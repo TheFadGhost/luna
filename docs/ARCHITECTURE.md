@@ -51,7 +51,7 @@ Status: DESIGN. Nothing here is built yet.
 | Process | Type | Resident RAM | Notes |
 |---|---|---|---|
 | `lunad` | Python, systemd user unit | ~40 MB | Supervisor. Owns socket, queue, memory, state. Never calls an LLM directly for long jobs. |
-| `luna-speak` | piper, persistent | ~60 MB | Kept warm: model cold-start per utterance is the difference between an assistant and a stutter. |
+| `luna-speak` | piper (venv), lazy + idle-unload | ~330 MB while loaded, 0 when idle | See measured numbers below. Estimate of ~60 MB was WRONG. |
 | embeddings | sentence-transformers / ONNX | ~90 MB | Loaded lazily, unloaded after 5 min idle. |
 | voxtype | already running | ~208 MB | Untouched. We only add a post_process hook. |
 | agent session | foot + codex | ~150-300 MB | Transient, only while working. |
@@ -165,7 +165,23 @@ Piper specifics (researched, not assumed):
 - Output: `--output-raw | aplay -r 22050 -f S16_LE -t raw -`. Sample rate must
   match the voice config. `pw-play` needs a WAV header, so raw PCM pairs with
   aplay via PipeWire's ALSA shim.
-- **Keep it resident.** Per-utterance model load is the whole latency budget.
+- **Measured on this machine** (Ryzen 5 4500U, en_GB-jenny_dioco-medium):
+  - model load (cold): **1.12 s** - paid once
+  - synth, warm: **0.41 s** for 6.75 s of audio
+  - **RTF 0.061 = 16.4x faster than real time** (research extrapolated ~0.3;
+    the real figure is five times better)
+  - **peak RSS 331 MB** - python + onnxruntime, NOT the 61 MB model file
+- **Revised residency decision.** 331 MB is too much to hold permanently against
+  3-4 GB of headroom, and the original ~60 MB estimate in this doc was wrong.
+  Because cold start is only 1.12 s, `luna-speak` **lazy-loads and unloads after
+  5 minutes idle**, same policy as embeddings. Cost: the first sentence after a
+  lull is ~1 s slower. Everything else is unaffected.
+- Installed via **project venv** (`~/Work/luna/.venv`, 198 MB), NOT the AUR -
+  `sudo` needs a password here so an unattended AUR build is not possible, and
+  the venv is revertible with a single `rm -rf`.
+- Voice files live in `~/.local/share/luna/voices/` (61 MB .onnx + .onnx.json).
+- Download helper: `python -m piper.download_voices <voice> --download-dir <d>`.
+- CLI has no `--config` requirement when the `.onnx.json` sits beside the model.
 - Licence note: piper is GPL-3.0 but invoked as a separate binary over a pipe,
   so it does not affect Luna's own licence.
 
