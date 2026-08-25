@@ -396,9 +396,11 @@ registration as one operation, so there is no window in which Luna owns a
 process she cannot prove is hers. The allowlist is
 `~/.local/share/luna/spawned.json`. Durable records (dispatched jobs, which
 outlive the daemon) are fsync'd; transient ones (the piper worker, `aplay`, a
-headless `ask`) are not — a measured ~4 ms fsync is not worth paying in the
-path that decides how fast Luna starts speaking, for a record that is worthless
-after a crash anyway.
+headless `ask`) are not — an fsync measured anywhere from 0.4 to 4 ms depending
+on cache state is not worth paying in the path that decides how fast Luna
+starts speaking, for a record that is worthless after a crash anyway. What is
+left costs 0.41 ms, and first audio still measures 40-45 ms warm, unchanged
+from Phase 1.
 
 `pkill`, `killall` and every other match-by-name kill are banned outright, and
 a test reads the shipped source to prove it: `os.kill`/`os.killpg` appear in

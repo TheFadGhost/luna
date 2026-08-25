@@ -85,6 +85,11 @@
 - **`luna peek` / `luna jobs` / `luna spawned`.** Peek toggles
   `special:luna` (confirmed via `monitors[].specialWorkspace`); jobs lists from
   disk so it survives a daemon restart.
+- **No speech regression from routing the barge-in through the firewall.**
+  The ledger write costs 0.41 ms (whole `safety.spawn`: 0.66 ms median), and
+  first audio for a reply with a short opening sentence measured 87 / 40 / 45 ms
+  warm — the same 45 ms as Phase 1. A long *first* sentence measures 660-760 ms,
+  but that is piper synthesising it, not the firewall.
 - 288 tests pass, up from 157.
 
 ## The Hyprland finding, in full

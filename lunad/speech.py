@@ -509,8 +509,10 @@ class Speech:
                 "-t", "raw", "-"]
         try:
             # The barge-in kills this pid, so this pid must be in the ledger
-            # before it can start making noise. `durable=False` keeps the
-            # ~4 ms fsync out of the path that decides how fast Luna speaks.
+            # before it can start making noise. `durable=False` keeps the fsync
+            # out of the path that decides how fast Luna speaks; what is left
+            # is a 0.4 ms ledger write, and first audio still measures 40-45 ms
+            # warm, the same as Phase 1.
             player = safety.spawn(
                 argv, kind="tts-play", durable=False, note="aplay",
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,

@@ -25,8 +25,11 @@ the hot path.
 **fsync policy.** Records are written on every spawn, but only *durable*
 records (dispatched jobs, which outlive the daemon) are fsync'd. A TTS player
 or a headless agent child dies with the daemon, so its record is worthless
-after a crash and does not justify the ~4 ms fsync in the path that decides how
-fast Luna starts speaking.
+after a crash and does not justify an fsync in the path that decides how fast
+Luna starts speaking. Measured here: the whole `spawn` call costs 0.66 ms
+median, of which the ledger write is 0.41 ms; an fsync on the same file ranged
+0.4-4 ms depending on cache state, which is the variance that made it not worth
+paying on every utterance.
 
 Nothing here ever matches a process by name. ``pkill -f`` and its relatives are
 banned from this codebase: a previous agent on this machine killed its own
