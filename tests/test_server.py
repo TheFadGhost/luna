@@ -29,18 +29,46 @@ class FakeAdapter(agent.BaseAdapter):
         self.raises = raises
         self.delay = delay
         self.last_system_prompt = ""
+        self.last_prompt = ""
+        self.calls: list[dict[str, Any]] = []
 
     def available(self) -> tuple[bool, str]:
         return True, "fake adapter"
 
     def ask(self, prompt: str, system_prompt: str, **kw: Any) -> agent.AgentReply:
         self.last_system_prompt = system_prompt
+        self.last_prompt = prompt
+        self.calls.append({"prompt": prompt, "system_prompt": system_prompt,
+                           "session_id": kw.get("session_id"),
+                           "resume": kw.get("resume")})
         if self.delay:
             time.sleep(self.delay)
         if self.raises:
             raise self.raises
         return agent.AgentReply(text=self.reply, agent="fake", model="fake-1",
                                 cost_usd=0.001, wall_ms=1)
+
+
+class MuteSpeech:
+    """Stands in for the piper worker: records, plays nothing, spends nothing."""
+
+    def __init__(self) -> None:
+        self.said: list[str] = []
+        self.cancels = 0
+
+    def say(self, text: str, wait: bool = False, timeout: float = 0.0):
+        self.said.append(text)
+        return {"spoken": text, "sentences": 1, "id": "fake", "cancelled": False}
+
+    def cancel(self) -> bool:
+        self.cancels += 1
+        return True
+
+    def status(self) -> dict[str, Any]:
+        return {"loaded": False, "speaking": False, "counters": {}}
+
+    def close(self) -> None:
+        pass
 
 
 class ProtocolTests(unittest.TestCase):
@@ -70,6 +98,8 @@ class DispatchTests(TempMemoryCase):
     def daemon(self, adapter: agent.BaseAdapter | None = None) -> Daemon:
         d = Daemon(agent_name="claude", memory=self.memory())
         d.adapter = adapter or FakeAdapter()
+        d.speech.close()          # no piper, no aplay, no audio in tests
+        d.speech = MuteSpeech()
         self.addCleanup(d.close)
         return d
 
@@ -103,17 +133,136 @@ class DispatchTests(TempMemoryCase):
         d.dispatch({"op": "ask", "prompt": "throwaway", "remember": False})
         self.assertEqual(d.memory.episodes.stats()["episodes"], 0)
 
-    def test_ask_injects_persona_and_memory_into_the_system_prompt(self):
+    def test_ask_injects_persona_and_tier1_into_the_system_prompt(self):
         adapter = FakeAdapter()
         d = self.daemon(adapter)
         d.memory.luna.append("the terminal on this machine is foot")
-        d.memory.episodes.record("we chose jenny_dioco for the voice", "agreed")
-        d.dispatch({"op": "ask", "prompt": "what voice did we choose"})
+        d.dispatch({"op": "ask", "prompt": "what terminal do I use"})
         prompt = adapter.last_system_prompt
         self.assertIn("You are Luna", prompt)
         self.assertIn("Never open with praise", prompt)      # from the spec
         self.assertIn("the terminal on this machine is foot", prompt)  # tier 1
-        self.assertIn("jenny_dioco", prompt)                 # tier 2 recall
+
+    def test_tier2_recall_rides_in_the_message_not_the_prefix(self):
+        # If recall were in the system prompt it would change the cacheable
+        # prefix on every turn and session reuse would save nothing.
+        adapter = FakeAdapter()
+        d = self.daemon(adapter)
+        d.memory.episodes.record("we chose jenny_dioco for the voice", "agreed")
+        d.dispatch({"op": "ask", "prompt": "what voice did we choose"})
+        self.assertIn("jenny_dioco", adapter.last_prompt)
+        self.assertNotIn("jenny_dioco", adapter.last_system_prompt)
+
+    def test_the_prefix_is_identical_across_turns_of_one_conversation(self):
+        adapter = FakeAdapter()
+        d = self.daemon(adapter)
+        d.memory.episodes.record("something about the bar widget", "noted")
+        d.dispatch({"op": "ask", "prompt": "first question about the bar"})
+        d.dispatch({"op": "ask", "prompt": "second, unrelated question"})
+        self.assertEqual(adapter.calls[0]["system_prompt"],
+                         adapter.calls[1]["system_prompt"])
+
+    def test_the_first_ask_starts_a_session_and_the_next_resumes_it(self):
+        adapter = FakeAdapter()
+        d = self.daemon(adapter)
+        d.dispatch({"op": "ask", "prompt": "one"})
+        second = d.dispatch({"op": "ask", "prompt": "two"})
+        self.assertIsNotNone(adapter.calls[0]["session_id"])
+        self.assertIsNone(adapter.calls[0]["resume"])
+        self.assertEqual(adapter.calls[1]["resume"],
+                         adapter.calls[0]["session_id"])
+        self.assertTrue(second["resumed"])
+
+    def test_a_tier1_write_starts_a_fresh_session(self):
+        adapter = FakeAdapter()
+        d = self.daemon(adapter)
+        d.dispatch({"op": "ask", "prompt": "one"})
+        d.dispatch({"op": "memory.write", "file": "LUNA.md",
+                    "entry": "the bar is Quickshell, not Waybar"})
+        third = d.dispatch({"op": "ask", "prompt": "two"})
+        self.assertFalse(third["resumed"])
+        self.assertIsNotNone(adapter.calls[1]["session_id"])
+
+    def test_a_refused_resume_retries_once_with_a_clean_session(self):
+        class FlakyResume(FakeAdapter):
+            def ask(self, prompt: str, system_prompt: str, **kw: Any):
+                if kw.get("resume"):
+                    self.calls.append({"prompt": prompt,
+                                       "system_prompt": system_prompt,
+                                       "session_id": kw.get("session_id"),
+                                       "resume": kw.get("resume")})
+                    raise agent.AgentFailed("no conversation found", returncode=1)
+                return super().ask(prompt, system_prompt, **kw)
+
+        adapter = FlakyResume()
+        d = self.daemon(adapter)
+        d.dispatch({"op": "ask", "prompt": "one"})
+        resp = d.dispatch({"op": "ask", "prompt": "two"})
+        self.assertTrue(resp["ok"], resp)
+        self.assertIsNotNone(adapter.calls[-1]["session_id"])
+
+    def test_session_reset_drops_everything(self):
+        d = self.daemon()
+        d.dispatch({"op": "ask", "prompt": "one"})
+        self.assertEqual(d.dispatch({"op": "session.reset"})["dropped"], 1)
+
+    def test_a_voice_ask_speaks_the_reply(self):
+        d = self.daemon(FakeAdapter(reply="Battery is at sixty percent."))
+        resp = d.dispatch({"op": "ask", "prompt": "battery",
+                           "surface": "voice"})
+        self.assertTrue(resp["ok"])
+        self.assertEqual(d.speech.said, ["Battery is at sixty percent."])
+
+    def test_a_cli_ask_stays_silent(self):
+        d = self.daemon()
+        d.dispatch({"op": "ask", "prompt": "battery"})
+        self.assertEqual(d.speech.said, [])
+
+    def test_a_voice_ask_is_told_to_answer_briefly(self):
+        adapter = FakeAdapter()
+        d = self.daemon(adapter)
+        d.dispatch({"op": "ask", "prompt": "battery", "surface": "voice"})
+        self.assertIn("speech synthesiser", adapter.last_prompt)
+
+    def test_a_detached_ask_returns_before_the_agent_does(self):
+        adapter = FakeAdapter(delay=1.0)
+        d = self.daemon(adapter)
+        started = time.monotonic()
+        resp = d.dispatch({"op": "ask", "prompt": "slow one", "detach": True,
+                           "surface": "voice"})
+        self.assertTrue(resp["queued"])
+        self.assertLess(time.monotonic() - started, 0.5)
+        for _ in range(60):
+            if d.speech.said:
+                break
+            time.sleep(0.1)
+        self.assertEqual(d.speech.said, ["Fine."])
+
+    def test_a_detached_failure_is_spoken_not_swallowed_silently(self):
+        d = self.daemon(FakeAdapter(raises=agent.AgentTimeout("too slow")))
+        d.dispatch({"op": "ask", "prompt": "x", "detach": True,
+                    "surface": "voice"})
+        for _ in range(60):
+            if d.speech.said:
+                break
+            time.sleep(0.1)
+        self.assertTrue(d.speech.said, "a failed voice ask said nothing at all")
+
+    def test_say_requires_text(self):
+        self.assertEqual(
+            self.daemon().dispatch({"op": "say", "text": " "})["error"],
+            "ProtocolError")
+
+    def test_say_speaks(self):
+        d = self.daemon()
+        resp = d.dispatch({"op": "say", "text": "hello there"})
+        self.assertTrue(resp["ok"])
+        self.assertEqual(d.speech.said, ["hello there"])
+
+    def test_speak_cancel(self):
+        d = self.daemon()
+        self.assertEqual(d.dispatch({"op": "speak.cancel"})["cancelled"], 1)
+        self.assertEqual(d.speech.cancels, 1)
 
     def test_ask_without_a_prompt_is_a_protocol_error(self):
         resp = self.daemon().dispatch({"op": "ask", "prompt": "  "})

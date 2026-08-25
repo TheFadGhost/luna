@@ -8,8 +8,10 @@ prices the work, and delegates the depth to specialists.
 
 ## Status
 
-**Phase 0 — text in, text out.** Daemon, socket, memory tiers 1–2, persona, CLI.
-See `docs/ARCHITECTURE.md` for the full design and the phase plan.
+**Phase 1 — she talks back.** Daemon, socket, memory tiers 1–2, persona, CLI,
+piper speech out, voxtype speech in, conversation sessions.
+See `docs/ARCHITECTURE.md` for the design and `docs/STATE-OF-PLAY.md` for what
+is actually built.
 
 ## Quick start
 
@@ -17,9 +19,31 @@ See `docs/ARCHITECTURE.md` for the full design and the phase plan.
 systemctl --user status lunad
 bin/luna status
 bin/luna ask "..."
+bin/luna say "read this aloud"
+bin/luna hush                     # stop speaking now
 bin/luna memory show
 bin/luna memory search "bar widget"
 ```
+
+## Voice
+
+**Out** — piper (`en_GB-jenny_dioco-medium`) in a project venv, lazy-loaded and
+unloaded after five idle minutes. The reply is split on sentences so playback
+starts on the first one (measured: first audio at 45 ms) while the rest is still
+being synthesised. Code, paths, URLs and long numbers are never read aloud; they
+become "it's on screen".
+
+**In** — `SUPER+ALT+L` runs `voxtype record toggle --profile luna`. The profile's
+`post_process_command` is `bin/luna-voice-router`, which forwards the transcript
+to the daemon and prints nothing.
+
+Plain dictation (F9, SUPER+CTRL+X) is untouched and stays untouched: it names no
+profile, so it takes none of this path.
+
+> **If you edit `~/.config/voxtype/config.toml`, restart voxtype.** The daemon
+> only reads its config at startup. Without a restart it logs
+> `Profile 'luna' not found in config, using default settings` and types your
+> question into whatever window has focus.
 
 ## Memory
 

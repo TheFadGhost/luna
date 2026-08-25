@@ -96,9 +96,13 @@ def cmd_ask(args: argparse.Namespace) -> int:
     with Client(timeout=args.timeout + 30) as client:
         request_id = uuid.uuid4().hex[:12]
         try:
-            resp = client.call("ask", prompt=prompt, surface=args.surface,
-                               model=args.model, timeout=args.timeout,
-                               id=request_id, remember=not args.no_remember)
+            payload = {"prompt": prompt, "surface": args.surface,
+                       "model": args.model, "timeout": args.timeout,
+                       "id": request_id, "remember": not args.no_remember,
+                       "conversation": args.conversation}
+            if args.speak:
+                payload["speak"] = True
+            resp = client.call("ask", **payload)
         except KeyboardInterrupt:
             with Client(timeout=10) as c2:
                 c2.call("cancel", target=request_id)
@@ -118,7 +122,52 @@ def cmd_ask(args: argparse.Namespace) -> int:
             bits.append(f"${cost:.4f}")
         if resp.get("recalled"):
             bits.append("recalled")
+        bits.append("resumed" if resp.get("resumed") else "new session")
         sys.stderr.write(f"{DIM}[{' · '.join(bits)}]{RESET}\n")
+    return 0
+
+
+def cmd_say(args: argparse.Namespace) -> int:
+    text = " ".join(args.text).strip() or sys.stdin.read().strip()
+    if not text:
+        sys.stderr.write("luna: nothing to say\n")
+        return 2
+    with Client(timeout=args.timeout + 30) as client:
+        resp = client.call("say", text=text, wait=args.wait,
+                           timeout=args.timeout)
+    if args.json:
+        print(json.dumps(resp, indent=2))
+        return 0 if resp.get("ok") else 1
+    if not resp.get("ok"):
+        return fail(resp)
+    if not resp.get("sentences"):
+        sys.stderr.write(f"luna: {resp.get('note', 'nothing speakable')}\n")
+        return 1
+    bits = [f"{resp['sentences']} sentence(s)", f"{resp.get('sample_rate')} Hz"]
+    if resp.get("first_audio_ms") is not None:
+        bits.append(f"first audio {resp['first_audio_ms']} ms")
+    if resp.get("total_ms") is not None:
+        bits.append(f"total {resp['total_ms']} ms")
+    print(resp["spoken"])
+    sys.stderr.write(f"{DIM}[{' · '.join(bits)}]{RESET}\n")
+    return 0
+
+
+def cmd_hush(args: argparse.Namespace) -> int:
+    with Client(timeout=15) as client:
+        resp = client.call("speak.cancel")
+    if not resp.get("ok"):
+        return fail(resp)
+    print("stopped" if resp["cancelled"] else resp.get("note", "nothing was speaking"))
+    return 0
+
+
+def cmd_session(args: argparse.Namespace) -> int:
+    with Client(timeout=15) as client:
+        resp = client.call("session.reset", conversation=args.conversation)
+    if not resp.get("ok"):
+        return fail(resp)
+    print(f"dropped {resp['dropped']} session(s)")
     return 0
 
 
@@ -152,6 +201,21 @@ def cmd_status(args: argparse.Namespace) -> int:
           f"${act['session_cost_usd']:.4f} this session")
     for run in act["in_flight"]:
         print(f"    - {run['id']} {run['age_s']}s  {run['prompt']!r}")
+
+    sp = resp.get("speech") or {}
+    state = "speaking" if sp.get("speaking") else (
+        "loaded" if sp.get("loaded") else "unloaded")
+    print(f"  speech   {sp.get('voice')} — {state}"
+          + (f", pid {sp['pid']}, {sp.get('load_ms')} ms load" if sp.get("pid")
+             else f", unloads after {sp.get('idle_unload_s', 0):.0f}s idle"))
+    se = resp.get("sessions") or {}
+    c = se.get("counters", {})
+    print(f"  sessions {len(se.get('live', []))} live · "
+          f"{c.get('new', 0)} new, {c.get('resumed', 0)} resumed, "
+          f"{c.get('retired', 0)} retired")
+    for live in se.get("live", []):
+        print(f"    - {live['key']}: {live['turns']} turns, "
+              f"idle {live['idle_s']:.0f}s, ${live['cost_usd']:.4f}")
     return 0
 
 
@@ -262,7 +326,13 @@ def build_parser() -> argparse.ArgumentParser:
     ask = sub.add_parser("ask", help="ask Luna something")
     ask.add_argument("prompt", nargs="*")
     ask.add_argument("--model", default=None)
-    ask.add_argument("--surface", default="cli")
+    ask.add_argument("--surface", default="cli",
+                     help="cli | voice | palette; voice also speaks the reply")
+    ask.add_argument("--conversation", default=None,
+                     help="session key; turns in one conversation share a "
+                          "warm prompt cache")
+    ask.add_argument("--speak", action="store_true",
+                     help="speak the reply whatever the surface")
     ask.add_argument("--timeout", type=float, default=180.0)
     ask.add_argument("--no-remember", action="store_true",
                      help="do not record this exchange in episodic memory")
@@ -296,6 +366,21 @@ def build_parser() -> argparse.ArgumentParser:
     lg.add_argument("-n", "--lines", type=int, default=40)
     lg.add_argument("--raw", action="store_true")
     lg.set_defaults(func=cmd_log)
+
+    sy = sub.add_parser("say", help="speak text aloud through piper")
+    sy.add_argument("text", nargs="*")
+    sy.add_argument("--wait", action="store_true",
+                    help="block until playback finishes")
+    sy.add_argument("--timeout", type=float, default=120.0)
+    sy.set_defaults(func=cmd_say)
+
+    hu = sub.add_parser("hush", help="stop speaking now")
+    hu.set_defaults(func=cmd_hush)
+
+    ss = sub.add_parser("session", help="conversation session control")
+    ss.add_argument("action", choices=["reset"])
+    ss.add_argument("conversation", nargs="?", default=None)
+    ss.set_defaults(func=cmd_session)
 
     cn = sub.add_parser("cancel", help="cancel an in-flight request")
     cn.add_argument("target", nargs="?", default=None)

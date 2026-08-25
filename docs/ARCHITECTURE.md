@@ -3,7 +3,9 @@
 A resident personal assistant for Omarchy. Not a chatbot: a supervised daemon
 with a voice, a memory that compounds, and the run of the desktop.
 
-Status: DESIGN. Nothing here is built yet.
+Status: Phases 0 and 1 built and running. Phases 2-3 are design.
+Where reality contradicted the design, the design text has been corrected
+in place and the correction is marked **CORRECTED**.
 
 ---
 
@@ -51,7 +53,7 @@ Status: DESIGN. Nothing here is built yet.
 | Process | Type | Resident RAM | Notes |
 |---|---|---|---|
 | `lunad` | Python, systemd user unit | ~40 MB | Supervisor. Owns socket, queue, memory, state. Never calls an LLM directly for long jobs. |
-| `luna-speak` | piper (venv), lazy + idle-unload | ~330 MB while loaded, 0 when idle | See measured numbers below. Estimate of ~60 MB was WRONG. |
+| piper worker | venv python, lazy + idle-unload | ~330 MB while loaded, 0 when idle | Spawned by `lunad`, so `lunad`'s cgroup reads ~470 MB while speaking and ~13 MB otherwise. Estimate of ~60 MB was WRONG. |
 | embeddings | sentence-transformers / ONNX | ~90 MB | Loaded lazily, unloaded after 5 min idle. |
 | voxtype | already running | ~208 MB | Untouched. We only add a post_process hook. |
 | agent session | foot + codex | ~150-300 MB | Transient, only while working. |
@@ -64,8 +66,16 @@ Every surface (voice, palette, hooks, CLI, bar widget) is a client. The daemon
 is the only thing that touches memory or spawns agents. This is what stops the
 system becoming four half-integrations that each grew their own state.
 
-Requests: `ask`, `say`, `listen_start`, `status`, `memory.{read,write,search}`,
-`cancel`, `subscribe` (for the bar widget's live state).
+Requests, as built: `ping`, `ask`, `say`, `speak.cancel`, `session.reset`,
+`status`, `memory.{read,write,search}`, `cancel`, `shutdown`. `subscribe`
+(for the bar widget's live state) is Phase 3. `listen_start` was dropped: the
+keybind talks to voxtype directly, so the daemon never needs to start a
+recording.
+
+`ask` takes `detach: true`, which acknowledges immediately and answers on a
+background thread. That exists for the voice router, which runs inside
+voxtype's `post_process_timeout_ms` and cannot wait for a reply it is not
+going to print.
 
 ## 4. Memory — adapted from Hermes Agent (Nous Research, MIT)
 
@@ -104,6 +114,32 @@ tidied when the cap is hit. Luna scores each candidate memory 0-1 on
 half-life so trivia ages out on its own. Corrections from the user score 1.0
 and never decay.
 
+### Prompt cost and the cacheable prefix — CORRECTED
+
+The Phase 0 note said each ask cost ~$0.05 because "separate processes never
+share a prompt cache". That diagnosis was wrong. Anthropic's prompt cache is
+keyed on the prompt *prefix* and IS shared across processes: a brand-new
+`claude -p --session-id <fresh uuid>` was measured taking a 4510-token cache
+**read**.
+
+The actual fault was that the tier-2 recall block sat at the *end of the system
+prompt*. Recall is chosen per request, so every ask changed the tail of the
+prefix and invalidated the whole ~5.5k-token cached block, paying to re-create
+it at cache-write price. That is the $0.05.
+
+The fix is structural, not a smaller prompt: the system prompt now holds only
+persona + tier 1 (stable between turns), and recall moved into the user
+message, where changing it costs nothing. **$0.0513/ask before (n=7),
+$0.0096/ask after (n=13).**
+
+Conversation sessions (`--session-id` on turn one, `--resume` after; see
+`lunad/session.py`) are implemented and on by default, retired when tier-1
+memory changes, when idle for 30 minutes, or after 60 turns. Their measured
+effect on cost is within noise ($0.0232 vs $0.0289 over three turns) because
+resuming replays and re-caches a growing history. They are kept for
+conversational continuity, not for money. A refused resume falls back to a
+fresh session automatically.
+
 ### Consolidation nudge
 After N turns, a background pass on a cheap model reviews recent episodes and
 proposes writes to Tier 1. Runs off the critical path; never blocks a reply.
@@ -123,20 +159,44 @@ post_process_timeout_ms = 2000
 output_mode = "clipboard"
 ```
 
-Keybind: a new bind runs `voxtype record toggle --profile luna`.
+Keybind: **SUPER+ALT+L** runs `voxtype record toggle --profile luna`,
+verified free against `hyprctl binds` and added to the user-owned
+`~/.config/hypr/bindings.lua` so it survives `omarchy update`.
 **F9 and SUPER+CTRL+X keep working exactly as today** - no shared mode flag, no
 race, no fork of voxtype. This is the requirement that plain dictation must not
 regress, and profiles satisfy it cleanly.
 
-Gotchas (confirmed from the binary, not assumed):
+Gotchas (now confirmed by running it, not only by reading the binary):
 - The transcript arrives on **stdin**; the router's **stdout replaces it**.
 - On non-zero exit, spawn failure, or timeout, voxtype **falls back to typing
   the original transcript**. For Luna that means a crashed router types your
-  speech into whatever window has focus. The router must therefore be
-  defensive: exit 0 and print nothing on any internal error, and hand off to
-  `lunad` asynchronously rather than blocking on the reply.
-- Empty stdout does NOT reliably suppress output - there is a
-  `fallback_on_empty` field governing it. Must be tested on the real config.
+  speech into whatever window has focus. The router is therefore defensive:
+  it catches `BaseException`, exits 0 and prints nothing on any internal error,
+  strips C0 control bytes, and hands off to `lunad` with `detach` rather than
+  blocking on the reply. Measured hand-off: 30 ms against a 2000 ms budget.
+- **CORRECTED: `fallback_on_empty` cannot be set per profile, and cannot be
+  turned off at all without breaking plain dictation.** `struct Profile` in
+  voxtype 0.7.5 has exactly three fields: `post_process_command`,
+  `post_process_timeout_ms`, `output_mode`. `fallback_on_empty` lives on
+  `[output.post_process]`, which refuses to parse without a `command` - and a
+  global command would route plain dictation through Luna too. Luna's router
+  correctly prints nothing, so the fallback ALWAYS fires
+  (`Post-process command returned empty output, using original text`). The
+  mitigation is `output_mode = "clipboard"` in the profile: the fallback
+  transcript goes to the clipboard, not into the focused window. Verified: 66
+  chars to clipboard, 0 bytes typed.
+- **CORRECTED: the voxtype daemon never re-reads its config.** Adding
+  `[profiles.luna]` is not enough; without `systemctl --user restart voxtype`
+  the daemon logs `Profile 'luna' not found in config, using default settings`
+  and types the transcript. The CLI *does* read the file live, so
+  `voxtype record start --profile <bogus>` printing `Available profiles: luna`
+  proves the file is right and says nothing about the running daemon.
+- **CORRECTED: `voxtype config` never prints profiles.** It validates them, but
+  the display omits `[profiles]` entirely. Do not use it to check the profile
+  took.
+- The profile reaches the daemon through `$XDG_RUNTIME_DIR/voxtype/profile_override`,
+  written by the CLI and deleted on read. `record cancel` while idle leaves a
+  stale `cancel` file that silently cancels the *next* recording.
 - `pre_recording_command` / `pre_output_command` / `post_output_command` are
   fire-and-forget compositor hooks. They do NOT receive the transcript and
   their stdout is not captured. Do not build on them.
@@ -149,9 +209,36 @@ User's current voxtype config differs from the shipped default in only two
 values (`type_delay_ms = 1`, `on_transcription = false`). Adding a `[profiles]`
 section is additive and does not disturb existing behaviour.
 
-**Out** — `luna-speak`, a persistent piper process. Sentence-streamed so speech
-begins on the first full sentence rather than after the whole reply.
-Spoken output is deliberately short; detail goes to screen.
+**Out** — `lunad/speech.py` plus `lunad/piper_worker.py`, a persistent piper
+process under the project venv. Sentence-streamed so speech begins on the first
+full sentence rather than after the whole reply. Measured warm: **first audio at
+45 ms** for a 14.3 s reply.
+
+Built rather than designed, because the mechanics forced it:
+- **The worker runs under `.venv/bin/python`, not lunad's interpreter.** piper,
+  onnxruntime and numpy exist only in the venv; the daemon is stock system
+  python and imports none of them.
+- **Framed wire protocol** (`BEGIN` / `AUDIO <n>` + n bytes / `END <id>
+  <status>`) rather than a raw byte stream. Every `say` produces exactly one
+  `END`, cancelled or not, which is what lets a barge-in drain the abandoned
+  utterance and know precisely where the next one starts. A raw stream would
+  bleed the tail of a cancelled reply into the next one.
+- **Cancellation uses a sequence number, not a flag.** A bare "cancelled" Event
+  set while nothing is speaking would cancel the *next* utterance instead of the
+  one interrupted.
+- **One `aplay` per utterance, not per sentence** - per-sentence processes give
+  an audible gap at every full stop, and the pipe's back-pressure throttles
+  synthesis for free.
+- **CORRECTED: piper emits one audio chunk per sentence.** `synthesize()` yields
+  one `AudioChunk` per sentence, so a long single sentence produces no audio
+  until it is fully synthesised. Our own sentence splitting is therefore what
+  makes streaming work at all; units are capped at 260 characters.
+
+Spoken output is deliberately short; detail goes to screen. `strip_for_speech`
+replaces code blocks, file paths, URLs, e-mail addresses, hashes and long digit
+runs with one short placeholder ("it's on screen"), collapses adjacent
+placeholders, and truncates at a sentence boundary. A voice `ask` also tells the
+model it is being read aloud and to answer in at most two sentences.
 
 Piper specifics (researched, not assumed):
 - Upstream is **OHF-Voice/piper1-gpl** (GPL-3.0). `rhasspy/piper` went read-only
@@ -213,7 +300,7 @@ No permission prompts, by choice. Instead:
 | Phase | Ships | Verifiable by |
 |---|---|---|
 | P0 | `lunad` + socket + CLI + memory tiers 1-2 + persona. Text only. | `luna ask "..."` returns an opinionated answer that cites remembered context. |
-| P1 | piper TTS out, voxtype routing in. | Hold F9, speak, she answers aloud. Plain dictation still types. |
+| P1 | **DONE.** piper TTS out, voxtype routing in, session reuse, cost fix. | SUPER+ALT+L, speak, she answers aloud. Plain dictation still types — regression-tested. |
 | P2 | Workspace dispatch + Sol + audit log. | "go build X" -> works in special workspace, reports back. |
 | P3 | Bar widget, ambient hooks (crash/battery/update), semantic recall + decay. | Crash a process, she explains it unprompted. |
 

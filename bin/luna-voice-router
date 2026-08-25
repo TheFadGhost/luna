@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""luna-voice-router — voxtype's post_process hook for the `luna` profile.
+
+voxtype pipes the transcript in on stdin and takes whatever this prints on
+stdout as the text to deliver. That is the entire contract, and it has one
+sharp edge:
+
+    On a non-zero exit, a spawn failure, an empty result with
+    fallback_on_empty (which defaults to TRUE), or a timeout, voxtype
+    delivers the ORIGINAL transcript instead.
+
+For dictation that is a sensible safety net. For Luna it is a trapdoor: the
+user speaks a question, this script fails, and the question is typed into
+whatever window happens to have focus — a terminal, a chat box, a text editor.
+
+So the rules here are absolute, and they are why this file is defensive to the
+point of paranoia:
+
+  * exit 0, always. Every path. No exception may escape ``main``.
+  * print nothing on stdout, ever. Not a newline, not an error.
+  * never block on a reply. voxtype gives us ``post_process_timeout_ms``
+    (2000 in the profile) and Luna takes seconds to think, so the transcript is
+    handed to the daemon with ``detach`` and this process leaves immediately.
+  * the profile also sets ``output_mode = "clipboard"``. Empty output still
+    triggers the ``fallback_on_empty`` path, and a profile cannot override that
+    flag — ``struct Profile`` in voxtype 0.7.5 carries only
+    post_process_command, post_process_timeout_ms and output_mode. Clipboard is
+    therefore the containment: worst case the transcript lands on the
+    clipboard, which is recoverable, rather than being typed somewhere it
+    cannot be taken back.
+
+Diagnostics go to a small rotating file, never to stdout and never to stderr —
+voxtype logs our stderr, and a chatty hook makes its logs useless.
+"""
+
+from __future__ import annotations
+
+import sys
+
+EXIT_OK = 0
+
+
+def _log(message: str) -> None:
+    """Best-effort breadcrumb. A logging failure is not worth an exit code."""
+    try:
+        import time
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from lunad import config  # noqa: PLC0415
+
+        path = config.ROUTER_LOG
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > config.ROUTER_LOG_MAX_BYTES:
+            path.replace(path.with_suffix(path.suffix + ".1"))
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(f"{stamp} {message}\n")
+    except Exception:  # noqa: BLE001 - deliberately total
+        pass
+
+
+def read_transcript() -> str:
+    """Read stdin without letting a decoding fault become an exit code."""
+    try:
+        raw = sys.stdin.buffer.read()
+    except Exception:  # noqa: BLE001
+        return ""
+    try:
+        return raw.decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def dispatch(transcript: str) -> str:
+    """Hand the transcript to lunad. Returns a short outcome for the log."""
+    import json
+    import socket
+    import uuid
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from lunad import config  # noqa: PLC0415
+
+    # NUL and other C0 controls cannot survive JSON -> socket -> sqlite intact,
+    # and a stray one turned a garbage transcript into an InternalError in the
+    # daemon during testing. Strip them here: the router is the boundary.
+    text = "".join(ch for ch in transcript
+                   if ch == "\n" or ch == "\t" or ord(ch) >= 0x20).strip()
+    if not text:
+        return "empty transcript, nothing sent"
+    if len(text) > config.ROUTER_MAX_TRANSCRIPT_CHARS:
+        # Not a refusal: a minute of speech is a legitimate long transcript.
+        # The cap exists so a runaway STT cannot post a megabyte to the socket.
+        text = text[:config.ROUTER_MAX_TRANSCRIPT_CHARS]
+
+    request = {
+        "op": "ask",
+        "id": uuid.uuid4().hex[:12],
+        "prompt": text,
+        "surface": "voice",
+        "detach": True,          # the daemon answers and speaks on its own time
+    }
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(config.ROUTER_CONNECT_TIMEOUT_S)
+    try:
+        sock.connect(str(config.SOCKET_PATH))
+        sock.sendall((json.dumps(request) + "\n").encode("utf-8"))
+        try:
+            # The daemon acknowledges the queueing, not the answer. Reading it
+            # is cheap and confirms the request was actually accepted; a
+            # timeout here is still a success from voxtype's point of view.
+            ack = sock.recv(4096).decode("utf-8", "replace").strip()
+        except (TimeoutError, socket.timeout, OSError):
+            ack = "(no ack)"
+        return f"sent {len(text)} chars as {request['id']}; ack {ack[:200]}"
+    finally:
+        try:
+            sock.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def main() -> int:
+    transcript = ""
+    try:
+        transcript = read_transcript()
+        outcome = dispatch(transcript)
+        _log(outcome)
+    except BaseException as exc:  # noqa: BLE001 - including KeyboardInterrupt
+        # The whole point of this file. Whatever happened, voxtype must see a
+        # clean exit and no output, or it types the user's speech somewhere.
+        _log(f"SUPPRESSED {type(exc).__name__}: {exc} "
+             f"(transcript {len(transcript)} chars)")
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BaseException:  # noqa: BLE001 - even a failure in main() exits 0
+        sys.exit(EXIT_OK)

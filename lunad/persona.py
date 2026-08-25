@@ -1,14 +1,19 @@
 """Assembly of Luna's system prompt.
 
-The prompt has three parts, in a fixed order chosen so the cacheable prefix is
-as long as possible:
+The system prompt holds only what is stable:
 
 1. the persona spec (``data/persona.md``) — identical for every request;
-2. the frozen tier-1 memory block — changes only when memory is written;
-3. tier-2 recall for this specific prompt — changes every request.
+2. the frozen tier-1 memory block — changes only when memory is written.
 
-Anything volatile therefore sits at the end, where invalidating it costs the
-least.
+Tier-2 recall used to sit at the end of the system prompt. It no longer does.
+Recall is chosen per request, so it changed the prefix on every turn, and once
+Phase 1 started resuming one conversation instead of spawning a fresh process
+per ask (see ``session.py``) that made the prompt cache useless: the prefix
+diverged at the recall block every time. Recall now rides in the *user* message
+where it belongs — it is context for this question, not for who Luna is.
+
+So: system prompt = the part that must stay byte-identical between turns; user
+message = the part that is allowed to change.
 """
 
 from __future__ import annotations
@@ -60,14 +65,35 @@ def load_spec(path: Path = config.PERSONA_PATH) -> str:
 
 def build_system_prompt(
     tier1_block: str,
-    recall_block: str = "",
     spec: str | None = None,
 ) -> str:
-    """Compose the full system prompt from persona + memory."""
+    """Compose the cacheable prefix: persona + tier-1 memory. Nothing volatile."""
     parts = [_PREAMBLE, "## Luna — persona specification\n", spec or load_spec()]
     parts.append("## Curated memory (tier 1, always loaded)\n\n" + tier1_block.strip())
+    parts.append(_CLOSING)
+    return "\n\n".join(p.strip() for p in parts if p.strip()) + "\n"
+
+
+def build_user_message(prompt: str, recall_block: str = "",
+                       surface: str = "cli") -> str:
+    """Wrap the user's message with anything retrieved for *this* turn.
+
+    Recall goes first and the question last, so the model reads the context
+    before the request rather than having to hold the request in mind while it
+    reads. The surface is named because a spoken answer has to be shorter than
+    a typed one and Luna has no other way to know which she is giving.
+    """
+    parts: list[str] = []
     if recall_block.strip():
         parts.append("## Recalled context (tier 2, retrieved for this message)\n\n"
                      + recall_block.strip())
-    parts.append(_CLOSING)
-    return "\n\n".join(p.strip() for p in parts if p.strip()) + "\n"
+    if surface == "voice":
+        parts.append(
+            "This message was spoken aloud and your answer will be read back "
+            "by a speech synthesiser. Answer in at most two short sentences, "
+            "in plain words. No lists, no code, no file paths, no URLs: if the "
+            "answer needs any of those, say the one-line version and note that "
+            "the detail is on screen."
+        )
+    parts.append(prompt.strip())
+    return "\n\n".join(parts)

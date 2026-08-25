@@ -23,7 +23,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from . import __version__, agent, config, log as luna_log, persona, protocol
+from . import (__version__, agent, config, log as luna_log, persona,
+               protocol, session as sessions, speech)
 from .memory import Memory, MemoryCapExceeded, MemoryError as LunaMemoryError
 
 log = logging.getLogger("lunad.server")
@@ -48,12 +49,19 @@ class Daemon:
         self.agent_name = (agent_name or agent.read_default_agent()).lower()
         self.adapter = agent.get_adapter(self.agent_name)
         self.persona_spec = persona.load_spec()
-        self.counters: dict[str, int] = {"ask": 0, "errors": 0, "cancelled": 0}
+        self.counters: dict[str, int] = {"ask": 0, "errors": 0, "cancelled": 0,
+                                         "said": 0}
         self.cost_usd = 0.0
         self._lock = threading.Lock()
         # Tier-1 is frozen for the life of the daemon's *session view* but must
         # reflect a memory.write immediately; it is cheap to rebuild, so it is
         # rebuilt per request and cached only within one request.
+        self.sessions = sessions.SessionManager()
+        # Speech is constructed eagerly but loads nothing: the piper process
+        # only starts on the first `say`, and dies again after five idle
+        # minutes. Constructing it here means `status` can report why TTS is
+        # unavailable without anyone having tried to speak first.
+        self.speech = speech.Speech()
         log.info(
             "daemon initialised",
             extra={"agent": self.agent_name, "version": __version__},
@@ -97,16 +105,55 @@ class Daemon:
                 "path": str(config.PERSONA_PATH),
                 "chars": len(self.persona_spec),
             },
+            speech=self.speech.status(),
+            sessions={
+                "live": self.sessions.snapshot(),
+                "counters": dict(self.sessions.counters),
+                "idle_s": self.sessions.idle_s,
+                "max_turns": self.sessions.max_turns,
+            },
         )
 
     def op_ask(self, req: dict[str, Any]) -> dict[str, Any]:
         prompt = req.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             raise protocol.ProtocolError("ask requires a non-empty 'prompt' string")
-        prompt = prompt.strip()
-        surface = str(req.get("surface") or "cli")
         request_id = str(req.get("id") or uuid.uuid4().hex[:12])
+
+        if req.get("detach"):
+            # For the voice router, which runs inside voxtype's post_process
+            # timeout and must not wait for an answer it is not going to print.
+            # The reply is spoken, logged and remembered on this thread instead.
+            threading.Thread(target=self._detached_ask, args=(dict(req),),
+                             daemon=True,
+                             name=f"luna-ask-{request_id}").start()
+            return protocol.ok(request_id, queued=True,
+                               surface=str(req.get("surface") or "cli"))
+        return self._ask(req, request_id)
+
+    def _detached_ask(self, req: dict[str, Any]) -> None:
+        request_id = str(req.get("id") or uuid.uuid4().hex[:12])
+        try:
+            self._ask(req, request_id)
+        except Exception as exc:  # noqa: BLE001 - nobody is listening; log it
+            with self._lock:
+                self.counters["errors"] += 1
+            log.warning("detached ask failed",
+                        extra={"req_id": request_id,
+                               "detail": f"{type(exc).__name__}: {exc}"})
+            if str(req.get("surface")) == "voice":
+                # Silence after speaking to her is indistinguishable from a
+                # daemon that died. Say so, briefly.
+                self._speak_safely("Something went wrong with that one. "
+                                   "The detail is on screen.")
+
+    def _ask(self, req: dict[str, Any], request_id: str) -> dict[str, Any]:
+        prompt = str(req["prompt"]).strip()
+        surface = str(req.get("surface") or "cli")
         remember = bool(req.get("remember", True))
+        speak = bool(req.get("speak", surface == "voice"))
+        conversation = str(req.get("conversation")
+                           or config.DEFAULT_CONVERSATION)
 
         tier1 = self.memory.tier1_block()
         try:
@@ -115,25 +162,34 @@ class Daemon:
             log.warning("recall failed, continuing without it",
                         extra={"req_id": request_id, "detail": str(exc)})
             recall = ""
-        system_prompt = persona.build_system_prompt(tier1, recall, self.persona_spec)
+
+        # The prefix is persona + tier 1 and nothing else, so it survives
+        # unchanged from turn to turn and the prompt cache is read rather than
+        # rewritten. Recall belongs to this turn, so it goes in the message.
+        system_prompt = persona.build_system_prompt(tier1, self.persona_spec)
+        message = persona.build_user_message(prompt, recall, surface)
+        prefix = sessions.fingerprint(self.persona_spec, tier1)
+
+        explicit = req.get("session_id") or req.get("resume")
+        sess = None if explicit else self.sessions.acquire(conversation, prefix)
+        args = ({"session_id": req.get("session_id"), "resume": req.get("resume")}
+                if explicit else self.sessions.args_for(sess))
 
         run = self.runs.new(prompt, surface, request_id)
         log.info("ask", extra={"req_id": request_id, "surface": surface,
                                "prompt_chars": len(prompt),
                                "system_chars": len(system_prompt),
-                               "recalled": bool(recall)})
+                               "recalled": bool(recall),
+                               "conversation": conversation,
+                               "resuming": bool(args.get("resume"))})
         try:
-            reply = self.adapter.ask(
-                prompt,
-                system_prompt,
-                model=req.get("model"),
-                session_id=req.get("session_id"),
-                resume=req.get("resume"),
-                timeout=float(req.get("timeout") or config.AGENT_TIMEOUT_S),
-                run=run,
-            )
+            reply = self._ask_agent(req, message, system_prompt, args, run,
+                                    sess, conversation, prefix, request_id)
         finally:
             self.runs.done(run)
+
+        if sess is not None:
+            self.sessions.succeeded(sess, reply.cost_usd, reply.session_id)
 
         episode = None
         if remember:
@@ -150,14 +206,95 @@ class Daemon:
             if reply.cost_usd:
                 self.cost_usd += reply.cost_usd
 
+        spoken = None
+        if speak:
+            spoken = self._speak_safely(reply.text)
+
         log.info("reply", extra={"req_id": request_id, "wall_ms": reply.wall_ms,
                                  "cost_usd": reply.cost_usd,
-                                 "reply_chars": len(reply.text)})
+                                 "reply_chars": len(reply.text),
+                                 "spoke": bool(spoken)})
         payload = reply.to_dict()
         payload["recalled"] = bool(recall)
+        payload["conversation"] = conversation
+        payload["resumed"] = bool(args.get("resume"))
+        if spoken is not None:
+            payload["spoken"] = spoken
         if episode is not None:
             payload["episode"] = {"id": episode.id, "salience": episode.salience}
         return protocol.ok(request_id, **payload)
+
+    def _ask_agent(self, req: dict[str, Any], message: str, system_prompt: str,
+                   args: dict[str, Any], run: agent.AgentRun,
+                   sess: sessions.Session | None, conversation: str,
+                   prefix: str, request_id: str) -> agent.AgentReply:
+        """One agent call, with a single retry if a resume is refused.
+
+        A resumable session id can go stale under the daemon — the agent's own
+        session store is cleaned up independently of ours. Treating that as a
+        hard failure would break the first ask after every such cleanup, so a
+        refused resume costs one uncached call and then heals itself.
+        """
+        timeout = float(req.get("timeout") or config.AGENT_TIMEOUT_S)
+        try:
+            return self.adapter.ask(message, system_prompt,
+                                    model=req.get("model"),
+                                    session_id=args.get("session_id"),
+                                    resume=args.get("resume"),
+                                    timeout=timeout, run=run)
+        except agent.AgentFailed as exc:
+            if not args.get("resume") or sess is None:
+                raise
+            log.warning("resume refused, starting a fresh session",
+                        extra={"req_id": request_id,
+                               "conversation": conversation,
+                               "detail": str(exc)[:300]})
+            self.sessions.drop(conversation)
+            fresh = self.sessions.acquire(conversation, prefix)
+            return self.adapter.ask(message, system_prompt,
+                                    model=req.get("model"),
+                                    session_id=fresh.session_id, resume=None,
+                                    timeout=timeout, run=run)
+
+    def _speak_safely(self, text: str) -> str | None:
+        """Speak, but never let a mute speaker turn into a failed ask."""
+        try:
+            result = self.speech.say(text)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not speak the reply",
+                        extra={"detail": f"{type(exc).__name__}: {exc}"})
+            return None
+        with self._lock:
+            self.counters["said"] += 1
+        return result.get("spoken") or None
+
+    def op_say(self, req: dict[str, Any]) -> dict[str, Any]:
+        text = req.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise protocol.ProtocolError("say requires a non-empty 'text' string")
+        try:
+            result = self.speech.say(
+                text, wait=bool(req.get("wait")),
+                timeout=float(req.get("timeout") or 120.0))
+        except speech.SpeechUnavailable as exc:
+            return protocol.err(req.get("id"), "SpeechUnavailable", str(exc))
+        with self._lock:
+            self.counters["said"] += 1
+        log.info("say", extra={"chars": len(text),
+                               "sentences": result.get("sentences")})
+        return protocol.ok(req.get("id"), **result)
+
+    def op_speak_cancel(self, req: dict[str, Any]) -> dict[str, Any]:
+        hit = self.speech.cancel()
+        return protocol.ok(req.get("id"), cancelled=1 if hit else 0,
+                           note="" if hit else "nothing was speaking")
+
+    def op_session_reset(self, req: dict[str, Any]) -> dict[str, Any]:
+        target = req.get("conversation")
+        if target:
+            return protocol.ok(req.get("id"), conversation=target,
+                               dropped=1 if self.sessions.drop(str(target)) else 0)
+        return protocol.ok(req.get("id"), dropped=self.sessions.clear())
 
     def op_memory_read(self, req: dict[str, Any]) -> dict[str, Any]:
         name = req.get("file")
@@ -246,6 +383,9 @@ class Daemon:
             "ping": self.op_ping,
             "status": self.op_status,
             "ask": self.op_ask,
+            "say": self.op_say,
+            "speak.cancel": self.op_speak_cancel,
+            "session.reset": self.op_session_reset,
             "memory.read": self.op_memory_read,
             "memory.write": self.op_memory_write,
             "memory.search": self.op_memory_search,
@@ -285,6 +425,7 @@ class Daemon:
 
     def close(self) -> None:
         self.runs.cancel_all()
+        self.speech.close()
         self.memory.close()
 
 
