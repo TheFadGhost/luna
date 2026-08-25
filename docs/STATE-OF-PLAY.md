@@ -33,6 +33,32 @@
 - **Cost fixed, and the Phase 0 diagnosis corrected** — see below.
 - 157 tests pass (`python3 -m unittest discover`), up from 84.
 
+
+### OSD theming (2026-08-25)
+- **voxtype's on-screen voice indicator now matches the monochrome desktop.**
+  Screenshot: `docs/osd-monochrome.png`.
+- **The default GTK4 OSD is a dead end** — `voxtype-osd-gtk4` draws its waveform
+  in Cairo from colour constants compiled into a stripped Rust binary, loads no
+  CSS and has no styled widget tree. It was swapped out, not restyled:
+  `[osd] frontend = "quickshell"` makes the daemon launch
+  `voxtype-osd-quickshell` instead.
+- **The QML lives in a user-owned tree**, `~/.local/share/voxtype/quickshell/`,
+  installed with `voxtype setup quickshell --skip-bridge`. Nothing under
+  `/usr/share/voxtype` or `/usr/lib/voxtype` was touched — `pacman -Qkk
+  voxtype-bin` reports `69 total files, 0 altered files`. Master copies of the
+  two edited QML files are in `osd/`, because
+  `voxtype setup quickshell --force` would overwrite the live ones.
+- **It reads Omarchy's real design tokens, not copied hexes.** `Commons` and
+  `Ui` are symlinked into that tree, so `import qs.Commons` resolves inside
+  voxtype's *own* Quickshell process, and every colour and dimension is bound to
+  `Color.*` / `Style.*`. The card is `Ui.BorderSurface`, not a hand-rolled
+  Rectangle. `Theme.refresh()` re-reads `colors.toml` every time the OSD comes
+  up, so a theme switch is picked up on the next recording — no file watcher,
+  which matters because `omarchy theme-set` `rm -rf`s the theme directory.
+- **Dictation re-verified end to end after the switch**: recording → transcript
+  → typed into the focused window via `wtype`. `voxtype.service` was restarted
+  once (config is only read at startup).
+
 ## The cost finding, in full
 
 The Phase 0 note blamed ~$0.05/ask on "separate processes never share a prompt
@@ -61,6 +87,9 @@ saves. It is kept for conversational continuity, not for money.
   invisible until it was restarted. Verified healthy and plain dictation
   verified working afterwards.
 - omarchy-shell and other agent sessions: untouched.
+- **voxtype OSD**: `qs -p ~/.local/share/voxtype/quickshell` spawned by the
+  voxtype daemon, plus its `voxtype-audio-bridge` child. Layer surface
+  `voxtype-osd` on the overlay layer, visible only while not idle.
 
 ## Next (Phase 2)
 1. Workspace dispatch: a special workspace, `foot` + agent with full autonomy.
@@ -79,6 +108,13 @@ saves. It is kept for conversational continuity, not for money.
 - **Barge-in has no keybind yet.** `luna hush` works from a terminal only.
 - **A voice ask that fails speaks a generic apology**, not the actual error;
   the detail is in `luna log`.
+- **The `[osd]` sizing keys are inert under the Quickshell frontend.**
+  `position` / `width_px` / `height_px` / `margin_px` reach only the GTK4 and
+  native frontends; the Quickshell OSD's geometry lives in its `Theme.qml`.
+  They are set in the config anyway so a fallback frontend lands correctly.
+- **The themed OSD depends on `/usr/share/omarchy/shell/{Commons,Ui}`.** An
+  `omarchy update` that renames a token would break it, and the failure mode
+  is a QML import error at OSD launch, not at dictation time.
 
 ## Blocked / needs the user
 - **Voice approval** — jenny_dioco is in use; alba was never compared aloud.

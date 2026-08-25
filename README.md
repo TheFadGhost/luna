@@ -40,6 +40,14 @@ to the daemon and prints nothing.
 Plain dictation (F9, SUPER+CTRL+X) is untouched and stays untouched: it names no
 profile, so it takes none of this path.
 
+**On screen** — the voice indicator that appears while recording is voxtype's
+Quickshell frontend (`[osd] frontend = "quickshell"`), restyled to the desktop's
+own design tokens. `osd/` holds the master copy of the two QML files; see its
+README for why the stock GTK4 indicator cannot be themed and how to restore this
+one after a voxtype update.
+
+![The monochrome voice indicator](docs/osd-monochrome.png)
+
 > **If you edit `~/.config/voxtype/config.toml`, restart voxtype.** The daemon
 > only reads its config at startup. Without a restart it logs
 > `Profile 'luna' not found in config, using default settings` and types your
