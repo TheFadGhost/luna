@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""luna — command-line client for lunad.
+
+A thin, dependency-free socket client. It holds no state and knows nothing
+about memory or agents: everything happens in the daemon, which is the whole
+point of the socket (ARCHITECTURE.md section 3).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import sys
+import uuid
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lunad import config  # noqa: E402
+
+BOLD, DIM, RESET = "\033[1m", "\033[2m", "\033[0m"
+if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+    BOLD = DIM = RESET = ""
+
+NOT_RUNNING = f"""\
+luna: the daemon is not running (no listener on {config.SOCKET_PATH}).
+
+  start it   : systemctl --user start lunad
+  enable it  : systemctl --user enable --now lunad
+  why it died: systemctl --user status lunad  |  luna log
+"""
+
+
+class Client:
+    def __init__(self, path: Path = config.SOCKET_PATH, timeout: float = 600.0) -> None:
+        self.path = path
+        self.timeout = timeout
+        self.sock: socket.socket | None = None
+        self.fh = None
+
+    def __enter__(self) -> "Client":
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(self.timeout)
+        try:
+            s.connect(str(self.path))
+        except (FileNotFoundError, ConnectionRefusedError):
+            s.close()
+            sys.stderr.write(NOT_RUNNING)
+            raise SystemExit(69)  # EX_UNAVAILABLE
+        except OSError as exc:
+            s.close()
+            sys.stderr.write(f"luna: cannot reach the daemon: {exc}\n")
+            raise SystemExit(69)
+        self.sock = s
+        self.fh = s.makefile("rwb")
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self.fh:
+            self.fh.close()
+        if self.sock:
+            self.sock.close()
+
+    def call(self, op: str, **payload: object) -> dict:
+        assert self.fh is not None
+        request = {"op": op, "id": uuid.uuid4().hex[:12], **payload}
+        self.fh.write((json.dumps(request) + "\n").encode())
+        self.fh.flush()
+        line = self.fh.readline()
+        if not line:
+            sys.stderr.write("luna: the daemon closed the connection mid-request. "
+                             "Check `luna log`.\n")
+            raise SystemExit(70)
+        return json.loads(line)
+
+
+def fail(resp: dict) -> int:
+    sys.stderr.write(f"luna: {resp.get('error', 'Error')}: "
+                     f"{resp.get('message', '(no detail)')}\n")
+    for key in ("usage_pct", "overflow", "returncode", "stderr", "sample"):
+        if key in resp:
+            sys.stderr.write(f"  {key}: {resp[key]}\n")
+    return 1
+
+
+# --------------------------------------------------------------------------
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    prompt = " ".join(args.prompt).strip() or sys.stdin.read().strip()
+    if not prompt:
+        sys.stderr.write("luna: nothing to ask\n")
+        return 2
+    with Client(timeout=args.timeout + 30) as client:
+        request_id = uuid.uuid4().hex[:12]
+        try:
+            resp = client.call("ask", prompt=prompt, surface=args.surface,
+                               model=args.model, timeout=args.timeout,
+                               id=request_id, remember=not args.no_remember)
+        except KeyboardInterrupt:
+            with Client(timeout=10) as c2:
+                c2.call("cancel", target=request_id)
+            sys.stderr.write("\nluna: cancelled\n")
+            return 130
+    if args.json:
+        print(json.dumps(resp, indent=2))
+        return 0 if resp.get("ok") else 1
+    if not resp.get("ok"):
+        return fail(resp)
+    print(resp["reply"])
+    if args.verbose:
+        cost = resp.get("cost_usd")
+        bits = [str(resp.get("model") or resp.get("agent")),
+                f"{resp.get('wall_ms', 0) / 1000:.1f}s"]
+        if cost is not None:
+            bits.append(f"${cost:.4f}")
+        if resp.get("recalled"):
+            bits.append("recalled")
+        sys.stderr.write(f"{DIM}[{' · '.join(bits)}]{RESET}\n")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    with Client(timeout=15) as client:
+        resp = client.call("status")
+    if args.json:
+        print(json.dumps(resp, indent=2))
+        return 0 if resp.get("ok") else 1
+    if not resp.get("ok"):
+        return fail(resp)
+    d, a, m, act = resp["daemon"], resp["agent"], resp["memory"], resp["activity"]
+    print(f"{BOLD}lunad{RESET} {d['version']}  pid {d['pid']}  "
+          f"up {d['uptime_s']:.0f}s  threads {d['threads']}")
+    print(f"  socket   {d['socket']}")
+    print(f"  agent    {a['name']} "
+          f"({'ready' if a['available'] else 'UNAVAILABLE'}) — {a['detail']}")
+    for name, u in m["tier1"].items():
+        bar_len = 20
+        filled = min(bar_len, int(bar_len * u["pct"] / 100))
+        bar = "#" * filled + "." * (bar_len - filled)
+        print(f"  {name:<8} [{bar}] {u['chars']}/{u['cap']} chars "
+              f"({u['pct']}%) · {u['entries']} entries")
+    t2 = m["tier2"]
+    print(f"  episodes {t2['episodes']} rows, {t2['size_bytes']} bytes, "
+          f"mean salience {t2['mean_salience']}")
+    print(f"  profile  tier 3 not implemented (Phase 3)")
+    print(f"  activity {act['counters']['ask']} asks, "
+          f"{act['counters']['errors']} errors, "
+          f"{len(act['in_flight'])} in flight, "
+          f"${act['session_cost_usd']:.4f} this session")
+    for run in act["in_flight"]:
+        print(f"    - {run['id']} {run['age_s']}s  {run['prompt']!r}")
+    return 0
+
+
+def cmd_memory(args: argparse.Namespace) -> int:
+    with Client(timeout=30) as client:
+        if args.mem_cmd == "show":
+            resp = client.call("memory.read", file=args.file, limit=args.limit)
+        elif args.mem_cmd == "search":
+            resp = client.call("memory.search",
+                               query=" ".join(args.query), limit=args.limit)
+        elif args.mem_cmd == "write":
+            resp = client.call("memory.write", file=args.file or "LUNA.md",
+                               mode="append", entry=" ".join(args.entry))
+        elif args.mem_cmd == "rm":
+            resp = client.call("memory.write", file=args.file or "LUNA.md",
+                               mode="remove", index=args.index)
+        else:  # pragma: no cover - argparse guarantees a subcommand
+            return 2
+    if args.json:
+        print(json.dumps(resp, indent=2))
+        return 0 if resp.get("ok") else 1
+    if not resp.get("ok"):
+        return fail(resp)
+
+    if args.mem_cmd == "search":
+        if not resp["results"]:
+            print(f"{DIM}no episodes match {resp['query']!r}{RESET}")
+            return 0
+        for hit in resp["results"]:
+            print(f"{BOLD}{hit['iso']}{RESET} "
+                  f"{DIM}[{hit['surface']} · salience "
+                  f"{hit['effective_salience']:.2f} of {hit['salience']:.2f}]{RESET}")
+            print(f"  > {hit['user_text'].strip()}")
+            reply = hit["luna_text"].strip().replace("\n", "\n    ")
+            print(f"    {reply}\n")
+        return 0
+
+    if args.mem_cmd in ("write", "rm"):
+        u = resp["usage"]
+        print(f"{u['file']}: {u['chars']}/{u['cap']} chars ({u['pct']}%), "
+              f"{u['entries']} entries")
+        return 0
+
+    if args.file:
+        u = resp["usage"]
+        print(f"{BOLD}{resp['file']}{RESET} {DIM}{u['chars']}/{u['cap']} chars "
+              f"({u['pct']}%){RESET}")
+        for i, entry in enumerate(resp["entries"]):
+            print(f"  [{i}] {entry}")
+        return 0
+
+    for name, block in resp["tier1"].items():
+        u = block["usage"]
+        print(f"{BOLD}{name}{RESET} {DIM}{u['chars']}/{u['cap']} chars "
+              f"({u['pct']}%){RESET}")
+        for i, entry in enumerate(block["entries"]):
+            print(f"  [{i}] {entry}")
+        if not block["entries"]:
+            print(f"  {DIM}(empty){RESET}")
+    print(f"\n{BOLD}recent episodes{RESET} "
+          f"{DIM}({resp['tier2']['episodes']} total){RESET}")
+    for ep in resp["recent"]:
+        print(f"  {ep['iso']} [{ep['surface']} {ep['effective_salience']:.2f}] "
+              f"{ep['user_text'].strip()[:80]}")
+    return 0
+
+
+def cmd_log(args: argparse.Namespace) -> int:
+    path = config.LOG_PATH
+    if not path.exists():
+        sys.stderr.write(f"luna: no log at {path} yet\n")
+        return 1
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    for line in lines[-args.lines:]:
+        if args.raw:
+            print(line)
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            print(line)
+            continue
+        extra = " ".join(
+            f"{k}={v}" for k, v in rec.items()
+            if k not in ("ts", "level", "logger", "msg", "exc")
+        )
+        print(f"{DIM}{rec['ts']}{RESET} {rec['level']:<7} {rec['msg']} "
+              f"{DIM}{extra}{RESET}")
+        if "exc" in rec:
+            print(rec["exc"])
+    return 0
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    with Client(timeout=15) as client:
+        resp = client.call("cancel", target=args.target, all=args.all)
+    if not resp.get("ok"):
+        return fail(resp)
+    print(f"cancelled {resp['cancelled']}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="luna", description="Talk to Luna.")
+    p.add_argument("--json", action="store_true", help="raw JSON response")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    ask = sub.add_parser("ask", help="ask Luna something")
+    ask.add_argument("prompt", nargs="*")
+    ask.add_argument("--model", default=None)
+    ask.add_argument("--surface", default="cli")
+    ask.add_argument("--timeout", type=float, default=180.0)
+    ask.add_argument("--no-remember", action="store_true",
+                     help="do not record this exchange in episodic memory")
+    ask.add_argument("-v", "--verbose", action="store_true",
+                     help="print model, latency and cost to stderr")
+    ask.set_defaults(func=cmd_ask)
+
+    st = sub.add_parser("status", help="daemon and memory state")
+    st.set_defaults(func=cmd_status)
+
+    mem = sub.add_parser("memory", help="inspect and edit memory")
+    msub = mem.add_subparsers(dest="mem_cmd", required=True)
+    show = msub.add_parser("show", help="show curated memory and recent episodes")
+    show.add_argument("file", nargs="?", default=None,
+                      help="LUNA.md or USER.md; omit for everything")
+    show.add_argument("--limit", type=int, default=10)
+    search = msub.add_parser("search", help="keyword search of episodic memory")
+    search.add_argument("query", nargs="+")
+    search.add_argument("--limit", type=int, default=10)
+    write = msub.add_parser("write", help="append a curated entry")
+    write.add_argument("entry", nargs="+")
+    write.add_argument("--file", default="LUNA.md")
+    write.add_argument("--limit", type=int, default=10)
+    rm = msub.add_parser("rm", help="remove a curated entry by index")
+    rm.add_argument("index", type=int)
+    rm.add_argument("--file", default="LUNA.md")
+    rm.add_argument("--limit", type=int, default=10)
+    mem.set_defaults(func=cmd_memory)
+
+    lg = sub.add_parser("log", help="tail the daemon log")
+    lg.add_argument("-n", "--lines", type=int, default=40)
+    lg.add_argument("--raw", action="store_true")
+    lg.set_defaults(func=cmd_log)
+
+    cn = sub.add_parser("cancel", help="cancel an in-flight request")
+    cn.add_argument("target", nargs="?", default=None)
+    cn.add_argument("--all", action="store_true")
+    cn.set_defaults(func=cmd_cancel)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if not hasattr(args, "json"):
+        args.json = False
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        sys.stderr.write("\nluna: interrupted\n")
+        return 130
+    except socket.timeout:
+        sys.stderr.write("luna: timed out waiting for the daemon\n")
+        return 75
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

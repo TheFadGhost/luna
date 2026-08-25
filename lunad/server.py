@@ -1,0 +1,416 @@
+"""The daemon: socket, dispatch, lifecycle.
+
+ARCHITECTURE.md section 3 — a single Unix socket, every surface is a client,
+and the daemon is the only thing that touches memory or spawns agents.
+
+Threaded rather than async on purpose: the only slow operation is a blocking
+subprocess, threads express that directly, and there is no third-party async
+runtime available to lean on. One thread per connection, an agent call blocks
+only its own thread, and the accept loop never stalls.
+"""
+
+from __future__ import annotations
+
+import errno
+import logging
+import os
+import signal
+import socket
+import socketserver
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Callable
+
+from . import __version__, agent, config, log as luna_log, persona, protocol
+from .memory import Memory, MemoryCapExceeded, MemoryError as LunaMemoryError
+
+log = logging.getLogger("lunad.server")
+
+
+# =========================================================================
+# Daemon state
+# =========================================================================
+
+
+class Daemon:
+    """Everything the handlers need, built once."""
+
+    def __init__(self, agent_name: str | None = None,
+                 memory: Memory | None = None) -> None:
+        config.ensure_dirs()
+        self.started = time.time()
+        # `memory` is injectable so tests can run against a temp directory
+        # without touching the user's real memory files.
+        self.memory = memory if memory is not None else Memory()
+        self.runs = agent.RunRegistry()
+        self.agent_name = (agent_name or agent.read_default_agent()).lower()
+        self.adapter = agent.get_adapter(self.agent_name)
+        self.persona_spec = persona.load_spec()
+        self.counters: dict[str, int] = {"ask": 0, "errors": 0, "cancelled": 0}
+        self.cost_usd = 0.0
+        self._lock = threading.Lock()
+        # Tier-1 is frozen for the life of the daemon's *session view* but must
+        # reflect a memory.write immediately; it is cheap to rebuild, so it is
+        # rebuilt per request and cached only within one request.
+        log.info(
+            "daemon initialised",
+            extra={"agent": self.agent_name, "version": __version__},
+        )
+
+    # -- operations ------------------------------------------------------
+
+    def op_ping(self, req: dict[str, Any]) -> dict[str, Any]:
+        return protocol.ok(req.get("id"), pong=True, ts=time.time())
+
+    def op_status(self, req: dict[str, Any]) -> dict[str, Any]:
+        available, detail = self.adapter.available()
+        with self._lock:
+            counters = dict(self.counters)
+            cost = round(self.cost_usd, 6)
+        return protocol.ok(
+            req.get("id"),
+            daemon={
+                "version": __version__,
+                "protocol": protocol.PROTOCOL_VERSION,
+                "pid": os.getpid(),
+                "uptime_s": round(time.time() - self.started, 1),
+                "socket": str(config.SOCKET_PATH),
+                "state_dir": str(config.STATE_DIR),
+                "log": str(config.LOG_PATH),
+                "threads": threading.active_count(),
+            },
+            agent={
+                "name": self.agent_name,
+                "available": available,
+                "detail": detail,
+                "timeout_s": config.AGENT_TIMEOUT_S,
+            },
+            memory=self.memory.usage(),
+            activity={
+                "in_flight": self.runs.snapshot(),
+                "counters": counters,
+                "session_cost_usd": cost,
+            },
+            persona={
+                "path": str(config.PERSONA_PATH),
+                "chars": len(self.persona_spec),
+            },
+        )
+
+    def op_ask(self, req: dict[str, Any]) -> dict[str, Any]:
+        prompt = req.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise protocol.ProtocolError("ask requires a non-empty 'prompt' string")
+        prompt = prompt.strip()
+        surface = str(req.get("surface") or "cli")
+        request_id = str(req.get("id") or uuid.uuid4().hex[:12])
+        remember = bool(req.get("remember", True))
+
+        tier1 = self.memory.tier1_block()
+        try:
+            recall = self.memory.recall_block(prompt)
+        except LunaMemoryError as exc:
+            log.warning("recall failed, continuing without it",
+                        extra={"req_id": request_id, "detail": str(exc)})
+            recall = ""
+        system_prompt = persona.build_system_prompt(tier1, recall, self.persona_spec)
+
+        run = self.runs.new(prompt, surface, request_id)
+        log.info("ask", extra={"req_id": request_id, "surface": surface,
+                               "prompt_chars": len(prompt),
+                               "system_chars": len(system_prompt),
+                               "recalled": bool(recall)})
+        try:
+            reply = self.adapter.ask(
+                prompt,
+                system_prompt,
+                model=req.get("model"),
+                session_id=req.get("session_id"),
+                resume=req.get("resume"),
+                timeout=float(req.get("timeout") or config.AGENT_TIMEOUT_S),
+                run=run,
+            )
+        finally:
+            self.runs.done(run)
+
+        episode = None
+        if remember:
+            try:
+                episode = self.memory.episodes.record(
+                    prompt, reply.text, surface=surface
+                )
+            except Exception:  # noqa: BLE001 - a memory fault must not eat a reply
+                log.exception("failed to record episode",
+                              extra={"req_id": request_id})
+
+        with self._lock:
+            self.counters["ask"] += 1
+            if reply.cost_usd:
+                self.cost_usd += reply.cost_usd
+
+        log.info("reply", extra={"req_id": request_id, "wall_ms": reply.wall_ms,
+                                 "cost_usd": reply.cost_usd,
+                                 "reply_chars": len(reply.text)})
+        payload = reply.to_dict()
+        payload["recalled"] = bool(recall)
+        if episode is not None:
+            payload["episode"] = {"id": episode.id, "salience": episode.salience}
+        return protocol.ok(request_id, **payload)
+
+    def op_memory_read(self, req: dict[str, Any]) -> dict[str, Any]:
+        name = req.get("file")
+        if name:
+            handle = self.memory.file(str(name))
+            return protocol.ok(req.get("id"), file=handle.name,
+                               entries=handle.entries(), usage=handle.usage(),
+                               text=handle.text())
+        return protocol.ok(
+            req.get("id"),
+            tier1={
+                "LUNA.md": {"entries": self.memory.luna.entries(),
+                            "usage": self.memory.luna.usage()},
+                "USER.md": {"entries": self.memory.user.entries(),
+                            "usage": self.memory.user.usage()},
+            },
+            recent=[e.to_dict() for e in
+                    self.memory.episodes.recent(int(req.get("limit") or 10))],
+            tier2=self.memory.episodes.stats(),
+        )
+
+    def op_memory_write(self, req: dict[str, Any]) -> dict[str, Any]:
+        handle = self.memory.file(str(req.get("file") or "LUNA.md"))
+        mode = str(req.get("mode") or "append").lower()
+        if mode == "append":
+            entry = req.get("entry")
+            if not isinstance(entry, str) or not entry.strip():
+                raise protocol.ProtocolError(
+                    "memory.write mode=append requires a non-empty 'entry'")
+            usage = handle.append(entry)
+        elif mode == "replace":
+            entries = req.get("entries")
+            if not isinstance(entries, list):
+                raise protocol.ProtocolError(
+                    "memory.write mode=replace requires an 'entries' list")
+            usage = handle.replace([str(e) for e in entries])
+        elif mode == "remove":
+            index = req.get("index")
+            if not isinstance(index, int):
+                raise protocol.ProtocolError(
+                    "memory.write mode=remove requires an integer 'index'")
+            usage = handle.remove(index)
+        else:
+            raise protocol.ProtocolError(
+                f"unknown memory.write mode {mode!r}; "
+                "expected append, replace or remove")
+        log.info("memory.write", extra={"file": handle.name, "mode": mode,
+                                        "pct": usage["pct"]})
+        return protocol.ok(req.get("id"), file=handle.name, mode=mode,
+                           usage=usage, entries=handle.entries())
+
+    def op_memory_search(self, req: dict[str, Any]) -> dict[str, Any]:
+        query = req.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise protocol.ProtocolError("memory.search requires a 'query' string")
+        limit = int(req.get("limit") or 10)
+        hits = self.memory.episodes.search(query, limit=limit)
+        return protocol.ok(req.get("id"), query=query,
+                           results=[h.to_dict() for h in hits], count=len(hits))
+
+    def op_cancel(self, req: dict[str, Any]) -> dict[str, Any]:
+        if req.get("all"):
+            n = self.runs.cancel_all()
+            with self._lock:
+                self.counters["cancelled"] += n
+            return protocol.ok(req.get("id"), cancelled=n)
+        target = req.get("target")
+        if not isinstance(target, str) or not target:
+            raise protocol.ProtocolError(
+                "cancel requires a 'target' request id, or all=true")
+        hit = self.runs.cancel(target)
+        if hit:
+            with self._lock:
+                self.counters["cancelled"] += 1
+        return protocol.ok(req.get("id"), target=target, cancelled=1 if hit else 0,
+                           note="" if hit else "no in-flight request with that id")
+
+    def op_shutdown(self, req: dict[str, Any]) -> dict[str, Any]:
+        # Present so a supervisor or the CLI can stop the daemon cleanly; the
+        # actual stop is scheduled after the response is flushed.
+        threading.Timer(0.1, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+        return protocol.ok(req.get("id"), stopping=True)
+
+    def dispatch(self, req: dict[str, Any]) -> dict[str, Any]:
+        table: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
+            "ping": self.op_ping,
+            "status": self.op_status,
+            "ask": self.op_ask,
+            "memory.read": self.op_memory_read,
+            "memory.write": self.op_memory_write,
+            "memory.search": self.op_memory_search,
+            "cancel": self.op_cancel,
+            "shutdown": self.op_shutdown,
+        }
+        op = req["op"]
+        handler = table.get(op)
+        if handler is None:
+            return protocol.err(
+                req.get("id"), "UnknownOp",
+                f"unknown op {op!r}; known: {', '.join(sorted(table))}")
+        try:
+            return handler(req)
+        except MemoryCapExceeded as exc:
+            with self._lock:
+                self.counters["errors"] += 1
+            log.warning("memory cap exceeded", extra=luna_log.safe_extra(exc.to_dict()))
+            return protocol.err(req.get("id"), **_strip(exc.to_dict()))
+        except LunaMemoryError as exc:
+            with self._lock:
+                self.counters["errors"] += 1
+            return protocol.err(req.get("id"), **_strip(exc.to_dict()))
+        except agent.AgentError as exc:
+            with self._lock:
+                self.counters["errors"] += 1
+            log.warning("agent error", extra={"op": op, "detail": str(exc)})
+            return protocol.err(req.get("id"), **_strip(exc.to_dict()))
+        except protocol.ProtocolError as exc:
+            return protocol.err(req.get("id"), "ProtocolError", str(exc))
+        except Exception as exc:  # noqa: BLE001 - the daemon must survive anything
+            with self._lock:
+                self.counters["errors"] += 1
+            log.exception("unhandled error in %s", op)
+            return protocol.err(req.get("id"), "InternalError",
+                                f"{type(exc).__name__}: {exc}")
+
+    def close(self) -> None:
+        self.runs.cancel_all()
+        self.memory.close()
+
+
+def _strip(d: dict[str, Any]) -> dict[str, Any]:
+    """Adapt an exception dict to protocol.err's keyword signature."""
+    out = dict(d)
+    return {"error": out.pop("error", "Error"),
+            "message": out.pop("message", ""), **out}
+
+
+# =========================================================================
+# Socket plumbing
+# =========================================================================
+
+
+class _Handler(socketserver.StreamRequestHandler):
+    # A slow agent call must not be killed by a socket timeout, but a wedged
+    # client must not hold a thread forever either.
+    timeout = config.AGENT_TIMEOUT_S + 60
+
+    def handle(self) -> None:
+        daemon: Daemon = self.server.daemon  # type: ignore[attr-defined]
+        peer = "unix"
+        while True:
+            try:
+                line = self.rfile.readline()
+            except (TimeoutError, socket.timeout):
+                log.info("client idle timeout", extra={"peer": peer})
+                return
+            except OSError as exc:
+                if exc.errno not in (errno.ECONNRESET, errno.EPIPE):
+                    log.warning("read error", extra={"detail": str(exc)})
+                return
+            if not line:
+                return
+            if not line.strip():
+                continue
+            try:
+                req = protocol.decode(line)
+            except protocol.ProtocolError as exc:
+                response = protocol.err(None, "ProtocolError", str(exc))
+            else:
+                response = daemon.dispatch(req)
+            try:
+                self.wfile.write(protocol.encode(response))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                log.info("client vanished before the response was written")
+                return
+
+
+class LunaServer(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+    allow_reuse_address = False
+    request_queue_size = 32
+
+    def __init__(self, path: Path, daemon: Daemon) -> None:
+        self.socket_path = path
+        self.daemon = daemon
+        _clear_stale_socket(path)
+        super().__init__(str(path), _Handler)
+        os.chmod(path, 0o600)
+
+    def handle_error(self, request, client_address) -> None:  # noqa: ANN001
+        log.exception("handler crashed")
+
+    def server_close(self) -> None:
+        super().server_close()
+        try:
+            self.socket_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.warning("could not remove socket",
+                        extra={"path": str(self.socket_path), "detail": str(exc)})
+
+
+class AlreadyRunning(RuntimeError):
+    pass
+
+
+def _clear_stale_socket(path: Path) -> None:
+    """Remove a leftover socket, but never one a live daemon is listening on."""
+    if not path.exists():
+        return
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(1.0)
+    try:
+        probe.connect(str(path))
+    except (ConnectionRefusedError, FileNotFoundError):
+        path.unlink(missing_ok=True)
+        log.info("removed stale socket", extra={"path": str(path)})
+    except OSError:
+        path.unlink(missing_ok=True)
+    else:
+        raise AlreadyRunning(
+            f"another lunad is already listening on {path}. "
+            "Stop it with: systemctl --user stop lunad"
+        )
+    finally:
+        probe.close()
+
+
+def serve(agent_name: str | None = None) -> int:
+    """Run until SIGTERM/SIGINT. Returns a process exit code."""
+    daemon = Daemon(agent_name)
+    server = LunaServer(config.SOCKET_PATH, daemon)
+    stopping = threading.Event()
+
+    def _stop(signum: int, _frame: Any) -> None:
+        if stopping.is_set():
+            return
+        stopping.set()
+        log.info("shutting down", extra={"signal": signal.Signals(signum).name})
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    log.info("listening", extra={"socket": str(config.SOCKET_PATH),
+                                 "agent": daemon.agent_name,
+                                 "pid": os.getpid()})
+    try:
+        server.serve_forever(poll_interval=0.5)
+    finally:
+        server.server_close()
+        daemon.close()
+        log.info("stopped")
+    return 0
