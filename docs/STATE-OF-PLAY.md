@@ -59,6 +59,56 @@
   → typed into the focused window via `wtype`. `voxtype.service` was restarted
   once (config is only read at startup).
 
+### Phase 2
+- **Workspace dispatch.** `luna dispatch "..."` writes a job directory, spawns
+  `foot` (app-id `org.omarchy.luna`) running the agent under
+  `bypassPermissions --tools default --safe-mode`, and reports back. Verified
+  end to end: `create /tmp/luna-p2-proof.txt containing the current date` →
+  job `94c1c5d5`, exit 0 in 14.2 s, file on disk reading
+  `Tue Aug 25 11:13:18 PM GMT 2026`.
+- **The PID firewall.** `lunad/safety.py`, one gate, start-time checked against
+  `/proc/<pid>/stat` field 22. Proved against real pids while a job ran:
+  `may_signal(1470712)` (the voxtype daemon) → **False**, "Luna did not spawn
+  it", and `signal_pid` on it raised `SignalRefused` with voxtype still alive;
+  `may_signal(1473361)` (a job Luna spawned) → **True**.
+  `grep -rn 'pkill|os.kill|killpg|terminate()' lunad/ bin/` finds calls in
+  `safety.py` only; every other hit is prose. The Phase 1 speech barge-in and
+  the agent timeout now route through it.
+- **Audit log.** `~/.local/share/luna/audit.jsonl`, append-only, fsync per
+  line, `luna audit --since 30m`. Dispatches, spawns, signals, refusals and
+  memory writes, each with `why` and outcome. Undo is recorded only where an
+  inverse really exists.
+- **Sol.** `data/sol-persona.md`, own system prompt, own namespace
+  (`memory/sol/SOL.md` + its own episode store). `SolMemory.file("LUNA.md")`
+  raises. Verified live: job `615f6bcc`, `--to sol`, returned a report in the
+  specified Finding / Evidence / cost / what-I-did-not-check shape.
+- **`luna peek` / `luna jobs` / `luna spawned`.** Peek toggles
+  `special:luna` (confirmed via `monitors[].specialWorkspace`); jobs lists from
+  disk so it survives a daemon restart.
+- 288 tests pass, up from 157.
+
+## The Hyprland finding, in full
+
+Omarchy's Hyprland 0.56.2 takes a **Lua** config and `hyprctl` evaluates its
+arguments as Lua. The bracket exec syntax is therefore a Lua parse error, not a
+Hyprland one:
+
+```
+$ hyprctl dispatch exec "[float] echo hi"
+error: [string "return hl.dispatch(exec [float] echo hi)"]:1: ')' expected near 'echo'
+```
+
+`--`, quoting and `--instance` change nothing; `hyprctl keyword` answers
+`keyword can't work with non-legacy parsers. Use eval.` What works is the
+dispatcher's own Lua function — `hl.dsp.exec_cmd("[workspace special:luna
+silent] cmd")`, `hl.dsp.workspace.toggle_special("luna")` — and, for the
+runtime window rule, `hl.window_rule({ match = {...}, workspace = "..." })`,
+whose key names came from `/usr/share/omarchy/default/hypr/helpers.lua` because
+it accepts any table without complaint.
+
+Dispatch does not use `exec_cmd`: Luna must own the pid, so she `Popen`s `foot`
+herself and places the window with a rule.
+
 ## The cost finding, in full
 
 The Phase 0 note blamed ~$0.05/ask on "separate processes never share a prompt
@@ -86,16 +136,20 @@ saves. It is kept for conversational continuity, not for money.
   voxtype daemon only reads its config at startup, so `[profiles.luna]` was
   invisible until it was restarted. Verified healthy and plain dictation
   verified working afterwards.
-- omarchy-shell and other agent sessions: untouched.
+- omarchy-shell and other agent sessions: untouched. Phase 2 restarted
+  `lunad` only. (`voxtype` was restarted several times during the same window
+  by the concurrent OSD session, not by this work.)
 - **voxtype OSD**: `qs -p ~/.local/share/voxtype/quickshell` spawned by the
   voxtype daemon, plus its `voxtype-audio-bridge` child. Layer surface
   `voxtype-osd` on the overlay layer, visible only while not idle.
 
-## Next (Phase 2)
-1. Workspace dispatch: a special workspace, `foot` + agent with full autonomy.
-2. Sol — the specialist agent, own prompt, own memory namespace.
-3. Audit log (`~/.local/share/luna/audit.jsonl`) + undo journal.
-4. Wire `luna hush` to a keybind so a spoken reply can be cut off by hand.
+## Next (Phase 3)
+1. Bar widget + `subscribe` for live state.
+2. Ambient hooks: crash, battery, `omarchy update`.
+3. Semantic recall (sqlite-vec + local embeddings) and decay in tier 2.
+4. Tier 3 derived profile.
+5. Wire `luna hush` to a keybind so a spoken reply can be cut off by hand.
+6. Parallel worker fan-out — `dispatch` is one job per call today.
 
 ## Known limitations / stubbed
 - **Codex adapter is still a declared stub.** Its headless flags were never
@@ -108,6 +162,18 @@ saves. It is kept for conversational continuity, not for money.
 - **Barge-in has no keybind yet.** `luna hush` works from a terminal only.
 - **A voice ask that fails speaks a generic apology**, not the actual error;
   the detail is in `luna log`.
+- **A dispatched session is not sandboxed.** It runs with `bypassPermissions`
+  and real tools, so it could write anywhere the user can. Sol's namespace
+  isolation is enforced in lunad's memory API and stated in his prompt; it is
+  not a filesystem boundary. The audit log is the mitigation.
+- **The Hyprland window rule is runtime-only.** It vanishes on a config reload
+  and is re-added by the next dispatch. Between the two, a dispatched window
+  would open on the active workspace — the job still runs, and `luna jobs`
+  says so in its note.
+- **`dispatch` does not fan out.** One job per call.
+- **Job directories are never garbage-collected.** `~/.local/share/luna/jobs/`
+  grows one directory per dispatch.
+- **The audit log is never rotated**, on purpose. It grows without bound.
 - **The `[osd]` sizing keys are inert under the Quickshell frontend.**
   `position` / `width_px` / `height_px` / `margin_px` reach only the GTK4 and
   native frontends; the Quickshell OSD's geometry lives in its `Theme.qml`.

@@ -14,10 +14,10 @@ import unittest
 import uuid
 from typing import Any
 
-from lunad import agent, protocol
+from lunad import agent, dispatch, protocol
 from lunad.server import Daemon, LunaServer
 
-from ._support import TempMemoryCase
+from ._support import FakeHyprland, TempMemoryCase
 
 
 class FakeAdapter(agent.BaseAdapter):
@@ -94,9 +94,31 @@ class ProtocolTests(unittest.TestCase):
             protocol.decode(b"x" * (protocol.MAX_LINE_BYTES + 1))
 
 
-class DispatchTests(TempMemoryCase):
+class DaemonCase(TempMemoryCase):
+    """A Daemon wired to temp state and a fake compositor.
+
+    Phase 2 gave the daemon two more things that reach outside the process —
+    an audit log and a dispatcher that shells out to ``hyprctl``. Both are
+    injected here so the suite neither writes to the user's audit log nor
+    depends on a live Wayland session.
+    """
+
+    def build_daemon(self, **kw: object) -> Daemon:
+        self.hypr = FakeHyprland()
+        dispatcher = dispatch.Dispatcher(jobs_dir=self.root / "jobs",
+                                         hypr=self.hypr, audit=self.audit,
+                                         sol_memory_dir=self.root / "sol",
+                                         agent_bin="/bin/true")
+        daemon = Daemon(agent_name="claude", memory=self.memory(),
+                        sol_memory=self.sol_memory(), audit=self.audit,
+                        dispatcher=dispatcher, **kw)
+        self.addCleanup(daemon.close)
+        return daemon
+
+
+class DispatchTests(DaemonCase):
     def daemon(self, adapter: agent.BaseAdapter | None = None) -> Daemon:
-        d = Daemon(agent_name="claude", memory=self.memory())
+        d = self.build_daemon()
         d.adapter = adapter or FakeAdapter()
         d.speech.close()          # no piper, no aplay, no audio in tests
         d.speech = MuteSpeech()
@@ -322,13 +344,13 @@ class DispatchTests(TempMemoryCase):
         self.assertEqual(resp["cancelled"], 0)
 
 
-class SocketTests(TempMemoryCase):
+class SocketTests(DaemonCase):
     """End-to-end over a real Unix socket, including concurrency."""
 
     def setUp(self) -> None:
         super().setUp()
         self.adapter = FakeAdapter(delay=0.4)
-        self.daemon = Daemon(agent_name="claude", memory=self.memory())
+        self.daemon = self.build_daemon()
         self.daemon.adapter = self.adapter
         self.sock_path = self.root / "luna.sock"
         self.server = LunaServer(self.sock_path, self.daemon)
@@ -403,12 +425,93 @@ class SocketTests(TempMemoryCase):
 
     def test_server_close_removes_the_socket(self):
         path = self.root / "throwaway.sock"
-        daemon = Daemon(agent_name="claude", memory=self.memory())
+        daemon = self.build_daemon()
         server = LunaServer(path, daemon)
         self.assertTrue(path.exists())
         server.server_close()
         daemon.close()
         self.assertFalse(path.exists())
+
+
+class Phase2OpTests(DaemonCase):
+    """The ops added in Phase 2, exercised through the daemon's own dispatch."""
+
+    def daemon(self) -> Daemon:
+        d = self.build_daemon()
+        d.adapter = FakeAdapter()
+        d.speech.close()
+        d.speech = MuteSpeech()
+        return d
+
+    def test_peek_toggles_the_workspace(self):
+        d = self.daemon()
+        first = d.dispatch({"op": "peek"})
+        self.assertTrue(first["ok"])
+        self.assertTrue(first["visible"])
+        self.assertFalse(d.dispatch({"op": "peek"})["visible"])
+
+    def test_jobs_is_empty_before_anything_is_dispatched(self):
+        resp = self.daemon().dispatch({"op": "jobs"})
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["jobs"], [])
+        self.assertTrue(resp["workspace"]["available"])
+
+    def test_dispatch_requires_a_task(self):
+        resp = self.daemon().dispatch({"op": "dispatch", "task": "  "})
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"], "ProtocolError")
+
+    def test_audit_reads_back_what_the_daemon_wrote(self):
+        d = self.daemon()
+        resp = d.dispatch({"op": "audit"})
+        self.assertTrue(resp["ok"])
+        actions = [e["action"] for e in resp["entries"]]
+        self.assertIn("daemon.started", actions)
+
+    def test_audit_rejects_a_since_it_cannot_parse(self):
+        resp = self.daemon().dispatch({"op": "audit", "since": "yesterdayish"})
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"], "ProtocolError")
+
+    def test_audit_since_filters(self):
+        d = self.daemon()
+        self.audit.append("marker.recent", ok=True)
+        resp = d.dispatch({"op": "audit", "since": "1m"})
+        self.assertIn("marker.recent", [e["action"] for e in resp["entries"]])
+        resp = d.dispatch({"op": "audit", "since": "1m", "action": "nothing."})
+        self.assertEqual(resp["entries"], [])
+
+    def test_spawned_reports_the_allowlist(self):
+        resp = self.daemon().dispatch({"op": "spawned"})
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["tracked"], 0)
+        self.assertEqual(resp["entries"], [])
+
+    def test_spawned_check_refuses_a_pid_luna_did_not_spawn(self):
+        """The firewall, answerable from outside the process."""
+        import os
+        resp = self.daemon().dispatch({"op": "spawned", "check": os.getppid()})
+        self.assertTrue(resp["ok"])
+        self.assertFalse(resp["check"]["may_signal"])
+        self.assertIn("did not spawn", resp["check"]["reason"])
+
+    def test_cancelling_an_unknown_job_is_reported_not_raised(self):
+        resp = self.daemon().dispatch({"op": "jobs", "cancel": "nope"})
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["cancelled"], 0)
+
+    def test_status_reports_the_firewall_and_the_workspace(self):
+        resp = self.daemon().dispatch({"op": "status"})
+        self.assertIn("spawned", resp)
+        self.assertIn("dispatch", resp)
+        self.assertTrue(resp["dispatch"]["workspace"]["available"])
+        self.assertEqual(resp["dispatch"]["workspace"]["workspace"],
+                         "special:luna")
+
+    def test_the_new_ops_are_listed_when_an_op_is_unknown(self):
+        resp = self.daemon().dispatch({"op": "nope"})
+        for op in ("dispatch", "jobs", "peek", "audit", "spawned"):
+            self.assertIn(op, resp["message"])
 
 
 if __name__ == "__main__":

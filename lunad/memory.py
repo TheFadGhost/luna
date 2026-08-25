@@ -678,3 +678,62 @@ class Memory:
 
     def close(self) -> None:
         self.episodes.close()
+
+
+class SolMemory:
+    """Sol's namespace — deliberately not a :class:`Memory`.
+
+    Sol is a specialist who reports to Luna, and the failure mode worth
+    designing against is not malice but drift: two agents editing one model of
+    the world until neither is right and nobody can say which write was wrong.
+    So the separation is structural rather than advisory.
+
+    * different directory (``memory/sol/``), so a path mistake lands somewhere
+      harmless rather than in ``LUNA.md``;
+    * different episode store, so Sol's job chatter never surfaces as recall in
+      Luna's conversation;
+    * :meth:`file` knows exactly one name. Asking it for ``LUNA.md`` raises,
+      with the reason, rather than returning a handle.
+
+    The class enforces this for every path that goes through ``lunad``. A
+    dispatched session holding real tools could in principle write anywhere on
+    the disk; that is bounded by its system prompt and by the audit log, not by
+    this object, and the docs say so rather than implying otherwise.
+    """
+
+    NAME = "SOL.md"
+
+    def __init__(self, root: Path = config.SOL_MEMORY_DIR) -> None:
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.sol = Tier1File(self.root / self.NAME, config.SOL_MD_CAP, self.NAME)
+        self.episodes = EpisodeStore(self.root / "episodes.db")
+
+    def file(self, name: str) -> Tier1File:
+        key = name.strip().upper().removesuffix(".MD")
+        if key == "SOL":
+            return self.sol
+        if key in ("LUNA", "USER"):
+            raise MemoryError(
+                f"{name} belongs to Luna. Sol's namespace holds SOL.md only; "
+                "a specialist does not edit his supervisor's memory. Put it in "
+                "the report instead."
+            )
+        raise MemoryError(
+            f"unknown file {name!r} in Sol's namespace; expected SOL.md"
+        )
+
+    def block(self) -> str:
+        """Sol's tier-1 block, for his system prompt. May be empty."""
+        entries = self.sol.entries()
+        if not entries:
+            return ""
+        return "\n".join(f"- {e}" for e in entries)
+
+    def usage(self) -> dict[str, Any]:
+        return {"namespace": str(self.root),
+                "SOL.md": self.sol.usage(),
+                "episodes": self.episodes.stats()}
+
+    def close(self) -> None:
+        self.episodes.close()

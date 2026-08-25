@@ -23,9 +23,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from . import (__version__, agent, config, log as luna_log, persona,
-               protocol, session as sessions, speech)
-from .memory import Memory, MemoryCapExceeded, MemoryError as LunaMemoryError
+from . import (__version__, agent, audit as audit_mod, config, dispatch,
+               log as luna_log, persona, protocol, safety,
+               session as sessions, speech)
+from .memory import (Memory, MemoryCapExceeded, MemoryError as LunaMemoryError,
+                     SolMemory)
 
 log = logging.getLogger("lunad.server")
 
@@ -39,12 +41,23 @@ class Daemon:
     """Everything the handlers need, built once."""
 
     def __init__(self, agent_name: str | None = None,
-                 memory: Memory | None = None) -> None:
+                 memory: Memory | None = None,
+                 sol_memory: SolMemory | None = None,
+                 audit: audit_mod.AuditLog | None = None,
+                 dispatcher: dispatch.Dispatcher | None = None) -> None:
         config.ensure_dirs()
         self.started = time.time()
         # `memory` is injectable so tests can run against a temp directory
         # without touching the user's real memory files.
         self.memory = memory if memory is not None else Memory()
+        self.sol_memory = sol_memory if sol_memory is not None else SolMemory()
+        self.audit = audit if audit is not None else audit_mod.audit()
+        # Every signal and every spawn lands in the audit log from here on.
+        # The firewall holds the hook rather than importing audit itself, so
+        # `safety` stays at the bottom of the dependency graph.
+        safety.set_audit_hook(self.audit.hook)
+        self.dispatcher = (dispatcher if dispatcher is not None
+                           else dispatch.Dispatcher(audit=self.audit))
         self.runs = agent.RunRegistry()
         self.agent_name = (agent_name or agent.read_default_agent()).lower()
         self.adapter = agent.get_adapter(self.agent_name)
@@ -66,6 +79,10 @@ class Daemon:
             "daemon initialised",
             extra={"agent": self.agent_name, "version": __version__},
         )
+        self.audit.append("daemon.started", ok=True, agent=self.agent_name,
+                          version=__version__,
+                          why="lunad came up",
+                          tracked_pids=len(safety.ledger()))
 
     # -- operations ------------------------------------------------------
 
@@ -106,6 +123,11 @@ class Daemon:
                 "chars": len(self.persona_spec),
             },
             speech=self.speech.status(),
+            dispatch=self.dispatcher.snapshot(),
+            audit=self.audit.stats(),
+            spawned={"tracked": len(safety.ledger()),
+                     "refusals": safety.ledger().refusals,
+                     "path": str(config.SPAWNED_PATH)},
             sessions={
                 "live": self.sessions.snapshot(),
                 "counters": dict(self.sessions.counters),
@@ -296,15 +318,44 @@ class Daemon:
                                dropped=1 if self.sessions.drop(str(target)) else 0)
         return protocol.ok(req.get("id"), dropped=self.sessions.clear())
 
+    def _namespace(self, req: dict[str, Any]) -> tuple[str, Any]:
+        """Pick the memory namespace for a request.
+
+        Two namespaces, never one with a prefix: Luna's tier-1 files and Sol's.
+        `SolMemory.file` refuses LUNA.md and USER.md by name, so a request that
+        names Sol's namespace cannot reach Luna's memory even by asking for it
+        directly.
+        """
+        name = str(req.get("namespace") or "luna").strip().lower()
+        if name == "luna":
+            return "luna", self.memory
+        if name == "sol":
+            return "sol", self.sol_memory
+        raise protocol.ProtocolError(
+            f"unknown memory namespace {name!r}; expected 'luna' or 'sol'")
+
     def op_memory_read(self, req: dict[str, Any]) -> dict[str, Any]:
+        namespace, store = self._namespace(req)
         name = req.get("file")
         if name:
-            handle = self.memory.file(str(name))
+            handle = store.file(str(name))
             return protocol.ok(req.get("id"), file=handle.name,
+                               namespace=namespace,
                                entries=handle.entries(), usage=handle.usage(),
                                text=handle.text())
+        if namespace == "sol":
+            return protocol.ok(
+                req.get("id"), namespace="sol",
+                tier1={"SOL.md": {"entries": store.sol.entries(),
+                                  "usage": store.sol.usage()}},
+                recent=[e.to_dict() for e in
+                        store.episodes.recent(int(req.get("limit") or 10))],
+                tier2=store.episodes.stats(),
+                dir=str(store.root),
+            )
         return protocol.ok(
             req.get("id"),
+            namespace="luna",
             tier1={
                 "LUNA.md": {"entries": self.memory.luna.entries(),
                             "usage": self.memory.luna.usage()},
@@ -317,7 +368,9 @@ class Daemon:
         )
 
     def op_memory_write(self, req: dict[str, Any]) -> dict[str, Any]:
-        handle = self.memory.file(str(req.get("file") or "LUNA.md"))
+        namespace, store = self._namespace(req)
+        default = "SOL.md" if namespace == "sol" else "LUNA.md"
+        handle = store.file(str(req.get("file") or default))
         mode = str(req.get("mode") or "append").lower()
         if mode == "append":
             entry = req.get("entry")
@@ -343,8 +396,21 @@ class Daemon:
                 "expected append, replace or remove")
         log.info("memory.write", extra={"file": handle.name, "mode": mode,
                                         "pct": usage["pct"]})
+        # The only tier-1 write with a genuine inverse is an append: the entry
+        # that was just added is the last index, and removing it restores the
+        # file exactly. `replace` and `remove` discard text that is not kept
+        # anywhere, so no undo is claimed for them.
+        undo = (audit_mod.undo_for_memory_append(handle.name,
+                                                 len(handle.entries()) - 1)
+                if mode == "append" else None)
+        self.audit.append("memory.write", ok=True, actor=namespace,
+                          file=handle.name, mode=mode,
+                          chars=usage["chars"], pct=usage["pct"],
+                          why=str(req.get("why") or "curated memory updated"),
+                          undo=undo)
         return protocol.ok(req.get("id"), file=handle.name, mode=mode,
-                           usage=usage, entries=handle.entries())
+                           namespace=namespace, usage=usage,
+                           entries=handle.entries())
 
     def op_memory_search(self, req: dict[str, Any]) -> dict[str, Any]:
         query = req.get("query")
@@ -372,10 +438,104 @@ class Daemon:
         return protocol.ok(req.get("id"), target=target, cancelled=1 if hit else 0,
                            note="" if hit else "no in-flight request with that id")
 
+    # -- Phase 2: delegation, the workspace, and the record -------------
+
+    def op_dispatch(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Hand a task to a real agent session in the `luna` workspace."""
+        task = req.get("task")
+        if not isinstance(task, str) or not task.strip():
+            raise protocol.ProtocolError("dispatch requires a non-empty 'task'")
+        to = str(req.get("to") or "worker").lower()
+        block = self.sol_memory.block() if to == "sol" else ""
+        job = self.dispatcher.dispatch(
+            task, to,
+            timeout=float(req.get("timeout") or config.DISPATCH_TIMEOUT_S),
+            sol_memory_block=block)
+        payload = job.to_dict()
+        payload["announce"] = self.dispatcher.announce(job)
+        if req.get("wait"):
+            # Blocking is opt-in. The default is to hand back the job id
+            # immediately, because a dispatched job runs for minutes and the
+            # socket client should not be holding a thread for all of it.
+            payload = self._wait_for_job(job, float(req.get("wait_timeout") or
+                                                    config.DISPATCH_TIMEOUT_S))
+            payload["announce"] = self.dispatcher.announce(job)
+        return protocol.ok(req.get("id"), **payload)
+
+    def _wait_for_job(self, job: dispatch.Job, timeout: float) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if job.state != "running":
+                break
+            time.sleep(0.5)
+        payload = job.to_dict(output=job.read_output())
+        if job.state == "running":
+            payload["note"] = (f"still running after {timeout:.0f}s; "
+                               f"`luna jobs` for the outcome")
+        return payload
+
+    def op_jobs(self, req: dict[str, Any]) -> dict[str, Any]:
+        target = req.get("cancel")
+        if target:
+            stopped = self.dispatcher.cancel(str(target))
+            return protocol.ok(req.get("id"), cancelled=1 if stopped else 0,
+                               target=str(target),
+                               note="" if stopped else
+                                    "no running job with that id in this daemon")
+        jobs = self.dispatcher.jobs(limit=int(req.get("limit")
+                                              or config.JOB_LIST_LIMIT),
+                                    with_output=bool(req.get("output")))
+        return protocol.ok(req.get("id"), jobs=jobs, count=len(jobs),
+                           workspace=self.dispatcher.hypr.state())
+
+    def op_peek(self, req: dict[str, Any]) -> dict[str, Any]:
+        return protocol.ok(req.get("id"), **self.dispatcher.peek())
+
+    def op_audit(self, req: dict[str, Any]) -> dict[str, Any]:
+        try:
+            since = audit_mod.parse_since(req.get("since"))
+        except ValueError as exc:
+            raise protocol.ProtocolError(str(exc)) from exc
+        entries = self.audit.read(since=since,
+                                  limit=int(req.get("limit") or 40),
+                                  action=req.get("action"))
+        return protocol.ok(req.get("id"), entries=entries, count=len(entries),
+                           summary=audit_mod.summarise(entries),
+                           **self.audit.stats())
+
+    def op_spawned(self, req: dict[str, Any]) -> dict[str, Any]:
+        """The signal allowlist, and the gate's answer for a given pid.
+
+        Exposed so the firewall can be inspected from outside the process —
+        `luna spawned --check <pid>` is how the refusal is demonstrated on a
+        pid Luna did not spawn.
+        """
+        lg = safety.ledger()
+        payload: dict[str, Any] = {
+            "path": str(config.SPAWNED_PATH),
+            "tracked": len(lg),
+            "refusals": lg.refusals,
+            "entries": lg.entries(include_dead=bool(req.get("all"))),
+        }
+        pid = req.get("check")
+        if pid is not None:
+            allowed = lg.may_signal(pid)
+            payload["check"] = {
+                "pid": pid,
+                "may_signal": allowed,
+                "reason": "" if allowed else lg.why_not(pid),
+                "cmdline": safety.process_cmdline(int(pid))[:200]
+                if str(pid).isdigit() else "",
+            }
+        return protocol.ok(req.get("id"), **payload)
+
     def op_shutdown(self, req: dict[str, Any]) -> dict[str, Any]:
         # Present so a supervisor or the CLI can stop the daemon cleanly; the
         # actual stop is scheduled after the response is flushed.
-        threading.Timer(0.1, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+        # safety.signal_self, not os.kill: the daemon signalling itself is the
+        # one deliberate exception to the firewall, and it is written down in
+        # exactly one place so a grep for os.kill lands there.
+        threading.Timer(0.1, lambda: safety.signal_self(signal.SIGTERM)).start()
         return protocol.ok(req.get("id"), stopping=True)
 
     def dispatch(self, req: dict[str, Any]) -> dict[str, Any]:
@@ -389,6 +549,11 @@ class Daemon:
             "memory.read": self.op_memory_read,
             "memory.write": self.op_memory_write,
             "memory.search": self.op_memory_search,
+            "dispatch": self.op_dispatch,
+            "jobs": self.op_jobs,
+            "peek": self.op_peek,
+            "audit": self.op_audit,
+            "spawned": self.op_spawned,
             "cancel": self.op_cancel,
             "shutdown": self.op_shutdown,
         }
@@ -414,6 +579,18 @@ class Daemon:
                 self.counters["errors"] += 1
             log.warning("agent error", extra={"op": op, "detail": str(exc)})
             return protocol.err(req.get("id"), **_strip(exc.to_dict()))
+        except dispatch.DispatchError as exc:
+            with self._lock:
+                self.counters["errors"] += 1
+            log.warning("dispatch error", extra={"op": op, "detail": str(exc)})
+            return protocol.err(req.get("id"), **_strip(exc.to_dict()))
+        except safety.SignalRefused as exc:
+            # The firewall said no. That is not an internal error and it is not
+            # something to retry; it is the answer.
+            log.warning("signal refused", extra={"op": op, "pid": exc.pid,
+                                                 "reason": exc.reason})
+            return protocol.err(req.get("id"), "SignalRefused", str(exc),
+                                pid=exc.pid, reason=exc.reason)
         except protocol.ProtocolError as exc:
             return protocol.err(req.get("id"), "ProtocolError", str(exc))
         except Exception as exc:  # noqa: BLE001 - the daemon must survive anything
@@ -426,7 +603,12 @@ class Daemon:
     def close(self) -> None:
         self.runs.cancel_all()
         self.speech.close()
+        self.dispatcher.close()
         self.memory.close()
+        self.sol_memory.close()
+        self.audit.append("daemon.stopped", ok=True,
+                          why="lunad shutting down",
+                          uptime_s=round(time.time() - self.started, 1))
 
 
 def _strip(d: dict[str, Any]) -> dict[str, Any]:

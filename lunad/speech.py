@@ -31,7 +31,6 @@ import json
 import logging
 import os
 import re
-import signal
 import subprocess
 import threading
 import time
@@ -39,7 +38,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from . import config
+from . import config, safety
 
 log = logging.getLogger("lunad.speech")
 
@@ -509,9 +508,13 @@ class Speech:
         argv = [self.aplay, "-q", "-r", str(rate), "-f", "S16_LE", "-c", "1",
                 "-t", "raw", "-"]
         try:
-            player = subprocess.Popen(
-                argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE, start_new_session=True)
+            # The barge-in kills this pid, so this pid must be in the ledger
+            # before it can start making noise. `durable=False` keeps the
+            # ~4 ms fsync out of the path that decides how fast Luna speaks.
+            player = safety.spawn(
+                argv, kind="tts-play", durable=False, note="aplay",
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE)
         except OSError as exc:
             raise SpeechUnavailable(f"could not start {self.aplay}: {exc}") from exc
         with self._lock:
@@ -561,10 +564,13 @@ class Speech:
                     str(self.model), str(self.voice_config)]
             started = time.monotonic()
             try:
-                proc = subprocess.Popen(
-                    argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE, start_new_session=True,
-                    cwd=str(config.PROJECT_DIR))
+                # Registered in the signal ledger by the same call that forks
+                # it, so the idle unload and the barge-in have a pid they can
+                # prove is theirs. Not durable: piper dies with the daemon.
+                proc = safety.spawn(
+                    argv, kind="tts-worker", durable=False, note="piper worker",
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, cwd=str(config.PROJECT_DIR))
             except OSError as exc:
                 raise SpeechUnavailable(f"could not start piper: {exc}") from exc
 
@@ -632,21 +638,27 @@ class Speech:
             return False
 
     @staticmethod
-    def _kill(proc: subprocess.Popen) -> None:
-        if proc.poll() is not None:
-            return
+    def _kill(proc: subprocess.Popen, reason: str = "speech stopped") -> None:
+        """Stop a child this module spawned — through the firewall, always.
+
+        A barge-in is the most latency-sensitive kill in the daemon and it was
+        the most tempting place to keep a direct ``killpg``. It does not have
+        one: the ledger lookup is a dict hit and one ``/proc`` read, and the
+        alternative is a second copy of the rule that must never be wrong.
+
+        Grace is 1.5 s rather than 5: this is ``aplay`` and a piper worker
+        being told to stop, and a barge-in that waits five seconds to go quiet
+        is not a barge-in.
+        """
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            return
-        for _ in range(30):
-            if proc.poll() is not None:
-                return
-            time.sleep(0.05)
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+            safety.terminate(proc, grace=1.5, reason=reason)
+        except safety.SignalRefused:
+            # Not reachable through any current path — every proc handed here
+            # came from safety.spawn. If it ever happens, it is a real bug and
+            # the log has to say so rather than the daemon dying mid-sentence.
+            log.exception("speech tried to signal a process Luna does not own")
+        finally:
+            safety.reap(proc)
 
 
 # =========================================================================

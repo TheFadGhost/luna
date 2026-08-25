@@ -3,7 +3,7 @@
 A resident personal assistant for Omarchy. Not a chatbot: a supervised daemon
 with a voice, a memory that compounds, and the run of the desktop.
 
-Status: Phases 0 and 1 built and running. Phases 2-3 are design.
+Status: Phases 0, 1 and 2 built and running. Phase 3 is design.
 Where reality contradicted the design, the design text has been corrected
 in place and the correction is marked **CORRECTED**.
 
@@ -42,11 +42,16 @@ in place and the correction is marked **CORRECTED**.
     derived)          |
                       v
           special workspace "luna"
-          foot + codex/claude, full autonomy
+          foot (app-id org.omarchy.luna)
+          + claude, full autonomy
                       |
                       v
               Sol / worker agents
 ```
+
+Everything `lunad` forks — the piper worker, `aplay`, a headless `ask`, a
+dispatched terminal — goes through `safety.spawn` and lands in the signal
+allowlist. Nothing else in the package may deliver a signal (section 7).
 
 ## 2. Processes and their budget
 
@@ -67,7 +72,9 @@ is the only thing that touches memory or spawns agents. This is what stops the
 system becoming four half-integrations that each grew their own state.
 
 Requests, as built: `ping`, `ask`, `say`, `speak.cancel`, `session.reset`,
-`status`, `memory.{read,write,search}`, `cancel`, `shutdown`. `subscribe`
+`status`, `memory.{read,write,search}`, `dispatch`, `jobs`, `peek`, `audit`,
+`spawned`, `cancel`, `shutdown`. `memory.read`/`memory.write` take an optional
+`namespace` (`luna` or `sol`). `subscribe`
 (for the bar widget's live state) is Phase 3. `listen_start` was dropped: the
 keybind talks to voxtype directly, so the daemon never needs to start a
 recording.
@@ -277,23 +284,157 @@ Piper specifics (researched, not assumed):
 - **Luna** is the only one the user addresses. Conversational, opinionated,
   budget-aware. She triages and decides who does the work.
 - **Sol** is a specialist she enrols for deep technical work: own system prompt,
-  own skill set, own memory namespace, reports back to Luna not to the user.
-- **Workers** are anonymous, parallel, disposable. Fan-out grunt work.
+  own memory namespace (`memory/sol/SOL.md` + its own episode store), reports
+  back to Luna not to the user. Spec in `data/sol-persona.md`.
+- **Workers** are anonymous, disposable. Fan-out grunt work. Parallel fan-out
+  is not built: `dispatch` is one job per call. Nothing stops several being in
+  flight, but Luna does not plan a fan-out for you.
 
-Luna announces who she enrolled and why, in one line. She does not delegate
-what she could finish in one step.
+Luna announces who she enrolled and why, in one line. The line is composed in
+`dispatch.py`, not asked of a model — an announcement that cost four seconds
+and an API call would not get made. She does not delegate what she could finish
+in one step.
 
-## 7. Safety under full autonomy
+### How a job actually runs — BUILT, and not as designed
+
+`luna dispatch "..."` writes a job directory under
+`~/.local/share/luna/jobs/<id>/` (`task.txt`, `system.txt`, `run.sh`,
+`output.txt`, `stderr.txt`, `exit`, `job.json`), spawns `foot` running
+`run.sh`, and watches the pid. `run.sh` runs the configured agent with
+`--permission-mode bypassPermissions --tools default --safe-mode`, wrapped in
+`timeout`, piped through `tee`. `luna jobs` lists them newest first, from disk,
+so the list survives a daemon restart; `luna peek` toggles the workspace.
+
+Four things the design got wrong, corrected here:
+
+- **CORRECTED: Luna spawns the terminal herself; Hyprland does not.** The
+  obvious route is an exec rule — `hyprctl dispatch exec "[workspace
+  special:luna silent] foot ..."` — which lets the compositor place the window.
+  It also means the compositor owns the pid: Luna could not claim the process,
+  wait on it, or read its exit status, and the firewall in section 7 is only
+  worth something if the ledger records forks she actually performed. So `foot`
+  is started with `subprocess.Popen` and placed with a *window* rule instead.
+- **CORRECTED: `omarchy-launch-tui` is not used.** It ends in
+  `exec setsid uwsm-app -- xdg-terminal-exec ...`, which is three layers of
+  re-exec between Luna and the terminal. The pid she would get back is not the
+  pid that ends up running. Same reason as above.
+- **CORRECTED: the app-id is `org.omarchy.luna`, not `org.omarchy.agent`.**
+  `omarchy-launch-tui` gives agent terminals the app-id `org.omarchy.agent`,
+  and the user had four windows carrying it open while this was being built. A
+  workspace rule matching that class would have swept live sessions into Luna's
+  hidden workspace. This was the single most dangerous thing this phase could
+  have got wrong.
+- **CORRECTED: the workspace is `luna`, and the rule is installed at runtime.**
+  `scratchpad` is bound to SUPER+S and belongs to the user. The window rule is
+  added through `hyprctl repl` behind a Lua global, so repeated dispatches do
+  not stack duplicates and nothing under `~/.config/hypr` is edited. It
+  disappears on the next Hyprland config reload, at which point the next
+  dispatch adds it again.
+
+### The Hyprland incantation — the thing that cost the time
+
+Omarchy's Hyprland (0.56.2 here) takes a **Lua** config, and `hyprctl` wraps
+its arguments in `return hl.dispatch(<args>)` before evaluating them. So the
+familiar bracket syntax is not a Hyprland error, it is a *Lua parse* error:
+
+```
+$ hyprctl dispatch exec "[float] echo hi"
+error: [string "return hl.dispatch(exec [float] echo hi)"]:1: ')' expected near 'echo'
+```
+
+`--`, quoting and `hyprctl --instance` do not help: the text never reaches a
+shell. Nor does `hyprctl keyword`, which answers
+`keyword can't work with non-legacy parsers. Use eval.` The forms that work:
+
+```sh
+# exec with window rules — rules stay inside the Lua string
+hyprctl dispatch 'hl.dsp.exec_cmd("[workspace special:luna silent] foo")'
+
+# show/hide the special workspace
+hyprctl dispatch 'hl.dsp.workspace.toggle_special("luna")'
+
+# a window rule at runtime (this is what dispatch uses)
+hyprctl repl 'hl.window_rule({ match = { class = "^org\.omarchy\.luna$" },
+                               workspace = "special:luna silent" })'
+```
+
+`hl.window_rule` accepts almost any table without complaining, so its key names
+could not be discovered by experiment. They were read from Omarchy's own
+`/usr/share/omarchy/default/hypr/helpers.lua`.
+
+Two more measured details: `hyprctl activeworkspace` never reports a special
+workspace — read `monitors[].specialWorkspace.name` instead. And `foot` *does*
+propagate its child's exit code, though `run.sh` writes `exit` to disk anyway,
+because that is the copy that survives a daemon restart.
+
+## 7. Safety under full autonomy — BUILT
 
 No permission prompts, by choice. Instead:
-- **Audit log** — `~/.local/share/luna/audit.jsonl`, append-only, every command
-  she runs with cwd, exit code, and what she was trying to achieve.
-- **Undo journal** — reversible actions record their inverse where one exists.
-- **Session firewall** — Luna refuses to signal PIDs she did not spawn, and
-  never restarts omarchy-shell. Both are recorded dead-ends in CUSTOMISATIONS.md.
-- **The five** — wiping disks, force-pushing over history, deleting the
-  customisations log, `rm -rf` outside her own dirs, touching another agent's
-  session: stated risk, second explicit instruction required. Judgement, not a prompt.
+
+### Session firewall — `lunad/safety.py`
+
+One gate, `may_signal(pid) -> bool`, and every path in `lunad` that could
+deliver a signal goes through it. It answers True only if **Luna spawned that
+pid** and **the process now holding it is still the one she spawned**.
+
+The second half is not decoration. Linux recycles pids, so a ledger that
+remembers only numbers hands out permission to whoever inherits one. Each
+record stores field 22 of `/proc/<pid>/stat` — start time in clock ticks since
+boot, stable for the life of a process — and a mismatch drops the record and
+refuses. The comm field (2) can contain spaces and parentheses, so the parse
+splits after the *last* `)`; getting that wrong would shift every later field
+and reject processes Luna really did spawn.
+
+Refusals **raise** (`SignalRefused`), never return False into a caller that can
+ignore them. `signal_group` additionally refuses any pid that is not its own
+process group leader — a child sharing the daemon's group would take the daemon
+with it. Everything Luna spawns gets `start_new_session=True`, so that check is
+satisfied by construction and violated only by a bug.
+
+`safety.spawn()` is the other half of the same gate: `Popen` and ledger
+registration as one operation, so there is no window in which Luna owns a
+process she cannot prove is hers. The allowlist is
+`~/.local/share/luna/spawned.json`. Durable records (dispatched jobs, which
+outlive the daemon) are fsync'd; transient ones (the piper worker, `aplay`, a
+headless `ask`) are not — a measured ~4 ms fsync is not worth paying in the
+path that decides how fast Luna starts speaking, for a record that is worthless
+after a crash anyway.
+
+`pkill`, `killall` and every other match-by-name kill are banned outright, and
+a test reads the shipped source to prove it: `os.kill`/`os.killpg` appear in
+`safety.py` and nowhere else, no `Popen.terminate()`/`.kill()` survives, and
+every child is spawned through `safety.spawn`. The one deliberate exception is
+`signal_self`, the daemon stopping itself — `may_signal` refuses `getpid()`
+precisely so self-termination cannot be reached by accident.
+
+### Audit log — `lunad/audit.py`
+
+`~/.local/share/luna/audit.jsonl`. Opened `"a"`, fsync'd per line, never
+truncated, never rotated. A log Luna can rewrite is not evidence. Every
+dispatch, spawn, signal, refusal and memory write, with `why` (the intent, not
+the mechanics), the outcome, and the exit status. `luna audit [--since 30m]`
+reads it back newest first.
+
+**Undo journal — deliberately sparse.** An inverse is recorded only where one
+genuinely exists and is known at the time: a tier-1 *append* is undone by
+removing the index it landed at, a dispatched job by cancelling it, `peek` by
+itself. `replace` and `remove` discard text that is not kept anywhere, so no
+undo is claimed for them. A fabricated undo command is worse than none,
+because someone will run it.
+
+### The five
+Wiping disks, force-pushing over history, deleting the customisations log,
+`rm -rf` outside her own dirs, touching another agent's session: stated risk,
+second explicit instruction required. Judgement, not a prompt. This is persona,
+not code — the code enforces the pid boundary, not the other four.
+
+### What is *not* enforced by code
+A dispatched session runs with `bypassPermissions` and real tools. It could
+write anywhere the user can. Sol's namespace isolation is enforced in `lunad`'s
+own memory API (`SolMemory.file` refuses `LUNA.md` and `USER.md` by name) and
+stated in his system prompt; it is not a filesystem sandbox, and this document
+says so rather than implying otherwise. The audit log is what makes that
+tolerable.
 
 ## 8. Build phases
 
@@ -301,7 +442,7 @@ No permission prompts, by choice. Instead:
 |---|---|---|
 | P0 | `lunad` + socket + CLI + memory tiers 1-2 + persona. Text only. | `luna ask "..."` returns an opinionated answer that cites remembered context. |
 | P1 | **DONE.** piper TTS out, voxtype routing in, session reuse, cost fix. | SUPER+ALT+L, speak, she answers aloud. Plain dictation still types — regression-tested. |
-| P2 | Workspace dispatch + Sol + audit log. | "go build X" -> works in special workspace, reports back. |
+| P2 | **DONE.** Workspace dispatch + Sol + audit log + PID firewall. | `luna dispatch "..."` runs in the `luna` special workspace and reports back; `luna spawned --check <foreign pid>` refuses. |
 | P3 | Bar widget, ambient hooks (crash/battery/update), semantic recall + decay. | Crash a process, she explains it unprompted. |
 
 Each phase is independently useful and independently revertible.

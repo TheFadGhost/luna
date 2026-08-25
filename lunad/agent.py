@@ -16,7 +16,6 @@ import json
 import logging
 import os
 import shutil
-import signal
 import subprocess
 import threading
 import time
@@ -25,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import config
+from . import config, safety
 
 log = logging.getLogger("lunad.agent")
 
@@ -246,16 +245,22 @@ class ClaudeAdapter(BaseAdapter):
         config.AGENT_CWD.mkdir(parents=True, exist_ok=True)
 
         try:
-            proc = subprocess.Popen(
+            # safety.spawn, not Popen: the pid is registered in the signal
+            # ledger in the same operation that creates it, so there is no
+            # window in which Luna owns a process she cannot prove is hers.
+            # `durable=False` — this child dies with the daemon, so its record
+            # is worthless after a crash and does not earn an fsync.
+            proc = safety.spawn(
                 argv,
+                kind="agent",
+                durable=False,
+                note=f"{self.name} ask",
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=str(config.AGENT_CWD),
                 env=env,
                 text=True,
-                # Own process group: cancellation signals only what we spawned.
-                start_new_session=True,
             )
         except OSError as exc:
             raise AgentUnavailable(f"could not start {argv[0]}: {exc}") from exc
@@ -268,12 +273,14 @@ class ClaudeAdapter(BaseAdapter):
         except subprocess.TimeoutExpired:
             self._terminate(proc)
             stdout, stderr = proc.communicate()
+            safety.reap(proc)
             raise AgentTimeout(
                 f"{self.name} did not answer within {timeout:.0f}s and was "
                 f"terminated. Partial stderr: {(stderr or '').strip()[-500:]}"
             )
 
         wall_ms = int((time.monotonic() - started) * 1000)
+        safety.reap(proc)
 
         if run is not None and run.cancelled:
             raise AgentCancelled(f"request {run.request_id} was cancelled")
@@ -346,26 +353,17 @@ class ClaudeAdapter(BaseAdapter):
         )
 
     @staticmethod
-    def _terminate(proc: subprocess.Popen) -> None:
-        """Kill only the process group we created. Never signals anything else.
+    def _terminate(proc: subprocess.Popen, reason: str = "agent run ended") -> bool:
+        """Stop an agent child, through the firewall and nowhere else.
 
-        This is the session firewall from ARCHITECTURE.md section 7 in its
-        smallest form: Luna signals what she spawned and nothing more.
+        There is no signalling code here any more. Every check — is this pid
+        one Luna spawned, is it still the same process, does it lead its own
+        group — lives in :mod:`lunad.safety`, so there is exactly one place to
+        read and exactly one place to get it wrong. A refusal propagates: a
+        request to kill something Luna does not own is a bug worth seeing, not
+        a warning worth swallowing.
         """
-        if proc.poll() is not None:
-            return
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            return
-        for _ in range(50):
-            if proc.poll() is not None:
-                return
-            time.sleep(0.1)
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+        return safety.terminate(proc, grace=5.0, reason=reason)
 
 
 class CodexAdapter(BaseAdapter):

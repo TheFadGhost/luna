@@ -208,6 +208,24 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"  speech   {sp.get('voice')} — {state}"
           + (f", pid {sp['pid']}, {sp.get('load_ms')} ms load" if sp.get("pid")
              else f", unloads after {sp.get('idle_unload_s', 0):.0f}s idle"))
+    dsp = resp.get("dispatch") or {}
+    ws = dsp.get("workspace") or {}
+    if ws.get("available"):
+        print(f"  workspace {ws['workspace']} — "
+              f"{'visible' if ws.get('visible') else 'hidden'}, "
+              f"{ws.get('windows', 0)} window(s), "
+              f"{len(dsp.get('running', []))} job(s) running")
+    else:
+        print(f"  workspace unavailable — {ws.get('detail', '?')}")
+    for job in dsp.get("running", []):
+        print(f"    - {job['id']} → {job['to']} {job['elapsed_s']}s "
+              f"{job['task'][:60]!r}")
+    spawned = resp.get("spawned") or {}
+    aud = resp.get("audit") or {}
+    print(f"  firewall {spawned.get('tracked', 0)} pid(s) tracked, "
+          f"{spawned.get('refusals', 0)} refusal(s) · "
+          f"audit {aud.get('size_bytes', 0)} bytes")
+
     se = resp.get("sessions") or {}
     c = se.get("counters", {})
     print(f"  sessions {len(se.get('live', []))} live · "
@@ -280,6 +298,150 @@ def cmd_memory(args: argparse.Namespace) -> int:
     for ep in resp["recent"]:
         print(f"  {ep['iso']} [{ep['surface']} {ep['effective_salience']:.2f}] "
               f"{ep['user_text'].strip()[:80]}")
+    return 0
+
+
+def cmd_dispatch(args: argparse.Namespace) -> int:
+    task = " ".join(args.task).strip() or sys.stdin.read().strip()
+    if not task:
+        sys.stderr.write("luna: nothing to dispatch\n")
+        return 2
+    timeout = args.timeout + 60 if args.wait else 30
+    with Client(timeout=timeout) as client:
+        resp = client.call("dispatch", task=task, to=args.to,
+                           timeout=args.timeout, wait=args.wait,
+                           wait_timeout=args.timeout)
+    if args.json:
+        print(json.dumps(resp, indent=2))
+        return 0 if resp.get("ok") else 1
+    if not resp.get("ok"):
+        return fail(resp)
+    print(resp["announce"])
+    if not args.wait:
+        return 0
+    print()
+    if resp.get("output"):
+        print(resp["output"].rstrip())
+    state, code = resp.get("state"), resp.get("exit_code")
+    sys.stderr.write(f"{DIM}[{state} · exit {code} · "
+                     f"{resp.get('elapsed_s')}s · {resp.get('dir')}]{RESET}\n")
+    return 0 if state == "finished" else 1
+
+
+def _job_line(job: dict) -> str:
+    mark = {"finished": "ok  ", "failed": "FAIL", "running": "run ",
+            "cancelled": "cxl ", "orphaned": "orph"}.get(job["state"], "?   ")
+    code = "" if job.get("exit_code") is None else f" exit {job['exit_code']}"
+    return (f"{BOLD}{job['id']}{RESET} {mark} {job['to']:<6} "
+            f"{job['elapsed_s']:>6.1f}s{code}  {DIM}{job['iso']}{RESET}\n"
+            f"     {job['task'].splitlines()[0][:100]}")
+
+
+def cmd_jobs(args: argparse.Namespace) -> int:
+    with Client(timeout=30) as client:
+        if args.cancel:
+            resp = client.call("jobs", cancel=args.cancel)
+            if not resp.get("ok"):
+                return fail(resp)
+            print(f"cancelled {resp['cancelled']}"
+                  + (f" — {resp['note']}" if resp.get("note") else ""))
+            return 0
+        resp = client.call("jobs", limit=args.limit, output=args.output)
+    if args.json:
+        print(json.dumps(resp, indent=2))
+        return 0 if resp.get("ok") else 1
+    if not resp.get("ok"):
+        return fail(resp)
+    ws = resp.get("workspace") or {}
+    print(f"{DIM}{ws.get('workspace')} — "
+          f"{'visible' if ws.get('visible') else 'hidden'}, "
+          f"{ws.get('windows', 0)} window(s){RESET}")
+    if not resp["jobs"]:
+        print(f"{DIM}no jobs dispatched yet{RESET}")
+        return 0
+    for job in resp["jobs"]:
+        print(_job_line(job))
+        if args.output and job.get("output"):
+            body = job["output"].rstrip().replace("\n", "\n     ")
+            print(f"     {DIM}{body}{RESET}")
+    return 0
+
+
+def cmd_peek(args: argparse.Namespace) -> int:
+    with Client(timeout=30) as client:
+        resp = client.call("peek")
+    if not resp.get("ok"):
+        return fail(resp)
+    print(f"{resp['workspace']} "
+          + ("visible" if resp["visible"] else "hidden"))
+    return 0
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    with Client(timeout=30) as client:
+        resp = client.call("audit", since=args.since, limit=args.limit,
+                           action=args.action)
+    if args.json:
+        print(json.dumps(resp, indent=2))
+        return 0 if resp.get("ok") else 1
+    if not resp.get("ok"):
+        return fail(resp)
+    if not resp["entries"]:
+        print(f"{DIM}nothing in the audit log for that window "
+              f"({resp['path']}){RESET}")
+        return 0
+    skip = {"ts", "iso", "action", "actor", "ok", "why", "undo", "by_pid"}
+    for entry in resp["entries"]:
+        status = "" if entry.get("ok") is None else (
+            " ok" if entry["ok"] else " FAILED")
+        print(f"{DIM}{entry.get('iso', '?')}{RESET} "
+              f"{BOLD}{entry.get('action', '?')}{RESET}"
+              f"{status} {DIM}({entry.get('actor', 'luna')}){RESET}")
+        if entry.get("why"):
+            print(f"    why: {str(entry['why']).splitlines()[0][:160]}")
+        rest = " ".join(f"{k}={_short(v)}" for k, v in entry.items()
+                        if k not in skip)
+        if rest:
+            print(f"    {DIM}{rest[:400]}{RESET}")
+        if entry.get("undo"):
+            undo = entry["undo"]
+            cmd = " ".join(undo.get("cmd", [])) or "(no command)"
+            print(f"    undo: {cmd}  {DIM}({undo.get('valid_while', '')}){RESET}")
+    sys.stderr.write(f"{DIM}[{resp['count']} entries · {resp['size_bytes']} "
+                     f"bytes · {resp['path']}]{RESET}\n")
+    return 0
+
+
+def _short(value: object) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, default=str)
+    text = " ".join(str(text).split())
+    return text if len(text) <= 90 else text[:87] + "..."
+
+
+def cmd_spawned(args: argparse.Namespace) -> int:
+    """Inspect the signal allowlist — and ask it about any pid at all."""
+    with Client(timeout=30) as client:
+        resp = client.call("spawned", check=args.check, all=args.all)
+    if args.json:
+        print(json.dumps(resp, indent=2))
+        return 0 if resp.get("ok") else 1
+    if not resp.get("ok"):
+        return fail(resp)
+    check = resp.get("check")
+    if check:
+        verdict = "MAY SIGNAL" if check["may_signal"] else "REFUSED"
+        print(f"{BOLD}pid {check['pid']}: {verdict}{RESET}")
+        if check.get("reason"):
+            print(f"  reason:  {check['reason']}")
+        if check.get("cmdline"):
+            print(f"  cmdline: {check['cmdline']}")
+        print()
+    print(f"{DIM}{resp['tracked']} tracked, {resp['refusals']} refusal(s) "
+          f"this session · {resp['path']}{RESET}")
+    for rec in resp["entries"]:
+        alive = "alive" if rec["alive"] else "dead "
+        print(f"  {rec['pid']:>8} {alive} {rec['kind']:<12} "
+              f"{DIM}{rec['iso']}  {' '.join(rec['cmd'])[:70]}{RESET}")
     return 0
 
 
@@ -381,6 +543,42 @@ def build_parser() -> argparse.ArgumentParser:
     ss.add_argument("action", choices=["reset"])
     ss.add_argument("conversation", nargs="?", default=None)
     ss.set_defaults(func=cmd_session)
+
+    dp = sub.add_parser("dispatch", help="hand a task to an agent in the "
+                                        "luna workspace")
+    dp.add_argument("task", nargs="*")
+    dp.add_argument("--to", default="worker", choices=["worker", "sol"],
+                    help="sol is the specialist: own prompt, own memory")
+    dp.add_argument("--wait", action="store_true",
+                    help="block until the job finishes and print its output")
+    dp.add_argument("--timeout", type=float, default=3600.0)
+    dp.set_defaults(func=cmd_dispatch)
+
+    jb = sub.add_parser("jobs", help="dispatched work, newest first")
+    jb.add_argument("-n", "--limit", type=int, default=20)
+    jb.add_argument("--output", action="store_true",
+                    help="include what each job wrote")
+    jb.add_argument("--cancel", default=None, metavar="JOB_ID")
+    jb.set_defaults(func=cmd_jobs)
+
+    pk = sub.add_parser("peek", help="show or hide the luna workspace")
+    pk.set_defaults(func=cmd_peek)
+
+    au = sub.add_parser("audit", help="read the append-only audit log")
+    au.add_argument("--since", default=None,
+                    help="30m, 6h, 2d, 1w, YYYY-MM-DD, or a unix timestamp")
+    au.add_argument("-n", "--limit", type=int, default=40)
+    au.add_argument("--action", default=None,
+                    help="only actions starting with this prefix")
+    au.set_defaults(func=cmd_audit)
+
+    sp = sub.add_parser("spawned",
+                        help="the signal allowlist; --check asks the firewall "
+                             "about one pid")
+    sp.add_argument("--check", type=int, default=None, metavar="PID")
+    sp.add_argument("--all", action="store_true",
+                    help="include records whose process has exited")
+    sp.set_defaults(func=cmd_spawned)
 
     cn = sub.add_parser("cancel", help="cancel an in-flight request")
     cn.add_argument("target", nargs="?", default=None)

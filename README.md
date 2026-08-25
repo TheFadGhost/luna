@@ -8,8 +8,9 @@ prices the work, and delegates the depth to specialists.
 
 ## Status
 
-**Phase 1 — she talks back.** Daemon, socket, memory tiers 1–2, persona, CLI,
-piper speech out, voxtype speech in, conversation sessions.
+**Phase 2 — she delegates.** Daemon, socket, memory tiers 1–2, persona, CLI,
+piper speech out, voxtype speech in, conversation sessions — plus workspace
+dispatch, Sol the specialist, an append-only audit log and the PID firewall.
 See `docs/ARCHITECTURE.md` for the design and `docs/STATE-OF-PLAY.md` for what
 is actually built.
 
@@ -23,7 +24,49 @@ bin/luna say "read this aloud"
 bin/luna hush                     # stop speaking now
 bin/luna memory show
 bin/luna memory search "bar widget"
+
+bin/luna dispatch "go and work this out"   # a worker, in the luna workspace
+bin/luna dispatch --to sol "..."           # the specialist
+bin/luna jobs --output                     # what came back
+bin/luna peek                              # show/hide the workspace
+bin/luna audit --since 30m                 # what she did, and why
+bin/luna spawned --check 12345             # ask the firewall about a pid
 ```
+
+## Delegation
+
+`luna dispatch` opens a `foot` terminal in a hidden Hyprland special workspace
+called `luna` and runs the configured agent there with full autonomy. Luna
+starts the terminal herself rather than asking the compositor to, because she
+has to own the pid — see the firewall below. `luna peek` brings the workspace
+into view; `luna jobs` lists what has run, from disk, so it survives a daemon
+restart.
+
+**Sol** is the specialist she enrols for depth (`--to sol`): his own system
+prompt (`data/sol-persona.md`), his own memory namespace
+(`~/.local/share/luna/memory/sol/`), and a report back to Luna rather than to
+you. He cannot write `LUNA.md` or `USER.md` — the memory API refuses by name.
+
+## Safety, since she asks no permission
+
+**She signals only what she spawned.** One gate, `lunad/safety.py`, and every
+path in the daemon goes through it. A pid is signallable only if Luna forked it
+*and* the process holding that pid is still the one she forked — checked
+against the start time in `/proc/<pid>/stat`, because pids get recycled.
+Refusals raise. `pkill` and friends appear nowhere, and a test reads the
+shipped source to keep it that way.
+
+```sh
+$ luna spawned --check "$(systemctl --user show -p MainPID --value voxtype)"
+pid 1470712: REFUSED
+  reason:  Luna did not spawn it
+  cmdline: /usr/bin/voxtype daemon
+```
+
+**Everything is written down.** `~/.local/share/luna/audit.jsonl` is
+append-only and fsync'd per line: every dispatch, spawn, signal, refusal and
+memory write, with what it was for and how it ended. Where an action has a real
+inverse it is recorded; where it does not, nothing is invented.
 
 ## Voice
 

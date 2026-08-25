@@ -27,13 +27,22 @@ HOME = Path.home()
 STATE_DIR = _xdg("XDG_DATA_HOME", HOME / ".local" / "share") / "luna"
 MEMORY_DIR = STATE_DIR / "memory"
 LOG_PATH = STATE_DIR / "luna.log"
-AUDIT_PATH = STATE_DIR / "audit.jsonl"             # Phase 2; created lazily
+AUDIT_PATH = STATE_DIR / "audit.jsonl"             # append-only, never rotated
+SPAWNED_PATH = STATE_DIR / "spawned.json"          # the signal allowlist
+JOBS_DIR = STATE_DIR / "jobs"                      # one directory per dispatch
 AGENT_CWD = STATE_DIR / "agent-cwd"                # neutral cwd for agent runs
 
 LUNA_MD = MEMORY_DIR / "LUNA.md"
 USER_MD = MEMORY_DIR / "USER.md"
 EPISODES_DB = MEMORY_DIR / "episodes.db"
 PROFILE_JSON = MEMORY_DIR / "profile.json"         # Tier 3, stubbed
+
+# Sol's namespace. Separate directory, separate files, separate episode store:
+# Sol reports to Luna and must never write into LUNA.md or USER.md.
+SOL_MEMORY_DIR = MEMORY_DIR / "sol"
+SOL_MD = SOL_MEMORY_DIR / "SOL.md"
+SOL_EPISODES_DB = SOL_MEMORY_DIR / "episodes.db"
+SOL_PERSONA_PATH = DATA_DIR / "sol-persona.md"
 
 RUNTIME_DIR = _xdg("XDG_RUNTIME_DIR", Path(f"/run/user/{os.getuid()}")) / "luna"
 SOCKET_PATH = RUNTIME_DIR / "luna.sock"
@@ -44,6 +53,7 @@ OMARCHY_DEFAULT_AGENT = HOME / ".config" / "omarchy" / "defaults" / "agent"
 
 LUNA_MD_CAP = 3000
 USER_MD_CAP = 2000
+SOL_MD_CAP = 3000
 ENTRY_DELIMITER = "§"                         # section sign, from Hermes
 
 # --- Salience / decay -----------------------------------------------------
@@ -88,6 +98,27 @@ ROUTER_MAX_TRANSCRIPT_CHARS = 8_000
 AGENT_TIMEOUT_S = 180
 DEFAULT_MODEL = None                               # None -> agent's own default
 
+# --- Dispatch (ARCHITECTURE.md section 6) ---------------------------------
+#
+# Luna's own special workspace. `scratchpad` is already bound to SUPER+S and
+# belongs to the user; taking it would break a keybind they use.
+LUNA_WORKSPACE = "luna"
+
+# NOT `org.omarchy.agent`. That app-id is what `omarchy-launch-tui` gives the
+# user's own agent terminals — there are several open on this machine right
+# now — and a workspace rule matching it would sweep the user's live sessions
+# into Luna's hidden workspace. Luna's terminals get an app-id of their own.
+LUNA_APP_ID = "org.omarchy.luna"
+
+TERMINAL_BIN = "foot"                              # Omarchy's terminal
+HYPRCTL_BIN = "hyprctl"
+
+DISPATCH_TIMEOUT_S = 3600.0                        # a real job, not an ask
+DISPATCH_LINGER_S = 8.0                            # window stays up after exit
+JOB_OUTPUT_MAX_CHARS = 20_000                      # what `luna jobs` will show
+JOB_LIST_LIMIT = 20
+SPAWN_LEDGER_MAX = 200                             # records kept in spawned.json
+
 # --- Conversation sessions (prompt-cache reuse) ---------------------------
 #
 # A fresh `claude` process re-*creates* the ~8k-token system prompt cache on
@@ -111,6 +142,7 @@ RECALL_LIMIT = 6                                   # tier-2 episodes per prompt
 
 def ensure_dirs() -> None:
     """Create every directory Luna writes into. Idempotent."""
-    for d in (STATE_DIR, MEMORY_DIR, AGENT_CWD, RUNTIME_DIR, VOICES_DIR):
+    for d in (STATE_DIR, MEMORY_DIR, SOL_MEMORY_DIR, JOBS_DIR, AGENT_CWD,
+              RUNTIME_DIR, VOICES_DIR):
         d.mkdir(parents=True, exist_ok=True)
     RUNTIME_DIR.chmod(0o700)

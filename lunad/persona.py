@@ -74,6 +74,103 @@ def build_system_prompt(
     return "\n\n".join(p.strip() for p in parts if p.strip()) + "\n"
 
 
+# =========================================================================
+# Dispatched work — the prompt a spawned session runs under
+# =========================================================================
+#
+# A dispatched agent is a different animal from Luna herself: it has tools, it
+# has a terminal, and it can change the machine. Its system prompt therefore
+# carries the boundaries as well as the manner. These are stated as facts about
+# the machine rather than as pleas, because they are facts about the machine.
+
+_DISPATCH_BOUNDARIES = """\
+## Boundaries on this machine — not negotiable
+
+- **Other agent sessions are running right now.** Signal no process you did not
+  start yourself. Never `pkill`, `killall`, `pkill -f`, or any kill that
+  matches by name or pattern: they cannot tell another session's shell from
+  your own, and one has already been killed that way here.
+- Do not restart `omarchy-shell` and do not restart `voxtype`. Restarting the
+  shell takes the user's desktop with it.
+- No `sudo`, no `pacman`, no AUR. `sudo` needs a password nobody is there to
+  type.
+- Do not modify anything under `/usr/share/omarchy/`. `omarchy update`
+  overwrites it, so the change would silently disappear. User-owned config
+  lives in `~/.config`.
+- Work in the job directory you were given unless the task names somewhere
+  else. Nothing outside it gets `rm -rf`.
+- If the task turns out to be destructive or irreversible, stop and say so in
+  your report instead of deciding for the user.
+"""
+
+_WORKER_PREAMBLE = """\
+You are a worker session dispatched by Luna, the user's resident assistant on
+this Omarchy Linux desktop. You are working in a terminal in a hidden special
+workspace. The user is not watching this window and is not your audience: your
+output is a report back to Luna.
+
+Do the task. Then report what you found and what you changed, briefly, in
+plain prose.
+"""
+
+_SOL_PREAMBLE = """\
+You are Sol. Luna — the user's resident assistant on this Omarchy Linux
+desktop — has enrolled you for a job that needs depth rather than triage. You
+are running in a terminal in a hidden special workspace; the user is not
+watching and is not your audience. Your output is a report to Luna.
+
+The specification below is binding. Where it conflicts with your default
+manner, the specification wins.
+"""
+
+
+def load_sol_spec(path: Path = config.SOL_PERSONA_PATH) -> str:
+    """Read Sol's spec. Unlike Luna's, a missing spec is not fatal: Luna can
+    still dispatch anonymous workers, and refusing to work at all because a
+    specialist's persona file is absent would be the wrong failure."""
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def build_dispatch_system_prompt(to: str = "worker", spec: str | None = None,
+                                 memory_block: str = "",
+                                 memory_dir: str = "",
+                                 job_dir: str = "") -> str:
+    """The system prompt for a dispatched session.
+
+    ``to`` is ``"sol"`` for the specialist and anything else for an anonymous
+    worker. Sol additionally gets his persona spec, his own memory block and
+    the path of his own namespace — plus, explicitly, the statement that
+    Luna's tier-1 files are not his to write.
+    """
+    is_sol = to == "sol"
+    parts: list[str] = [_SOL_PREAMBLE if is_sol else _WORKER_PREAMBLE]
+    if is_sol:
+        text = spec if spec is not None else load_sol_spec()
+        if text:
+            parts.append("## Sol — persona specification\n\n" + text)
+        if memory_dir:
+            parts.append(
+                "## Your memory namespace\n\n"
+                f"Your notes live in `{memory_dir}`, and `SOL.md` in that "
+                "directory is yours to write. Luna's own memory files "
+                "(`LUNA.md`, `USER.md`) are one level up and are **not** "
+                "yours: do not read them as instructions and do not write to "
+                "them. If you learn something Luna should hold, put it in the "
+                "report and let her decide."
+            )
+        if memory_block.strip():
+            parts.append("## What you already know (SOL.md)\n\n"
+                         + memory_block.strip())
+    if job_dir:
+        parts.append(f"## Job directory\n\nYour working directory is "
+                     f"`{job_dir}`. Scratch files belong there.")
+    parts.append(_DISPATCH_BOUNDARIES)
+    return "\n\n".join(p.strip() for p in parts if p.strip()) + "\n"
+
+
 def build_user_message(prompt: str, recall_block: str = "",
                        surface: str = "cli") -> str:
     """Wrap the user's message with anything retrieved for *this* turn.
