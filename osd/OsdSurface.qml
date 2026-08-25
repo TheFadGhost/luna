@@ -180,9 +180,15 @@ PanelWindow {
                    : panel.daemonState === "streaming"     ? "󰜟"
                    : panel.daemonState === "transcribing"  ? "󰔟"
                    :                                          "󰍬"
-                font.family: VT.Theme.fontFamily
+                font.family: VT.Theme.iconFontFamily
                 font.pixelSize: VT.Theme.iconFontPx
                 color: panel.stateColor
+                // Subpixel (RGB LCD) antialiasing puts blue/orange fringes on
+                // thin high-contrast glyphs, which on a near-black monochrome
+                // card reads as "the mic is blue". QtRendering uses greyscale
+                // AA via the distance-field rasteriser, so the glyph stays the
+                // single colour it is actually painted with.
+                renderType: Text.QtRendering
             }
 
             Column {

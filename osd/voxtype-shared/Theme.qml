@@ -116,6 +116,13 @@ QtObject {
     property int iconFontPx: Style.font.display
     property string fontFamily: Style.font.family
 
+    // Icon glyphs are Nerd Font private-use codepoints. Omarchy's UI font does
+    // not contain them, so Qt silently falls back to Noto Color Emoji - a colour
+    // bitmap font that IGNORES the `color` property, which is why the mic
+    // rendered blue in a monochrome theme. Pin the icon slot to a font that
+    // actually has the glyphs so the tint applies.
+    property string iconFontFamily: "JetBrainsMono Nerd Font"
+
     /// Waveform canvas height.
     property int waveformHeightPx: Style.space(36)
 
