@@ -343,6 +343,21 @@ class Speech:
             return False, "missing: " + ", ".join(missing)
         return True, f"{config.VOICE_NAME} via {self.python}"
 
+    def _reported_rate(self) -> int | None:
+        """Sample rate for status/report payloads.
+
+        ``self._sample_rate`` is only populated once the worker has sent its
+        first metadata frame, so a detached ``say`` reports ``None`` even though
+        playback itself resolves the rate from the voice config. Fall back to
+        the config so the reported value matches what is actually played.
+        """
+        if self._sample_rate:
+            return self._sample_rate
+        try:
+            return read_sample_rate(self.voice_config)
+        except Exception:
+            return None
+
     def say(self, text: str, wait: bool = False,
             timeout: float = 120.0) -> dict[str, Any]:
         """Speak ``text``. Cancels anything already speaking (barge-in).
@@ -370,7 +385,7 @@ class Speech:
                 raise SpeechUnavailable(job.error)
         payload: dict[str, Any] = {
             "spoken": spoken, "sentences": len(sentences), "id": job.id,
-            "sample_rate": self._sample_rate, "waited": wait,
+            "sample_rate": self._reported_rate(), "waited": wait,
             "cancelled": job.cancelled,
         }
         if job.first_audio is not None:
@@ -408,7 +423,7 @@ class Speech:
                 "pid": proc.pid if proc and proc.poll() is None else None,
                 "speaking": speaking,
                 "voice": config.VOICE_NAME,
-                "sample_rate": self._sample_rate,
+                "sample_rate": self._reported_rate(),
                 "load_ms": self._load_ms,
                 "idle_s": round(time.monotonic() - self._last_used, 1),
                 "idle_unload_s": self.idle_unload_s,
