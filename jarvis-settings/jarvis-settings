@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""Jarvis — settings for the Luna assistant daemon. Entry point.
+
+Kept deliberately thin: it puts this directory on sys.path and hands over to
+jarvis.app, so the package can also be imported by the tests without the
+launcher being involved.
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from jarvis.app import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())
