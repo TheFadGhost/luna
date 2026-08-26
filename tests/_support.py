@@ -7,6 +7,10 @@ Those are global by design, because the firewall has to be the same object for
 every caller in the daemon; the price is that a test which forgets to redirect
 them would append to the user's real audit log, so redirecting them is done
 once, here, for every case.
+
+Since the Jarvis pass the settings singleton is redirected too, and for a
+sharper reason: a test that read the *real* config would pass or fail
+depending on what the user last changed in the GUI.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lunad import audit as audit_mod, safety  # noqa: E402
+from lunad import audit as audit_mod, safety, settings as settings_mod  # noqa: E402
 from lunad.memory import (EpisodeStore, Memory, SolMemory,  # noqa: E402
                           Tier1File)
 
@@ -78,10 +82,17 @@ class TempMemoryCase(unittest.TestCase):
         # Redirect the globals before anything can touch the real ones.
         self.ledger = safety.SpawnLedger(self.root / "spawned.json")
         self.audit = audit_mod.AuditLog(self.root / "audit.jsonl")
+        self.settings = settings_mod.Settings(self.root / "config.toml")
+        # A confirmation nobody answers costs 60 s by default. A test that
+        # trips one by accident should fail in a second, not wedge the suite.
+        self.settings.set("confirm.prompt.timeout_seconds", 1)
         old_ledger = safety.use_ledger(self.ledger)
         old_audit = audit_mod.use_audit(self.audit)
+        old_settings = settings_mod.use_settings(self.settings)
         self.addCleanup(safety.use_ledger, old_ledger)
         self.addCleanup(audit_mod.use_audit, old_audit)
+        self.addCleanup(settings_mod.use_settings, old_settings)
+        self.addCleanup(self.settings.stop_watching)
         self.addCleanup(safety.set_audit_hook, None)
 
     def sol_memory(self) -> SolMemory:

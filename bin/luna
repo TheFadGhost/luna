@@ -454,6 +454,143 @@ def cmd_spawned(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_settings(args: argparse.Namespace) -> int:
+    """Read and write ~/.config/jarvis/config.toml through the daemon.
+
+    Through the daemon rather than the file directly, so that what is printed
+    is what lunad is actually using — a value that fell back to its default
+    because the file said something invalid reads back as the default here,
+    which is the honest answer.
+    """
+    with Client(timeout=30) as client:
+        if args.set_cmd == "set":
+            value = _parse_value(args.value)
+            resp = client.call("settings.set", key=args.key, value=value,
+                               actor="cli", why="set from the CLI")
+        else:
+            resp = client.call("settings.get", key=args.key)
+    if args.json:
+        print(json.dumps(resp, indent=2))
+        return 0 if resp.get("ok") else 1
+    if not resp.get("ok"):
+        return fail(resp)
+    if args.set_cmd == "set":
+        for key, value in resp["applied"].items():
+            print(f"{key} = {_toml(value)}")
+        sys.stderr.write(f"{DIM}[{resp['path']}]{RESET}\n")
+        return 0
+    if args.key:
+        spec = f" {DIM}({resp['kind']}"
+        if resp.get("choices"):
+            spec += ": " + " | ".join(resp["choices"])
+        spec += f", default {_toml(resp['default'])}){RESET}"
+        print(f"{args.key} = {_toml(resp['value'])}{spec}")
+        return 0
+    for section, values in resp["settings"].items():
+        print(f"{BOLD}[{section}]{RESET}")
+        for key, value in values.items():
+            print(f"  {key} = {_toml(value)}")
+    sec = resp.get("secrets") or {}
+    print(f"\n{DIM}{resp['path']} mode {resp.get('mode')} · "
+          f"{resp.get('reloads', 0)} reload(s) · "
+          f"watching {resp.get('watching')}{RESET}")
+    print(f"{DIM}api key: "
+          + (f"present from {sec.get('source')}" if sec.get("present")
+             else "MISSING — " + str(sec.get("hint", "")))
+          + RESET)
+    for problem in resp.get("problems") or []:
+        sys.stderr.write(f"  ! {problem}\n")
+    return 0
+
+
+def _parse_value(raw: str) -> object:
+    """CLI arguments are strings; the schema is typed. Bridge honestly.
+
+    `true`/`false` and numbers are converted, everything else stays a string.
+    The daemon validates whatever comes out, so a wrong guess here is a clear
+    error rather than a silently stored wrong type.
+    """
+    text = raw.strip()
+    if text.lower() in ("true", "false"):
+        return text.lower() == "true"
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    return text
+
+
+def _toml(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return json.dumps(value)
+
+
+def cmd_confirm(args: argparse.Namespace) -> int:
+    """List pending questions, answer one, or raise one.
+
+    `luna confirm ask` is the tool-side gate a dispatched agent is told to
+    call. It blocks until the user answers or the prompt times out, and its
+    exit code *is* the answer: 0 for yes, 3 for no.
+    """
+    action = args.confirm_cmd
+    timeout = 15.0 if action in ("list", "yes", "no") else args.timeout + 15
+    with Client(timeout=timeout) as client:
+        if action == "list":
+            resp = client.call("confirm", action="list")
+        elif action in ("yes", "no"):
+            resp = client.call("confirm", action=action, token=args.token,
+                               by="user")
+        else:
+            resp = client.call("confirm", action="ask",
+                               **{"class": args.klass},
+                               detail=" ".join(args.detail),
+                               why="a dispatched agent asked first",
+                               actor="agent")
+    if args.json:
+        print(json.dumps(resp, indent=2))
+        return 0 if resp.get("ok") else 1
+    if not resp.get("ok"):
+        return fail(resp)
+
+    if action == "list":
+        pol = resp["policies"]
+        print(f"{BOLD}policies{RESET} "
+              f"{DIM}({resp['channel']}, {resp['timeout_s']:.0f}s, "
+              f"timeout = {resp['default_on_timeout']}){RESET}")
+        for name, value in pol.items():
+            mark = {"never": DIM, "ask": "", "deny": BOLD}.get(value, "")
+            print(f"  {name:<20} {mark}{value}{RESET}")
+        print(f"{DIM}always denied: {', '.join(resp['hard_denies'])}{RESET}")
+        if not resp["pending"]:
+            print(f"{DIM}nothing waiting on an answer{RESET}")
+            return 0
+        print(f"\n{BOLD}waiting{RESET}")
+        for item in resp["pending"]:
+            print(f"  {item['token']}  {item['action']}  "
+                  f"{item['remaining_s']:.0f}s left")
+            print(f"    {item['detail'][:120]}")
+            print(f"    {DIM}luna confirm yes {item['token']}  |  "
+                  f"luna confirm no {item['token']}{RESET}")
+        return 0
+
+    if action in ("yes", "no"):
+        if not resp["answered"]:
+            sys.stderr.write(f"luna: {resp['note']}\n")
+            return 1
+        print(f"{'approved' if resp['allow'] else 'declined'} {resp['token']}")
+        return 0
+
+    print(resp["message"])
+    return 0 if resp["allowed"] else 3
+
+
 def cmd_log(args: argparse.Namespace) -> int:
     path = config.LOG_PATH
     if not path.exists():
@@ -490,7 +627,12 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="luna", description="Talk to Luna.")
+    # `jarvis` and `luna` are the same client; argv[0] decides only the name
+    # in the help text, because the app is Jarvis and the assistant inside it
+    # is called whatever `[assistant] name` says.
+    prog = Path(sys.argv[0]).name or "luna"
+    p = argparse.ArgumentParser(
+        prog=prog, description="Talk to your assistant (Jarvis).")
     p.add_argument("--json", action="store_true", help="raw JSON response")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -593,6 +735,33 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--all", action="store_true",
                     help="include records whose process has exited")
     sp.set_defaults(func=cmd_spawned)
+
+    se = sub.add_parser("settings",
+                        help="read and write ~/.config/jarvis/config.toml")
+    sesub = se.add_subparsers(dest="set_cmd", required=False)
+    seshow = sesub.add_parser("show", help="print the live settings")
+    seshow.add_argument("key", nargs="?", default=None,
+                        help="one dotted key, e.g. voice.voice")
+    seset = sesub.add_parser("set", help="change one setting")
+    seset.add_argument("key")
+    seset.add_argument("value")
+    se.set_defaults(func=cmd_settings, set_cmd="show", key=None)
+
+    cf = sub.add_parser("confirm",
+                        help="the confirmation policy, and answers to it")
+    cfsub = cf.add_subparsers(dest="confirm_cmd", required=False)
+    cfsub.add_parser("list", help="policies and anything waiting for an answer")
+    cfyes = cfsub.add_parser("yes", help="approve a pending question")
+    cfyes.add_argument("token")
+    cfno = cfsub.add_parser("no", help="decline a pending question")
+    cfno.add_argument("token")
+    cfask = cfsub.add_parser(
+        "ask", help="ask the user before doing something; exits 0 for yes, "
+                    "3 for no. This is the gate a dispatched agent calls.")
+    cfask.add_argument("klass", metavar="CLASS")
+    cfask.add_argument("detail", nargs="*")
+    cfask.add_argument("--timeout", type=float, default=120.0)
+    cf.set_defaults(func=cmd_confirm, confirm_cmd="list")
 
     cn = sub.add_parser("cancel", help="cancel an in-flight request")
     cn.add_argument("target", nargs="?", default=None)

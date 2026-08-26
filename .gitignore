@@ -1,3 +1,14 @@
 __pycache__/
 *.pyc
 .venv/
+
+# Secrets never enter this repo. Jarvis keeps its key in
+# ~/.config/jarvis/secrets.env (0600), supplied to lunad by a systemd drop-in,
+# and never in config.toml. These patterns are belt and braces: if a key ever
+# ends up in the working tree by accident, git will not offer to commit it.
+secrets*
+*.env
+*.env.*
+.envrc
+*.key
+*.pem

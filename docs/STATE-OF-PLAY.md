@@ -185,7 +185,78 @@ saves. It is kept for conversational continuity, not for money.
   adapter for its own command line.
 - 325 tests pass, up from 288.
 
+### Phase 2b — Jarvis: config, TTS and confirmations (2026-08-26)
+- **The app is Jarvis; her name is a setting.** `[assistant] name`, default
+  `Luna`. Nothing in the new code writes "Luna" literally — the system prompt,
+  the worker and specialist prompts, the notification headline and the log
+  labels all read it from settings. Renaming her retires the warm sessions,
+  because her name is part of the cacheable prefix.
+- **`~/.config/jarvis/config.toml`**, 0600 in a 0700 directory, exactly the
+  schema in `docs/CONFIG-SCHEMA.md`. Read with `tomllib`; written by a
+  hand-rolled serialiser that carries the schema's own comments, because there
+  is no TOML writer in the stdlib and a comment-less config file is a worse
+  config file. A test parses the document and asserts the module still agrees
+  with it, key for key and default for default.
+- **Hot reload works and is verified**: edit the file, wait two seconds, the
+  next `say` uses the new voice. Same daemon pid throughout. Every reload logs
+  a diff and lands in the audit log.
+- **An invalid value warns and falls back**; `settings.set` over the socket
+  refuses instead. Ops `settings.get` / `settings.set` also hand back the whole
+  schema, so the settings GUI can build itself from the daemon.
+- **OpenRouter TTS**: `deepgram/flux-tts:free`, default voice `flux-sienna-en`,
+  alternate `flux-donovan-en`. WAV parsed chunk by chunk, PCM fed to the same
+  single `aplay`, one request per sentence with one sentence of look-ahead.
+- **piper is still there and still the fallback.** Verified by pointing
+  `[voice] model` at a model that does not exist: HTTP 400, one warning in the
+  log, and the sentence came out of piper at 22 050 Hz instead of 24 000.
+- **Confirmations**: eight policy classes from the schema, each `never` | `ask`
+  | `deny`, plus four hard denies that the config cannot re-enable. `ask` puts
+  an Omarchy toast on screen whose click action approves; silence is a no.
+- **The confirmation is real on the dispatch path and advisory inside a job.**
+  Verified end to end: `luna dispatch "delete /tmp/jarvis-proof.txt"` blocked
+  before forking anything, the toast fired, `luna confirm yes` released it —
+  and then the dispatched agent *itself* ran `luna confirm ask delete_files`
+  before the `rm`, which needed a second approval. Both are in the audit log.
+- **Secrets never touch config.toml.** `~/.config/jarvis/secrets.env` 0600, fed
+  to lunad by `lunad.service.d/10-jarvis-secrets.conf`. The drop-in also reads
+  voxtype's file, so the key already on this machine keeps working and nothing
+  had to be copied out of another program's directory.
+- `luna` and `jarvis` are both on PATH (`~/.local/bin`, symlinks to
+  `bin/luna`); `bin/jarvis` is a symlink in the repo.
+- 447 tests pass, up from 325.
+
 ## Known limitations / stubbed
+- **The confirmation system cannot see inside a running job.** It is enforced
+  on `lunad`'s own dispatch path — nothing forks until the task text has passed
+  the classifier — and it is *advisory* thereafter: a dispatched session runs
+  with `bypassPermissions` and real tools, and the daemon never sees its
+  individual tool calls. Layer 3 (the agent calling `luna confirm ask` itself)
+  worked on the first real test, but it works because the agent chose to
+  co-operate, not because anything stopped it.
+- **The classifier reads the task text, so vague phrasing evades it.** "Tidy up
+  the old build output" does not classify as `delete_files`; "rm -rf build"
+  does. False positives are cheap (one toast); false negatives are the real
+  cost and there is no way to drive them to zero from text alone.
+- **`long_job` and `spend` never fire on their own.** They need an explicit
+  estimate from the caller (`estimate_seconds`, `estimate_usd`). Gating them on
+  the dispatch timeout would ask about every job, which trains the user to
+  click through.
+- **Omarchy's notification has exactly one click action**, so a toast can only
+  carry the *yes*. Declining means running `luna confirm no <token>` or letting
+  it time out. That is the safe way round, but it does mean an explicit "no"
+  is not one click.
+- **OpenRouter TTS is 1.4-2.5 s slower to first audio than piper.** Measured,
+  warm: piper 96-124 ms short / 341-409 ms for two sentences; OpenRouter
+  1.5-1.8 s / 2.3-2.9 s. Better voice, real latency cost. `[voice] provider`
+  switches back with no restart.
+- **`[voice] speed` and `[voice] piper_voice` are accepted but inert.** The
+  schema has them, the daemon validates and stores them, and neither is wired
+  into synthesis yet: piper's voice is still `config.VOICE_NAME` and neither
+  provider is being asked to change rate.
+- **`[listen]`, `[memory]`, `[dispatch]` and `[ui]` are stored, not yet wired.**
+  They round-trip correctly and the GUI can edit them; the daemon still uses
+  its `config.py` constants for those. `[assistant]`, `[voice]` and `[confirm]`
+  are live.
 - **Codex `ask` has tools; Claude `ask` does not.** `claude` takes `--tools ""`
   and is genuinely text-in/text-out. codex has no equivalent flag, so the
   sandbox *is* the tool policy: an `ask` runs `-s read-only`, which still lets

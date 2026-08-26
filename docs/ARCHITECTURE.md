@@ -279,6 +279,48 @@ Piper specifics (researched, not assumed):
 - Licence note: piper is GPL-3.0 but invoked as a separate binary over a pipe,
   so it does not affect Luna's own licence.
 
+
+### 5a. OpenRouter TTS — BUILT, piper kept underneath
+
+The default voice is now **`flux-sienna-en`** (female) through
+`deepgram/flux-tts:free`, with **`flux-donovan-en`** as the alternate.
+`POST https://openrouter.ai/api/v1/audio/speech`, JSON `{model, input, voice}`,
+answering **RIFF/WAV, 24 kHz mono 16-bit**.
+
+- **The WAV header is parsed off, not sliced off.** The chunk list is walked to
+  find `fmt ` and `data`, because a `LIST`/`INFO` chunk before `data` is legal
+  and a fixed 44-byte slice would feed metadata to `aplay` as audio — audible,
+  as a click. What reaches `aplay` is raw PCM, exactly as with piper, so the
+  section 5 rule holds: **one `aplay` per utterance, not per sentence**, and
+  there is no gap at the full stop.
+- **One request per sentence**, with a producer thread running exactly one
+  sentence ahead. One ahead and not all of them: a barge-in two words in should
+  not have paid for the whole reply.
+- **piper stays the fallback**, controlled by `[voice] fallback`. Any HTTP
+  error, timeout, 502, empty body or unparseable payload hands the *remaining*
+  sentences to piper — mid-utterance, not only at sentence one, because the
+  failure providers actually produce is an intermittent 502 that is as likely
+  on sentence three. `fallback = "none"` raises instead. A failed TTS must
+  never be the reason she is silent.
+- `[voice] max_spoken_chars` (400) caps the spoken form at a sentence boundary;
+  the full text still goes to screen. The "never speak code, paths or URLs"
+  stripper from section 5 is unchanged and runs first, for both providers.
+
+**Measured on this machine, first audio, warm** (the number that decides
+whether she feels responsive):
+
+| | short utterance | two-sentence utterance |
+|---|---|---|
+| piper, local | 96–124 ms | 341–409 ms |
+| OpenRouter `flux-sienna-en` | 1.5–1.8 s | 2.3–2.9 s |
+
+So the remote voice costs roughly **1.4–2.5 s of extra latency before the first
+word**, in exchange for a markedly better voice. It is a real trade, not a free
+upgrade, and `[voice] provider = "piper"` switches back with no restart. (The
+40–45 ms figure elsewhere in this document is the ledger-write cost inside
+`safety.spawn`, not end-to-end first audio; measured end-to-end, warm piper is
+about 100 ms for a short sentence.)
+
 ## 6. Delegation — Luna leads, Sol specialises
 
 - **Luna** is the only one the user addresses. Conversational, opinionated,
@@ -472,6 +514,96 @@ stated in his system prompt; it is not a filesystem sandbox, and this document
 says so rather than implying otherwise. The audit log is what makes that
 tolerable.
 
+## 7a. Confirmation — `lunad/confirm.py` — BUILT
+
+The user revised the Phase-2 "full autonomy, no prompts" position to *"not
+proper constraints, but just double check before doing X"*. Section 7 above is
+unchanged; this is a layer on top of it, and it is a layer with three
+strengths, which is the part that matters.
+
+**Layer 1 — hard denies, in code.** Four things the config cannot re-enable:
+signalling a process Jarvis did not spawn, restarting `omarchy-shell`, deleting
+`~/.config/omarchy/CUSTOMISATIONS.md`, and `rm -rf` outside Jarvis's own
+directories. The first is not implemented in `confirm.py` at all — it *is*
+`safety.may_signal`, which every signal in the package already goes through,
+and a second copy would be a rule that can disagree with itself. The other
+three are text patterns checked before dispatch. They are never asked about: a
+question the user cannot answer with "yes" is not a question.
+
+**Layer 2 — policy classes, in the config.** `install_packages`,
+`delete_files`, `write_outside_home`, `system_config`, `network_send`,
+`git_push`, `long_job`, `spend`, each `never` | `ask` | `deny`. `ask` puts an
+Omarchy toast on screen whose click action is `luna confirm yes <token>`, and
+optionally a line in the journal with the same token. Omarchy's notification
+takes exactly **one** click action, so the toast is the *yes* and silence is
+the *no* — the asymmetry is deliberate and it is the safe way round.
+`[confirm.prompt] default_on_timeout` can invert it; the default is `no`.
+
+`long_job` and `spend` are not text-classifiable and do not pretend to be: they
+fire on a number a caller supplies, and an absent number does not mean "under
+the threshold", it means unmeasured, so the class does not fire. In particular
+`DISPATCH_TIMEOUT_S` is a *ceiling*, not an estimate, and gating `long_job` on
+it would ask about every job ever dispatched — which trains the user to click
+through, and is worse than not asking.
+
+**Layer 3 — the tool-side gate, advisory.** A dispatched agent's system prompt
+lists the classes currently set to `ask` and tells it to run
+`luna confirm ask <class> "<what>"` first; exit 0 is yes, exit 3 is no. This is
+a real channel — it reaches the same broker and puts the same toast on screen —
+but it is honoured by the agent *choosing* to run it.
+
+**What is and is not intercepted, stated plainly.** Genuinely enforced: the
+daemon's own `dispatch` path. Nothing is forked by `lunad` until the task text
+has been through the classifier, and a refusal means no terminal was ever
+started. Not enforced: anything an already-running dispatched session decides
+to do. It has real tools and bypassed permissions, and the daemon does not see
+its individual tool calls. The classifier also reads the *task text*, so a task
+phrased vaguely enough ("tidy up the old build output") will not classify even
+though the work is a delete. The mitigations are the audit log and layer 3, not
+a guarantee.
+
+Every decision — auto-allowed, asked, approved, declined, timed out, hard
+denied — is one line in `audit.jsonl`, with the class, the policy, the token,
+the channel and how long the user took.
+
+## 7b. Configuration — `lunad/settings.py` — BUILT
+
+The app is **Jarvis**; the assistant's name is a *setting* (`[assistant] name`,
+default `Luna`), used in her system prompt, her greetings, her notifications
+and her log labels. Nothing in the new code writes "Luna" literally.
+
+`~/.config/jarvis/config.toml`, 0600, in a 0700 directory.
+`docs/CONFIG-SCHEMA.md` is the contract; the schema table in `settings.py` is
+its executable copy, carrying the default, the type, the allowed values and the
+comment for every key. A test parses the document and asserts they still agree,
+so the settings GUI and the daemon cannot drift apart silently.
+
+- **Reading** is `tomllib` (3.14 stdlib).
+- **Writing** is hand-rolled — there is no writer in the standard library, a
+  dependency for this would be absurd, and a JSON-ish dump would throw away
+  every comment, which is most of what makes a config file usable. The
+  serialiser emits the schema's own comments in the schema's own order.
+- **Hot reload** is a `stat` every 2 s on mtime-ns *and* size. Size matters:
+  a GUI toggling one boolean rewrites the same length in the same second.
+  Every reload logs a diff and lands in the audit log. Values are read at the
+  point of use, never cached at start-up, so voice, model and confirm policy
+  take effect on the next request. Two settings need more: her *name* is in
+  the cacheable prefix, so a rename retires the live sessions; the *agent* is a
+  different binary, so switching it swaps the adapter.
+- **An invalid value warns and falls back**, never crashes — a typo from the
+  GUI must not cost the user their assistant. `settings.set` over the socket
+  does the opposite and *refuses*: a program asserting a value deserves to be
+  told it is wrong.
+- Ops `settings.get` / `settings.set` expose all of it, plus the schema, so the
+  GUI can build itself from the daemon rather than from a second copy.
+
+**Secrets are never in `config.toml`.** `~/.config/jarvis/secrets.env`, 0600,
+read by systemd through `lunad.service.d/10-jarvis-secrets.conf`. The drop-in
+also reads `~/.config/voxtype/secrets.env`, which already held the key on this
+machine — lunad accepts `VOXTYPE_WHISPER_API_KEY` as a fallback so nothing had
+to be copied out of a file that belongs to another program. `secrets_status()`
+reports whether a key exists and where it came from, never the key.
+
 ## 8. Build phases
 
 | Phase | Ships | Verifiable by |
@@ -479,6 +611,7 @@ tolerable.
 | P0 | `lunad` + socket + CLI + memory tiers 1-2 + persona. Text only. | `luna ask "..."` returns an opinionated answer that cites remembered context. |
 | P1 | **DONE.** piper TTS out, voxtype routing in, session reuse, cost fix. | SUPER+ALT+L, speak, she answers aloud. Plain dictation still types — regression-tested. |
 | P2 | **DONE.** Workspace dispatch + Sol + audit log + PID firewall. | `luna dispatch "..."` runs in the `luna` special workspace and reports back; `luna spawned --check <foreign pid>` refuses. |
+| P2b | **DONE.** Jarvis: config file + hot reload, OpenRouter TTS with piper fallback, confirmation policy, name as a setting. | Edit `~/.config/jarvis/config.toml`, do not restart, hear the change. |
 | P3 | Bar widget, ambient hooks (crash/battery/update), semantic recall + decay. | Crash a process, she explains it unprompted. |
 
 Each phase is independently useful and independently revertible.

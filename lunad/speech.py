@@ -23,6 +23,17 @@ synthesis for free.
 **Only our own PIDs are ever signalled.** Cancellation kills the ``aplay`` this
 module started and asks the worker to stop; it never goes looking for piper or
 audio processes by name. That is the session firewall in section 7.
+
+**Two providers, one pipeline.** Since the Jarvis pass there is a second voice:
+OpenRouter's ``deepgram/flux-tts:free``, requested one sentence at a time so
+that speech starts on sentence one exactly as it does with piper. It answers
+with a RIFF/WAV body, whose header is parsed off so the samples can be fed to
+the *same* single ``aplay`` — one player per utterance, no gap at the full
+stop. piper stays installed and stays the fallback: providers 502 intermittently
+and a failed request must never be the reason she goes quiet. Which provider is
+in use, which voice, and whether there is a fallback are all settings, read at
+the start of every utterance so a change takes effect on the next thing she
+says rather than on the next restart.
 """
 
 from __future__ import annotations
@@ -31,14 +42,17 @@ import json
 import logging
 import os
 import re
+import struct
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
 
-from . import config, safety
+from . import config, safety, settings as settings_mod
 
 log = logging.getLogger("lunad.speech")
 
@@ -278,15 +292,113 @@ def read_sample_rate(config_path: Path | None = None) -> int:
 
 
 # =========================================================================
+# OpenRouter TTS
+# =========================================================================
+
+
+class RemoteSpeechFailed(RuntimeError):
+    """One sentence did not come back. Recoverable: piper is still there."""
+
+
+class Wav:
+    """The three numbers ``aplay`` needs, and the samples themselves."""
+
+    __slots__ = ("pcm", "rate", "channels", "bits")
+
+    def __init__(self, pcm: bytes, rate: int, channels: int, bits: int) -> None:
+        self.pcm, self.rate, self.channels, self.bits = pcm, rate, channels, bits
+
+    def format(self) -> str:
+        return {8: "U8", 16: "S16_LE", 24: "S24_3LE", 32: "S32_LE"}.get(
+            self.bits, "S16_LE")
+
+    def matches(self, other: "Wav") -> bool:
+        return (self.rate, self.channels, self.bits) == (
+            other.rate, other.channels, other.bits)
+
+
+def parse_wav(data: bytes) -> Wav:
+    """Pull the samples out of a RIFF container.
+
+    Walking the chunk list rather than assuming a 44-byte header: a WAV with a
+    ``LIST``/``INFO`` chunk before ``data`` is perfectly legal, and slicing at
+    a fixed offset would feed that metadata to ``aplay`` as audio — which is
+    audible, as a click.
+    """
+    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        raise RemoteSpeechFailed(
+            f"the provider did not return WAV audio (got {len(data)} bytes "
+            f"starting {data[:16]!r})")
+    rate = channels = bits = 0
+    pos = 12
+    pcm = b""
+    while pos + 8 <= len(data):
+        cid = data[pos:pos + 4]
+        (size,) = struct.unpack_from("<I", data, pos + 4)
+        body = data[pos + 8:pos + 8 + size]
+        if cid == b"fmt " and len(body) >= 16:
+            _, channels, rate, _, _, bits = struct.unpack_from("<HHIIHH", body, 0)
+        elif cid == b"data":
+            pcm = body
+        pos += 8 + size + (size & 1)          # chunks are word-aligned
+    if not pcm or not rate or not channels:
+        raise RemoteSpeechFailed("the WAV body had no usable data chunk")
+    return Wav(pcm, rate, channels, bits or 16)
+
+
+def synthesise(text: str, *, model: str, voice: str, api_key: str,
+               url: str = config.OPENROUTER_SPEECH_URL,
+               timeout: float = config.OPENROUTER_TIMEOUT_S) -> Wav:
+    """One sentence, one request. Raises :class:`RemoteSpeechFailed`.
+
+    Every failure mode the provider actually exhibits is folded into one
+    exception on purpose: a 502, a timeout, an empty body and a JSON error page
+    all mean the same thing to the caller, which is "use piper for this one".
+    """
+    if not api_key:
+        raise RemoteSpeechFailed(
+            "no OpenRouter API key; set OPENROUTER_API_KEY in "
+            f"{config.SECRETS_PATH}")
+    payload = json.dumps({"model": model, "input": text,
+                          "voice": voice}).encode("utf-8")
+    request = urllib.request.Request(
+        url, data=payload, method="POST",
+        headers={"Authorization": f"Bearer {api_key}",
+                 "Content-Type": "application/json",
+                 "Accept": "audio/wav"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+        except Exception:  # noqa: BLE001 - the status is the useful part
+            pass
+        raise RemoteSpeechFailed(
+            f"{url} returned HTTP {exc.code}: {detail or exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise RemoteSpeechFailed(f"could not reach {url}: {exc.reason}") from exc
+    except (TimeoutError, OSError) as exc:
+        raise RemoteSpeechFailed(f"{url} timed out or failed: {exc}") from exc
+    if not body:
+        raise RemoteSpeechFailed(f"{url} returned an empty body")
+    return parse_wav(body)
+
+
+# =========================================================================
 # The worker
 # =========================================================================
 
 
 class _Job:
     __slots__ = ("id", "sentences", "text", "cancelled", "done", "started",
-                 "error", "played_bytes", "first_audio")
+                 "error", "played_bytes", "first_audio", "provider",
+                 "fell_back", "voice", "sample_rate", "cfg")
 
-    def __init__(self, sentences: list[str], text: str) -> None:
+    def __init__(self, sentences: list[str], text: str,
+                 cfg: dict[str, Any] | None = None) -> None:
+        self.cfg = cfg or {}
         self.id = uuid.uuid4().hex[:12]
         self.sentences = sentences
         self.text = text
@@ -296,10 +408,22 @@ class _Job:
         self.done = threading.Event()
         self.played_bytes = 0
         self.first_audio: float | None = None   # proves streaming, not batching
+        self.provider = str(self.cfg.get("provider", "piper"))
+        self.voice = str(self.cfg.get("voice", ""))
+        self.sample_rate: int | None = None
+        # Set when a remote request failed and piper finished the utterance.
+        # Reported rather than swallowed: silent degradation is how a broken
+        # voice goes unnoticed for a week.
+        self.fell_back: str = ""
 
 
 class Speech:
-    """Lazy piper worker with sentence streaming, barge-in and idle unload."""
+    """Two voices, one pipeline: OpenRouter first, piper underneath.
+
+    Lazy piper worker with sentence streaming, barge-in and idle unload; an
+    OpenRouter request per sentence when the config asks for it, feeding the
+    same single ``aplay``.
+    """
 
     def __init__(
         self,
@@ -308,6 +432,8 @@ class Speech:
         python: Path | None = None,
         idle_unload_s: float | None = None,
         aplay: str | None = None,
+        settings: Any = None,
+        synth: Any = None,
     ) -> None:
         self.model = model or config.VOICE_ONNX
         self.voice_config = voice_config or config.VOICE_CONFIG
@@ -315,6 +441,10 @@ class Speech:
         self.idle_unload_s = (config.SPEECH_IDLE_UNLOAD_S
                               if idle_unload_s is None else idle_unload_s)
         self.aplay = aplay or config.APLAY_BIN
+        # Injected in tests so that "the provider 502s" is a branch the suite
+        # can take without a network, and so that a test can never spend money.
+        self._settings = settings
+        self.synth = synth if synth is not None else synthesise
 
         self._proc: subprocess.Popen | None = None
         self._stdout: Any = None
@@ -327,13 +457,19 @@ class Speech:
         self._closed = False
         self._load_ms: int | None = None
         self.counters = {"said": 0, "cancelled": 0, "errors": 0,
-                         "loads": 0, "unloads": 0}
+                         "loads": 0, "unloads": 0, "remote": 0,
+                         "fallbacks": 0}
 
         self._reaper = threading.Thread(target=self._idle_reaper, daemon=True,
                                         name="luna-speech-idle")
         self._reaper.start()
 
     # -- public API ------------------------------------------------------
+
+    @property
+    def settings(self) -> Any:
+        return (self._settings if self._settings is not None
+                else settings_mod.settings())
 
     def available(self) -> tuple[bool, str]:
         missing = [str(p) for p in (self.python, self.model, self.voice_config)
@@ -357,6 +493,27 @@ class Speech:
         except Exception:
             return None
 
+    # -- settings, read fresh on every utterance --------------------------
+
+    def _voice_settings(self) -> dict[str, Any]:
+        """The voice half of the config, as of right now.
+
+        Read here and not cached on the instance: hot reload is only real if
+        the value that reaches the request is the value in the file at the time
+        of the request. A voice captured in ``__init__`` would need a restart,
+        which is the thing this is meant to remove.
+        """
+        cfg = self.settings.section("voice") if self.settings else {}
+        return {
+            "enabled": bool(cfg.get("enabled", True)),
+            "provider": str(cfg.get("provider", "openrouter")),
+            "model": str(cfg.get("model", "deepgram/flux-tts:free")),
+            "voice": str(cfg.get("voice", "flux-sienna-en")),
+            "fallback": str(cfg.get("fallback", "piper")),
+            "max_spoken_chars": int(cfg.get("max_spoken_chars",
+                                            config.SPEECH_MAX_CHARS)),
+        }
+
     def say(self, text: str, wait: bool = False,
             timeout: float = 120.0) -> dict[str, Any]:
         """Speak ``text``. Cancels anything already speaking (barge-in).
@@ -364,14 +521,20 @@ class Speech:
         Returns immediately unless ``wait``; the spoken form is returned either
         way so a caller can show what was actually said.
         """
-        spoken = strip_for_speech(text)
+        voice_cfg = self._voice_settings()
+        if not voice_cfg["enabled"]:
+            return {"spoken": "", "sentences": 0, "id": None,
+                    "note": "voice is switched off in [voice] enabled"}
+        # `max_spoken_chars` is the cap the schema exposes: anything past it is
+        # trimmed at a sentence boundary and the full text stays on screen.
+        spoken = strip_for_speech(text, max_chars=voice_cfg["max_spoken_chars"])
         sentences = split_sentences(spoken)
         if not sentences:
             return {"spoken": "", "sentences": 0, "id": None,
                     "note": "nothing speakable in that text"}
 
         self.cancel()                       # barge-in: previous utterance stops
-        job = _Job(sentences, spoken)
+        job = _Job(sentences, spoken, cfg=voice_cfg)
         with self._lock:
             if self._closed:
                 raise SpeechUnavailable("speech worker is shut down")
@@ -384,9 +547,13 @@ class Speech:
                 raise SpeechUnavailable(job.error)
         payload: dict[str, Any] = {
             "spoken": spoken, "sentences": len(sentences), "id": job.id,
-            "sample_rate": self._reported_rate(), "waited": wait,
-            "cancelled": job.cancelled,
+            "sample_rate": job.sample_rate or self._reported_rate(),
+            "waited": wait, "cancelled": job.cancelled,
+            "provider": job.provider, "voice": job.voice or config.VOICE_NAME,
         }
+        if job.fell_back:
+            payload["fell_back_to"] = "piper"
+            payload["fallback_reason"] = job.fell_back[:300]
         if job.first_audio is not None:
             payload["first_audio_ms"] = int(
                 (job.first_audio - job.started) * 1000)
@@ -414,6 +581,7 @@ class Speech:
         return speaking
 
     def status(self) -> dict[str, Any]:
+        cfg = self._voice_settings()
         with self._lock:
             proc, job = self._proc, self._job
             speaking = job is not None and not job.done.is_set()
@@ -421,8 +589,17 @@ class Speech:
                 "loaded": proc is not None and proc.poll() is None,
                 "pid": proc.pid if proc and proc.poll() is None else None,
                 "speaking": speaking,
-                "voice": config.VOICE_NAME,
-                "sample_rate": self._reported_rate(),
+                "provider": cfg["provider"],
+                "voice": (cfg["voice"] if cfg["provider"] == "openrouter"
+                          else config.VOICE_NAME),
+                "piper_voice": config.VOICE_NAME,
+                "model": cfg["model"],
+                "fallback": cfg["fallback"],
+                "enabled": cfg["enabled"],
+                "max_spoken_chars": cfg["max_spoken_chars"],
+                "key": settings_mod.secrets_status().get("present", False),
+                "sample_rate": (job.sample_rate if job and job.sample_rate
+                                else self._reported_rate()),
                 "load_ms": self._load_ms,
                 "idle_s": round(time.monotonic() - self._last_used, 1),
                 "idle_unload_s": self.idle_unload_s,
@@ -459,13 +636,130 @@ class Speech:
                 job.done.set()
 
     def _play(self, job: _Job) -> None:
+        """Route the utterance to a provider, and catch it if it falls.
+
+        The remote path returns the sentences it did not manage to speak. That
+        is the whole fallback contract: an empty list means she said it all, a
+        non-empty one means piper finishes the job. Falling back mid-utterance
+        rather than only at sentence one matters because the failure the
+        provider actually produces is an intermittent 502, which is as likely
+        on sentence three as on sentence one.
+        """
+        remaining = job.sentences
+        if job.provider == "openrouter":
+            remaining = self._play_remote(job)
+            if remaining and job.cfg.get("fallback") != "piper":
+                raise SpeechUnavailable(
+                    job.fell_back or "the speech provider failed and "
+                    "[voice] fallback is not piper")
+            if remaining:
+                log.warning("falling back to piper",
+                            extra={"job": job.id, "left": len(remaining),
+                                   "detail": job.fell_back[:300]})
+                self.counters["fallbacks"] += 1
+        if remaining:
+            self._play_piper(job, remaining)
+
+    # -- OpenRouter ------------------------------------------------------
+
+    def _play_remote(self, job: _Job) -> list[str]:
+        """Sentence-at-a-time synthesis into one ``aplay``.
+
+        A second thread runs one sentence ahead, so the request for sentence
+        two is already in flight while sentence one is playing. One ahead and
+        not all of them: a barge-in two words in should not have paid for the
+        whole reply.
+        """
+        cfg = job.cfg
+        key = settings_mod.api_key()
+        model, voice = str(cfg.get("model", "")), str(cfg.get("voice", ""))
+        results: dict[int, Any] = {}
+        playing = [0]                     # the index the consumer is on
+        ready = threading.Condition()
+
+        def produce() -> None:
+            for index, sentence in enumerate(job.sentences):
+                with ready:
+                    # Stay at most one sentence ahead of playback.
+                    while not job.cancelled and index - playing[0] > 1:
+                        ready.wait(0.05)
+                if job.cancelled:
+                    break
+                try:
+                    outcome: Any = self.synth(
+                        sentence, model=model, voice=voice, api_key=key,
+                        timeout=config.OPENROUTER_TIMEOUT_S)
+                except RemoteSpeechFailed as exc:
+                    outcome = exc
+                except Exception as exc:  # noqa: BLE001 - any fault is a fallback
+                    outcome = RemoteSpeechFailed(f"{type(exc).__name__}: {exc}")
+                with ready:
+                    results[index] = outcome
+                    ready.notify_all()
+                if isinstance(outcome, RemoteSpeechFailed):
+                    break
+
+        worker = threading.Thread(target=produce, daemon=True,
+                                  name=f"luna-tts-{job.id}")
+        worker.start()
+
+        player: subprocess.Popen | None = None
+        current: Wav | None = None
+        index = 0
+        try:
+            while index < len(job.sentences):
+                with ready:
+                    deadline = time.monotonic() + config.OPENROUTER_TIMEOUT_S + 10
+                    while index not in results and not job.cancelled:
+                        if time.monotonic() > deadline:
+                            results[index] = RemoteSpeechFailed(
+                                "the synthesis thread produced nothing in time")
+                            break
+                        ready.wait(0.05)
+                    outcome = results.get(index)
+                if job.cancelled:
+                    return []
+                if isinstance(outcome, RemoteSpeechFailed) or outcome is None:
+                    job.fell_back = str(outcome or "no audio")
+                    return job.sentences[index:]
+                wav: Wav = outcome
+                if player is not None and current is not None and not wav.matches(current):
+                    # A format change cannot be spliced into a running aplay.
+                    self._finish_player(player, job)
+                    player, current = None, None
+                if player is None:
+                    player = self._start_player(wav.rate, channels=wav.channels,
+                                                fmt=wav.format())
+                    current = wav
+                    job.first_audio = job.first_audio or time.monotonic()
+                    job.sample_rate = wav.rate
+                if not _feed(player, wav.pcm):
+                    job.cancelled = True
+                    return []
+                job.played_bytes += len(wav.pcm)
+                index += 1
+                with ready:
+                    playing[0] = index
+                    ready.notify_all()
+        finally:
+            if player is not None:
+                self._finish_player(player, job)
+        if not job.cancelled and not job.error:
+            self.counters["said"] += 1
+            self.counters["remote"] += 1
+        return []
+
+    # -- piper -----------------------------------------------------------
+
+    def _play_piper(self, job: _Job, sentences: list[str]) -> None:
         proc, stdout = self._ensure_worker()
         rate = self._sample_rate or read_sample_rate(self.voice_config)
+        job.sample_rate = job.sample_rate or rate
 
         if job.cancelled:
             return
         if not self._send(proc, {"op": "say", "id": job.id,
-                                 "sentences": job.sentences}):
+                                 "sentences": sentences}):
             raise SpeechUnavailable("the piper worker vanished mid-request")
 
         player: subprocess.Popen | None = None
@@ -504,9 +798,10 @@ class Speech:
         if not job.cancelled and not job.error:
             self.counters["said"] += 1
 
-    def _start_player(self, rate: int) -> subprocess.Popen:
-        argv = [self.aplay, "-q", "-r", str(rate), "-f", "S16_LE", "-c", "1",
-                "-t", "raw", "-"]
+    def _start_player(self, rate: int, channels: int = 1,
+                      fmt: str = "S16_LE") -> subprocess.Popen:
+        argv = [self.aplay, "-q", "-r", str(rate), "-f", fmt,
+                "-c", str(channels), "-t", "raw", "-"]
         try:
             # The barge-in kills this pid, so this pid must be in the ledger
             # before it can start making noise. `durable=False` keeps the fsync

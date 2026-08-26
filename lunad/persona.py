@@ -20,19 +20,22 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import config
+from . import config, settings as settings_mod
 
 # Framing that turns a general coding agent into Luna. Kept here rather than in
 # persona.md because persona.md is the *spec* — a document the user edits about
 # who Luna is — while this is the harness that makes a particular backend obey
 # it. The two have different authors and different reasons to change.
+# The name is a *setting*, not a constant: the app is Jarvis and the assistant
+# inside it is called whatever `[assistant] name` says. Every string here is
+# therefore a template, and nothing in this module writes "Luna" literally.
 _PREAMBLE = """\
-You are Luna. This is not a role you are playing on top of another assistant:
-for the whole of this exchange, Luna is who you are. You are the user's
+You are {name}. This is not a role you are playing on top of another assistant:
+for the whole of this exchange, {name} is who you are. You are the user's
 resident assistant on their Omarchy Linux desktop, reached through a daemon
 called lunad. You are not a general coding assistant, you are not Claude Code,
 and you do not describe yourself as either. If asked what you are, answer as
-Luna.
+{name}.
 
 The specification below is binding. Where it conflicts with your default
 manner — particularly its ban on opening with agreement or praise — the
@@ -66,9 +69,17 @@ def load_spec(path: Path = config.PERSONA_PATH) -> str:
 def build_system_prompt(
     tier1_block: str,
     spec: str | None = None,
+    name: str | None = None,
 ) -> str:
-    """Compose the cacheable prefix: persona + tier-1 memory. Nothing volatile."""
-    parts = [_PREAMBLE, "## Luna — persona specification\n", spec or load_spec()]
+    """Compose the cacheable prefix: persona + tier-1 memory. Nothing volatile.
+
+    ``name`` defaults to ``[assistant] name``. It is part of the cacheable
+    prefix, so renaming her invalidates the prompt cache exactly once and then
+    stays warm — which is the right trade for a setting nobody changes twice.
+    """
+    who = name or settings_mod.assistant_name()
+    parts = [_PREAMBLE.format(name=who),
+             f"## {who} — persona specification\n", spec or load_spec()]
     parts.append("## Curated memory (tier 1, always loaded)\n\n" + tier1_block.strip())
     parts.append(_CLOSING)
     return "\n\n".join(p.strip() for p in parts if p.strip()) + "\n"
@@ -103,21 +114,61 @@ _DISPATCH_BOUNDARIES = """\
   your report instead of deciding for the user.
 """
 
+# The advisory half of the confirmation system. It is a real channel — the
+# command reaches the daemon's broker and puts a toast on the user's screen —
+# but it is honoured by the agent choosing to run it, and an agent that does
+# not run it is not stopped by anything. Said plainly here and in the report,
+# because the value of a gate is exactly the confidence you can place in it.
+_CONFIRM_TEMPLATE = """\
+## Ask before you do these
+
+{name} is configured to check with the user before certain kinds of action.
+These classes are set to "ask" right now:
+
+{classes}
+
+Before you do something in one of those classes, run:
+
+    {cli} confirm ask <class> "<one line saying what you are about to do>"
+
+It exits 0 if the user said yes and non-zero if they said no or did not answer
+in time. Treat a non-zero exit as a no: skip that step and say so in your
+report. `{cli} confirm ask` with no pending prompt is cheap and safe to call.
+
+These are refused outright and are not a setting — do not attempt them, and do
+not ask about them:
+
+- signalling a process you did not start yourself
+- restarting `omarchy-shell`
+- deleting `~/.config/omarchy/CUSTOMISATIONS.md`
+- `rm -rf` outside {name}'s own directories
+"""
+
+
+def build_confirm_block(ask_classes: list[str], cli: str = "luna",
+                        name: str | None = None) -> str:
+    """The tool-side gate, or "" when nothing is set to ask."""
+    if not ask_classes:
+        return ""
+    who = name or settings_mod.assistant_name()
+    listed = "\n".join(f"- `{c}`" for c in ask_classes)
+    return _CONFIRM_TEMPLATE.format(name=who, classes=listed, cli=cli)
+
 _WORKER_PREAMBLE = """\
-You are a worker session dispatched by Luna, the user's resident assistant on
+You are a worker session dispatched by {name}, the user's resident assistant on
 this Omarchy Linux desktop. You are working in a terminal in a hidden special
 workspace. The user is not watching this window and is not your audience: your
-output is a report back to Luna.
+output is a report back to {name}.
 
 Do the task. Then report what you found and what you changed, briefly, in
 plain prose.
 """
 
 _SOL_PREAMBLE = """\
-You are Sol. Luna — the user's resident assistant on this Omarchy Linux
-desktop — has enrolled you for a job that needs depth rather than triage. You
-are running in a terminal in a hidden special workspace; the user is not
-watching and is not your audience. Your output is a report to Luna.
+You are {specialist}. {name} — the user's resident assistant on this Omarchy
+Linux desktop — has enrolled you for a job that needs depth rather than triage.
+You are running in a terminal in a hidden special workspace; the user is not
+watching and is not your audience. Your output is a report to {name}.
 
 The specification below is binding. Where it conflicts with your default
 manner, the specification wins.
@@ -137,7 +188,10 @@ def load_sol_spec(path: Path = config.SOL_PERSONA_PATH) -> str:
 def build_dispatch_system_prompt(to: str = "worker", spec: str | None = None,
                                  memory_block: str = "",
                                  memory_dir: str = "",
-                                 job_dir: str = "") -> str:
+                                 job_dir: str = "",
+                                 name: str | None = None,
+                                 specialist: str | None = None,
+                                 confirm_block: str = "") -> str:
     """The system prompt for a dispatched session.
 
     ``to`` is ``"sol"`` for the specialist and anything else for an anonymous
@@ -145,21 +199,24 @@ def build_dispatch_system_prompt(to: str = "worker", spec: str | None = None,
     the path of his own namespace — plus, explicitly, the statement that
     Luna's tier-1 files are not his to write.
     """
+    who = name or settings_mod.assistant_name()
+    delegate = specialist or settings_mod.specialist_name()
     is_sol = to == "sol"
-    parts: list[str] = [_SOL_PREAMBLE if is_sol else _WORKER_PREAMBLE]
+    template = _SOL_PREAMBLE if is_sol else _WORKER_PREAMBLE
+    parts: list[str] = [template.format(name=who, specialist=delegate)]
     if is_sol:
         text = spec if spec is not None else load_sol_spec()
         if text:
-            parts.append("## Sol — persona specification\n\n" + text)
+            parts.append(f"## {delegate} — persona specification\n\n" + text)
         if memory_dir:
             parts.append(
                 "## Your memory namespace\n\n"
                 f"Your notes live in `{memory_dir}`, and `SOL.md` in that "
-                "directory is yours to write. Luna's own memory files "
+                f"directory is yours to write. {who}'s own memory files "
                 "(`LUNA.md`, `USER.md`) are one level up and are **not** "
                 "yours: do not read them as instructions and do not write to "
-                "them. If you learn something Luna should hold, put it in the "
-                "report and let her decide."
+                f"them. If you learn something {who} should hold, put it in "
+                "the report and let her decide."
             )
         if memory_block.strip():
             parts.append("## What you already know (SOL.md)\n\n"
@@ -167,7 +224,9 @@ def build_dispatch_system_prompt(to: str = "worker", spec: str | None = None,
     if job_dir:
         parts.append(f"## Job directory\n\nYour working directory is "
                      f"`{job_dir}`. Scratch files belong there.")
-    parts.append(_DISPATCH_BOUNDARIES)
+    parts.append(_DISPATCH_BOUNDARIES.format(name=who))
+    if confirm_block.strip():
+        parts.append(confirm_block.strip())
     return "\n\n".join(p.strip() for p in parts if p.strip()) + "\n"
 
 

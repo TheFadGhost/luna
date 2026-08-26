@@ -48,7 +48,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import agent as agent_mod, audit as audit_mod, config, persona, safety
+from . import (agent as agent_mod, audit as audit_mod, config,
+               confirm as confirm_mod, persona, safety,
+               settings as settings_mod)
 
 log = logging.getLogger("lunad.dispatch")
 
@@ -301,6 +303,7 @@ class Dispatcher:
                  agent_bin: str | None = None,
                  agent_name: str | None = None,
                  sol_memory_dir: Path = config.SOL_MEMORY_DIR,
+                 confirm: confirm_mod.ConfirmBroker | None = None,
                  spawn: Any = None) -> None:
         self.jobs_dir = Path(jobs_dir)
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
@@ -315,6 +318,11 @@ class Dispatcher:
         self.agent_name = (agent_name or agent_mod.read_default_agent()).lower()
         self.adapter = agent_mod.get_adapter(self.agent_name)
         self.sol_memory_dir = Path(sol_memory_dir)
+        # The one place in the daemon where a confirmation is genuinely
+        # enforced rather than requested: nothing is spawned until the task
+        # text has been through the classifier.
+        self.confirm = (confirm if confirm is not None
+                        else confirm_mod.ConfirmBroker(audit=self.audit))
         self.spawn = spawn or safety.spawn
         self._jobs: dict[str, Job] = {}
         self._procs: dict[str, subprocess.Popen] = {}
@@ -342,7 +350,8 @@ class Dispatcher:
         Composed here rather than asked of a model. An announcement that costs
         an API call and 4 seconds would not get made.
         """
-        who = "Sol" if job.to == "sol" else "a worker"
+        who = (settings_mod.specialist_name() if job.to == "sol"
+               else "a worker")
         why = ("depth-first technical work, reporting back to me"
                if job.to == "sol" else "grunt work I would only be in the way of")
         return (f"Enrolled {who} on job {job.id} — {why}. "
@@ -353,7 +362,9 @@ class Dispatcher:
     def dispatch(self, task: str, to: str = "worker", *,
                  timeout: float = config.DISPATCH_TIMEOUT_S,
                  linger: float = config.DISPATCH_LINGER_S,
-                 sol_memory_block: str = "") -> Job:
+                 sol_memory_block: str = "",
+                 estimate_seconds: float | None = None,
+                 estimate_usd: float | None = None) -> Job:
         task = (task or "").strip()
         if not task:
             raise DispatchError("dispatch needs a non-empty task")
@@ -367,15 +378,31 @@ class Dispatcher:
             raise DispatchUnavailable(
                 f"cannot dispatch: {detail}. Nothing was spawned.")
 
+        # Before anything forks. A refusal here raises ConfirmDenied and the
+        # terminal is never started, which is the only part of the
+        # confirmation system that is a real boundary rather than an
+        # instruction to a well-behaved agent.
+        # `timeout` is a ceiling, not an estimate — every dispatch carries the
+        # same one-hour default, so gating `long_job` on it would ask about
+        # every job ever dispatched and train the user to click through. The
+        # class only fires on an estimate a caller actually made.
+        decisions = self.confirm.gate(
+            task, why=f"dispatch to {to}", actor="luna",
+            seconds=estimate_seconds, usd=estimate_usd)
+
         job_id = uuid.uuid4().hex[:8]
         job_dir = self.jobs_dir / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
         job = Job(id=job_id, task=task, to=to, dir=job_dir)
 
+        ask_classes = [name for name in confirm_mod.CLASSES
+                       if self.confirm.policy(name) == confirm_mod.ASK]
         system_prompt = persona.build_dispatch_system_prompt(
             to=to, memory_block=sol_memory_block,
             memory_dir=str(self.sol_memory_dir) if to == "sol" else "",
-            job_dir=str(job_dir))
+            job_dir=str(job_dir),
+            confirm_block=persona.build_confirm_block(
+                ask_classes, cli=str(config.PROJECT_DIR / "bin" / "luna")))
 
         (job_dir / "task.txt").write_text(task + "\n", encoding="utf-8")
         (job_dir / "system.txt").write_text(system_prompt, encoding="utf-8")
@@ -426,6 +453,7 @@ class Dispatcher:
             "dispatch.spawn", ok=True, job_id=job_id, to=to, pid=proc.pid,
             why=task[:500], cmd=argv, job_dir=str(job_dir),
             workspace=f"special:{self.hypr.workspace}", rule=rule,
+            confirmed=[d.action for d in decisions] or None,
             undo={"what": "stop the dispatched job",
                   "cmd": ["luna", "jobs", "--cancel", job_id],
                   "valid_while": "the job is still running"})

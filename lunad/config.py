@@ -49,6 +49,41 @@ SOCKET_PATH = RUNTIME_DIR / "luna.sock"
 
 OMARCHY_DEFAULT_AGENT = HOME / ".config" / "omarchy" / "defaults" / "agent"
 
+# --- Jarvis: the app's own configuration home ------------------------------
+#
+# The *app* is Jarvis; the assistant's name is a setting inside it. The config
+# directory is therefore ~/.config/jarvis and not ~/.config/luna, and it is the
+# one directory Jarvis owns outside its state tree. Secrets never live in the
+# TOML: they live beside it in an env file that systemd reads, so a config file
+# the settings GUI rewrites can never carry a key into a backup or a commit.
+
+CONFIG_DIR = _xdg("XDG_CONFIG_HOME", HOME / ".config") / "jarvis"
+CONFIG_PATH = CONFIG_DIR / "config.toml"
+SECRETS_PATH = CONFIG_DIR / "secrets.env"
+
+# The key Luna already has on this machine. voxtype owns that file; Jarvis
+# reads it when it has no key of its own and never writes to it.
+VOXTYPE_SECRETS_PATH = _xdg("XDG_CONFIG_HOME", HOME / ".config") / "voxtype" / "secrets.env"
+
+CONFIG_DIR_MODE = 0o700
+CONFIG_FILE_MODE = 0o600
+
+# Hot reload. A stat every two seconds costs nothing measurable and needs no
+# inotify dependency; two seconds is also faster than a user can change a
+# setting in the GUI and then speak.
+CONFIG_POLL_S = 2.0
+
+# --- OpenRouter TTS -------------------------------------------------------
+
+OPENROUTER_SPEECH_URL = "https://openrouter.ai/api/v1/audio/speech"
+OPENROUTER_TIMEOUT_S = 20.0          # one sentence, not a whole reply
+OPENROUTER_KEY_ENVS = ("OPENROUTER_API_KEY", "VOXTYPE_WHISPER_API_KEY")
+
+# --- Confirmation ---------------------------------------------------------
+
+NOTIFY_BIN = "omarchy-notification-send"
+CONFIRM_POLL_S = 0.25                # how often a waiting thread checks
+
 # --- Memory caps (ARCHITECTURE.md section 4, tier 1) ----------------------
 
 LUNA_MD_CAP = 3000
@@ -183,3 +218,7 @@ def ensure_dirs() -> None:
               RUNTIME_DIR, VOICES_DIR):
         d.mkdir(parents=True, exist_ok=True)
     RUNTIME_DIR.chmod(0o700)
+    # 0700, always: the config directory sits next to a secrets file, and a
+    # directory that is only private on the day it was created is not private.
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.chmod(CONFIG_DIR_MODE)

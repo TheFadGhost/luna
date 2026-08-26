@@ -31,9 +31,22 @@ bin/luna jobs --output                     # what came back
 bin/luna peek                              # show/hide the workspace
 bin/luna audit --since 30m                 # what she did, and why
 bin/luna spawned --check 12345             # ask the firewall about a pid
+bin/luna settings                          # the live config, and where it lives
+bin/luna settings set voice.voice flux-donovan-en
+bin/luna confirm                           # the policy, and anything waiting
+bin/luna confirm yes <token>               # release a pending confirmation
 ```
 
 ## Delegation
+
+The app is **Jarvis**; the assistant's name is a setting (`[assistant] name`,
+default `Luna`). `jarvis` and `luna` are the same command. Configuration lives
+in `~/.config/jarvis/config.toml` (0600, in a 0700 directory) — see
+`docs/CONFIG-SCHEMA.md` — and `lunad` watches it and hot-reloads, so a change
+to the voice, the model or the confirmation policy takes effect on the next
+request rather than on the next restart. Secrets never go in that file: the
+OpenRouter key lives in `~/.config/jarvis/secrets.env` and reaches the daemon
+through a systemd drop-in.
 
 `luna dispatch` opens a `foot` terminal in a hidden Hyprland special workspace
 called `luna` and runs the configured agent there with full autonomy. Luna

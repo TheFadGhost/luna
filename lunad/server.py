@@ -23,9 +23,9 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from . import (__version__, agent, audit as audit_mod, config, dispatch,
-               log as luna_log, persona, protocol, safety,
-               session as sessions, speech)
+from . import (__version__, agent, audit as audit_mod, config, confirm,
+               dispatch, log as luna_log, persona, protocol, safety,
+               session as sessions, settings as settings_mod, speech)
 from .memory import (Memory, MemoryCapExceeded, MemoryError as LunaMemoryError,
                      SolMemory)
 
@@ -44,9 +44,17 @@ class Daemon:
                  memory: Memory | None = None,
                  sol_memory: SolMemory | None = None,
                  audit: audit_mod.AuditLog | None = None,
-                 dispatcher: dispatch.Dispatcher | None = None) -> None:
+                 dispatcher: dispatch.Dispatcher | None = None,
+                 settings: settings_mod.Settings | None = None) -> None:
         config.ensure_dirs()
         self.started = time.time()
+        # Settings come up before anything that reads one. A missing file is
+        # created here, populated with the schema's defaults, rather than left
+        # for the GUI to write: lunad must be configurable from the moment it
+        # starts, not from the moment somebody opens a settings window.
+        self.settings = (settings if settings is not None
+                         else settings_mod.settings())
+        settings_mod.ensure_secrets_file()
         # `memory` is injectable so tests can run against a temp directory
         # without touching the user's real memory files.
         self.memory = memory if memory is not None else Memory()
@@ -56,10 +64,23 @@ class Daemon:
         # The firewall holds the hook rather than importing audit itself, so
         # `safety` stays at the bottom of the dependency graph.
         safety.set_audit_hook(self.audit.hook)
+        self.confirm = confirm.ConfirmBroker(settings=self.settings,
+                                             audit=self.audit)
         self.dispatcher = (dispatcher if dispatcher is not None
-                           else dispatch.Dispatcher(audit=self.audit))
+                           else dispatch.Dispatcher(audit=self.audit,
+                                                    confirm=self.confirm))
+        # Exactly one broker in the process, whoever built the dispatcher. Two
+        # would mean a question raised by a dispatch could not be answered
+        # through `luna confirm`, because the pending map it looks in would be
+        # the other object's.
+        self.dispatcher.confirm = self.confirm
         self.runs = agent.RunRegistry()
-        self.agent_name = (agent_name or agent.read_default_agent()).lower()
+        # `--agent` beats the config, the config beats Omarchy's default. The
+        # CLI flag is an operator override for one run and must not be silently
+        # replaced by a file the operator did not look at.
+        self.agent_name = (agent_name
+                           or str(self.settings.get("assistant.agent") or "")
+                           or agent.read_default_agent()).lower()
         self.adapter = agent.get_adapter(self.agent_name)
         self.persona_spec = persona.load_spec()
         self.counters: dict[str, int] = {"ask": 0, "errors": 0, "cancelled": 0,
@@ -74,7 +95,9 @@ class Daemon:
         # only starts on the first `say`, and dies again after five idle
         # minutes. Constructing it here means `status` can report why TTS is
         # unavailable without anyone having tried to speak first.
-        self.speech = speech.Speech()
+        self.speech = speech.Speech(settings=self.settings)
+        self.settings.on_change(self._settings_changed)
+        self.settings.start_watching()
         log.info(
             "daemon initialised",
             extra={"agent": self.agent_name, "version": __version__},
@@ -82,7 +105,41 @@ class Daemon:
         self.audit.append("daemon.started", ok=True, agent=self.agent_name,
                           version=__version__,
                           why="lunad came up",
+                          assistant=settings_mod.assistant_name(),
+                          config=str(self.settings.path),
                           tracked_pids=len(safety.ledger()))
+
+    # -- hot reload ------------------------------------------------------
+
+    def _settings_changed(self, changes: list[dict[str, Any]]) -> None:
+        """React to a config change without a restart.
+
+        Most settings need nothing done: they are read at the point of use, so
+        the next request already sees them. Two do. Her *name* is part of the
+        cacheable system prompt, so a rename must retire the live sessions or
+        the next turn resumes a conversation with the old identity frozen into
+        its prefix. The agent is a different binary entirely, so switching it
+        needs a new adapter.
+        """
+        keys = {c["key"] for c in changes}
+        self.audit.append("settings.reloaded", ok=True,
+                          why="config.toml changed on disk",
+                          changed=[f"{c['key']}: {c['from']!r} -> {c['to']!r}"
+                                   for c in changes])
+        if "assistant.name" in keys:
+            dropped = self.sessions.clear()
+            log.info("assistant renamed; retired the live sessions",
+                     extra={"name": settings_mod.assistant_name(),
+                            "dropped": dropped})
+        if "assistant.agent" in keys:
+            wanted = str(self.settings.get("assistant.agent") or "").lower()
+            try:
+                self.adapter = agent.get_adapter(wanted)
+                self.agent_name = wanted
+                log.info("agent switched", extra={"agent": wanted})
+            except agent.AgentError as exc:
+                log.warning("cannot switch agent; keeping the current one",
+                            extra={"wanted": wanted, "detail": str(exc)})
 
     # -- operations ------------------------------------------------------
 
@@ -123,6 +180,11 @@ class Daemon:
                 "chars": len(self.persona_spec),
             },
             speech=self.speech.status(),
+            settings={**self.settings.status(),
+                      "assistant": settings_mod.assistant_name(),
+                      "specialist": settings_mod.specialist_name(),
+                      "secrets": settings_mod.secrets_status()},
+            confirm=self.confirm.snapshot(),
             dispatch=self.dispatcher.snapshot(),
             audit=self.audit.stats(),
             spawned={"tracked": len(safety.ledger()),
@@ -188,9 +250,14 @@ class Daemon:
         # The prefix is persona + tier 1 and nothing else, so it survives
         # unchanged from turn to turn and the prompt cache is read rather than
         # rewritten. Recall belongs to this turn, so it goes in the message.
-        system_prompt = persona.build_system_prompt(tier1, self.persona_spec)
+        who = settings_mod.assistant_name()
+        system_prompt = persona.build_system_prompt(tier1, self.persona_spec,
+                                                    name=who)
         message = persona.build_user_message(prompt, recall, surface)
-        prefix = sessions.fingerprint(self.persona_spec, tier1)
+        # Her name is in the prefix, so it is in the fingerprint: renaming her
+        # must retire the warm sessions rather than resume one whose cached
+        # prefix still introduces her by the old name.
+        prefix = sessions.fingerprint(self.persona_spec, tier1, who)
 
         explicit = req.get("session_id") or req.get("resume")
         sess = None if explicit else self.sessions.acquire(conversation, prefix)
@@ -258,9 +325,14 @@ class Daemon:
         refused resume costs one uncached call and then heals itself.
         """
         timeout = float(req.get("timeout") or config.AGENT_TIMEOUT_S)
+        # "" in the config means "the agent's own default", which is also what
+        # `model=None` means to every adapter, so an empty string must not be
+        # forwarded as a model name.
+        model = req.get("model") or str(self.settings.get("assistant.model")
+                                        or "") or None
         try:
             return self.adapter.ask(message, system_prompt,
-                                    model=req.get("model"),
+                                    model=model,
                                     session_id=args.get("session_id"),
                                     resume=args.get("resume"),
                                     timeout=timeout, run=run)
@@ -274,7 +346,7 @@ class Daemon:
             self.sessions.drop(conversation)
             fresh = self.sessions.acquire(conversation, prefix)
             return self.adapter.ask(message, system_prompt,
-                                    model=req.get("model"),
+                                    model=model,
                                     session_id=fresh.session_id, resume=None,
                                     timeout=timeout, run=run)
 
@@ -352,7 +424,8 @@ class Daemon:
         """
         adapter = agent.CodexAdapter()
         tier1 = self.memory.tier1_block()
-        system_prompt = persona.build_system_prompt(tier1, self.persona_spec)
+        system_prompt = persona.build_system_prompt(
+            tier1, self.persona_spec, name=settings_mod.assistant_name())
         path = adapter.write_profile(system_prompt)
         # Recorded with its undo, because this is the one file Luna writes
         # into the user's own dotfiles and it must be reversible from the log.
@@ -481,7 +554,9 @@ class Daemon:
         job = self.dispatcher.dispatch(
             task, to,
             timeout=float(req.get("timeout") or config.DISPATCH_TIMEOUT_S),
-            sol_memory_block=block)
+            sol_memory_block=block,
+            estimate_seconds=_number(req.get("estimate_seconds")),
+            estimate_usd=_number(req.get("estimate_usd")))
         payload = job.to_dict()
         payload["announce"] = self.dispatcher.announce(job)
         if req.get("wait"):
@@ -560,6 +635,107 @@ class Daemon:
             }
         return protocol.ok(req.get("id"), **payload)
 
+    # -- Jarvis: settings and confirmation over the socket ---------------
+
+    def op_settings_get(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Read the config — one key, or all of it.
+
+        The GUI reads through the daemon rather than off the disk so that what
+        it shows is what lunad is actually using, including any value that fell
+        back to its default because the file said something invalid.
+        """
+        key = req.get("key")
+        if key:
+            section, spec = settings_mod.find(str(key))
+            return protocol.ok(
+                req.get("id"), key=str(key),
+                value=self.settings.get(str(key)),
+                default=spec.default, kind=spec.kind,
+                choices=list(spec.choices) or None,
+                comment=spec.comment or None, section=section.name)
+        return protocol.ok(
+            req.get("id"), settings=self.settings.data,
+            defaults=settings_mod.defaults(),
+            schema=[{"section": sec.name,
+                     "keys": [{"name": k.name, "default": k.default,
+                               "kind": k.kind, "choices": list(k.choices),
+                               "minimum": k.minimum, "maximum": k.maximum,
+                               "comment": k.comment}
+                              for k in sec.keys]}
+                    for sec in settings_mod.SCHEMA],
+            secrets=settings_mod.secrets_status(),
+            **self.settings.status())
+
+    def op_settings_set(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Write one key, or several. Validated; an invalid value is refused.
+
+        Refusing rather than falling back is the opposite of what the *file*
+        loader does, and deliberately so: a file is a thing a human typed and
+        must degrade gracefully, while a `settings.set` is a program asserting
+        a value and deserves to be told it is wrong.
+        """
+        updates = req.get("updates")
+        if updates is None:
+            key, value = req.get("key"), req.get("value")
+            if not isinstance(key, str) or not key:
+                raise protocol.ProtocolError(
+                    "settings.set requires 'key' and 'value', or an "
+                    "'updates' object")
+            updates = {key: value}
+        if not isinstance(updates, dict):
+            raise protocol.ProtocolError("'updates' must be an object")
+        why = str(req.get("why") or "changed through the socket")
+        applied: dict[str, Any] = {}
+        for key, value in updates.items():
+            applied[str(key)] = self.settings.set(str(key), value, why=why)
+        self.audit.append("settings.set", ok=True, why=why,
+                          actor=str(req.get("actor") or "gui"),
+                          changed=list(applied),
+                          values={k: str(v) for k, v in applied.items()})
+        return protocol.ok(req.get("id"), applied=applied,
+                           settings=self.settings.data,
+                           path=str(self.settings.path))
+
+    def op_confirm(self, req: dict[str, Any]) -> dict[str, Any]:
+        """List, answer, or raise a confirmation.
+
+        ``action`` is one of ``list``, ``yes``, ``no`` or ``ask``. ``ask`` is
+        the tool-side gate: a dispatched agent calls it before doing something
+        in a class set to ``ask``, and blocks on the answer.
+        """
+        what = str(req.get("action") or "list").lower()
+        if what == "list":
+            return protocol.ok(req.get("id"), **self.confirm.snapshot())
+        if what in ("yes", "no"):
+            token = str(req.get("token") or "")
+            if not token:
+                raise protocol.ProtocolError(
+                    f"confirm {what} requires a 'token'")
+            hit = self.confirm.answer(token, what == "yes",
+                                      by=str(req.get("by") or "user"))
+            return protocol.ok(req.get("id"), token=token, answered=hit,
+                               allow=what == "yes",
+                               note="" if hit else
+                                    "no pending question with that token; "
+                                    "it may have already timed out")
+        if what == "ask":
+            klass = str(req.get("class") or req.get("confirm_action") or "")
+            if not klass:
+                raise protocol.ProtocolError(
+                    "confirm ask requires a 'class'; known: "
+                    + ", ".join(confirm.CLASSES))
+            detail = str(req.get("detail") or "")
+            for rule in confirm.hard_denials(detail or klass):
+                decision = confirm.Decision(rule.name, confirm.DENY, False,
+                                            "hard", detail, rule=rule.why)
+                return protocol.ok(req.get("id"), **decision.to_dict())
+            decision = self.confirm.check(
+                klass, detail, why=str(req.get("why") or "agent asked"),
+                actor=str(req.get("actor") or "agent"))
+            return protocol.ok(req.get("id"), **decision.to_dict())
+        raise protocol.ProtocolError(
+            f"unknown confirm action {what!r}; expected list, yes, no or ask")
+
     def op_shutdown(self, req: dict[str, Any]) -> dict[str, Any]:
         # Present so a supervisor or the CLI can stop the daemon cleanly; the
         # actual stop is scheduled after the response is flushed.
@@ -586,6 +762,9 @@ class Daemon:
             "peek": self.op_peek,
             "audit": self.op_audit,
             "spawned": self.op_spawned,
+            "settings.get": self.op_settings_get,
+            "settings.set": self.op_settings_set,
+            "confirm": self.op_confirm,
             "cancel": self.op_cancel,
             "shutdown": self.op_shutdown,
         }
@@ -616,6 +795,16 @@ class Daemon:
                 self.counters["errors"] += 1
             log.warning("dispatch error", extra={"op": op, "detail": str(exc)})
             return protocol.err(req.get("id"), **_strip(exc.to_dict()))
+        except confirm.ConfirmDenied as exc:
+            # Not an error in the daemon: it is the answer. Reported with the
+            # decision attached so a caller can say *why* it did not happen.
+            log.info("action not confirmed",
+                     extra={"op": op,
+                            "confirm_action": exc.decision.action,
+                            "outcome": exc.decision.outcome})
+            return protocol.err(req.get("id"), **_strip(exc.to_dict()))
+        except settings_mod.SettingsError as exc:
+            return protocol.err(req.get("id"), **_strip(exc.to_dict()))
         except safety.SignalRefused as exc:
             # The firewall said no. That is not an internal error and it is not
             # something to retry; it is the answer.
@@ -633,6 +822,7 @@ class Daemon:
                                 f"{type(exc).__name__}: {exc}")
 
     def close(self) -> None:
+        self.settings.stop_watching()
         self.runs.cancel_all()
         self.speech.close()
         self.dispatcher.close()
@@ -641,6 +831,16 @@ class Daemon:
         self.audit.append("daemon.stopped", ok=True,
                           why="lunad shutting down",
                           uptime_s=round(time.time() - self.started, 1))
+
+
+def _number(value: Any) -> float | None:
+    """A caller's estimate, or None. Never a guess of our own."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _strip(d: dict[str, Any]) -> dict[str, Any]:
