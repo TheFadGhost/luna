@@ -143,7 +143,11 @@ def cmd_say(args: argparse.Namespace) -> int:
     if not resp.get("sentences"):
         sys.stderr.write(f"luna: {resp.get('note', 'nothing speakable')}\n")
         return 1
-    bits = [f"{resp['sentences']} sentence(s)", f"{resp.get('sample_rate')} Hz"]
+    bits = [f"{resp['sentences']} sentence(s)"]
+    if resp.get("provider"):
+        bits.append(str(resp["provider"]))
+    if resp.get("sample_rate"):
+        bits.append(f"{resp['sample_rate']} Hz")
     if resp.get("first_audio_ms") is not None:
         bits.append(f"first audio {resp['first_audio_ms']} ms")
     if resp.get("total_ms") is not None:

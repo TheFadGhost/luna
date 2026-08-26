@@ -128,9 +128,13 @@ class Daemon:
                                    for c in changes])
         if "assistant.name" in keys:
             dropped = self.sessions.clear()
+            # NOT a bare extra={"name": ...}: "name" is a reserved LogRecord
+            # field and logging raises KeyError on the collision, which killed
+            # the whole settings-listener chain. safe_extra() renames clashes.
             log.info("assistant renamed; retired the live sessions",
-                     extra={"name": settings_mod.assistant_name(),
-                            "dropped": dropped})
+                     extra=luna_log.safe_extra(
+                         {"name": settings_mod.assistant_name(),
+                          "dropped": dropped}))
         if "assistant.agent" in keys:
             wanted = str(self.settings.get("assistant.agent") or "").lower()
             try:

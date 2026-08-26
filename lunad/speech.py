@@ -488,10 +488,16 @@ class Speech:
         """
         if self._sample_rate:
             return self._sample_rate
+        # Only guess from the piper voice config when piper is the provider
+        # that will actually speak. Guessing piper's 22050 while OpenRouter is
+        # configured reports the WRONG rate on every detached say, which reads
+        # as "it fell back to piper" when it did not. Unknown is honest.
         try:
-            return read_sample_rate(self.voice_config)
+            if str(self._voice_settings().get("provider", "")) != "openrouter":
+                return read_sample_rate(self.voice_config)
         except Exception:
-            return None
+            pass
+        return None
 
     # -- settings, read fresh on every utterance --------------------------
 
