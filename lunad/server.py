@@ -334,6 +334,37 @@ class Daemon:
         raise protocol.ProtocolError(
             f"unknown memory namespace {name!r}; expected 'luna' or 'sol'")
 
+    def op_codex_profile(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Write ``$CODEX_HOME/luna.config.toml`` so `codex -p luna` is Luna.
+
+        This is the one thing Luna writes outside her own state directory, and
+        it is deliberately the *least* invasive shape that satisfies the ask.
+        In codex 0.149.1 a profile is a separate file layered on top of the
+        user's config, not a table inside it, so the user's own
+        ``~/.codex/config.toml`` is never opened, never mind edited — and
+        plain ``codex`` keeps behaving exactly as it did. Deleting the file
+        undoes this completely.
+
+        It is generated on request rather than before every ask, because the
+        persona embeds tier-1 memory and rewriting a file in the user's codex
+        home on every turn would be a background process quietly churning
+        their dotfiles.
+        """
+        adapter = agent.CodexAdapter()
+        tier1 = self.memory.tier1_block()
+        system_prompt = persona.build_system_prompt(tier1, self.persona_spec)
+        path = adapter.write_profile(system_prompt)
+        # Recorded with its undo, because this is the one file Luna writes
+        # into the user's own dotfiles and it must be reversible from the log.
+        self.audit.append("codex.profile", ok=True, path=str(path),
+                          bytes=len(system_prompt),
+                          undo={"cmd": ["rm", "-f", str(path)],
+                                "note": "removes the luna codex profile; "
+                                        "plain `codex` is unaffected either way"})
+        log.info("wrote the codex luna profile", extra={"path": str(path)})
+        return protocol.ok(req.get("id"), path=str(path),
+                           usage=f"codex -p {adapter.PROFILE_NAME}")
+
     def op_memory_read(self, req: dict[str, Any]) -> dict[str, Any]:
         namespace, store = self._namespace(req)
         name = req.get("file")
@@ -546,6 +577,7 @@ class Daemon:
             "say": self.op_say,
             "speak.cancel": self.op_speak_cancel,
             "session.reset": self.op_session_reset,
+            "codex.profile": self.op_codex_profile,
             "memory.read": self.op_memory_read,
             "memory.write": self.op_memory_write,
             "memory.search": self.op_memory_search,

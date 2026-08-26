@@ -156,9 +156,46 @@ saves. It is kept for conversational continuity, not for money.
 5. Wire `luna hush` to a keybind so a spoken reply can be cut off by hand.
 6. Parallel worker fan-out — `dispatch` is one job per call today.
 
+### Phase 2b — the codex adapter (2026-08-26)
+
+- `CodexAdapter` is real, verified live against codex-cli 0.149.1. The stub is
+  gone.
+- **codex has no `--append-system-prompt` and no `--system-prompt`.** The
+  persona travels as a config override, `-c developer_instructions=<persona>`.
+  Proven, not assumed: with it, "what are you?" answers *"I'm Luna, your
+  resident assistant on this Omarchy Linux desktop"*; without it, *"I'm Codex,
+  an AI coding agent"*. Asked to rewrite the Quickshell bar in React Native
+  overnight, it pushed back on the layer-shell problem and offered QML instead
+  — the same refusal Claude gives.
+- `-c instructions=` was measured against it and rejected: same persona
+  capture, 5,422 prompt tokens against 4,874, and it *replaces* codex's base
+  instructions rather than adding to them, which would cost a dispatched
+  session its tool and patch guidance. `config.CODEX_PERSONA_KEY` switches
+  between the two in one line.
+- Output is parsed from `--json` (JSONL), with `-o/--output-last-message` kept
+  as an independent second witness for the reply text.
+- Sandbox: `ask` runs `-s read-only`, `dispatch` runs
+  `--dangerously-bypass-approvals-and-sandbox`. Both in `config.py`.
+- Sessions resume through `codex exec resume <thread-id>`. codex assigns the
+  id, so turn one has none and `SessionManager` adopts what comes back.
+- `luna codex-profile` writes `~/.codex/luna.config.toml` so the user's own
+  `codex -p luna` boots as Luna. It is a separate profile-v2 file; the user's
+  `~/.codex/config.toml` is never opened, and plain `codex` is unchanged.
+- `dispatch` no longer hard-codes claude's flags: the runner script asks the
+  adapter for its own command line.
+- 325 tests pass, up from 288.
+
 ## Known limitations / stubbed
-- **Codex adapter is still a declared stub.** Its headless flags were never
-  verified and were deliberately not guessed.
+- **Codex `ask` has tools; Claude `ask` does not.** `claude` takes `--tools ""`
+  and is genuinely text-in/text-out. codex has no equivalent flag, so the
+  sandbox *is* the tool policy: an `ask` runs `-s read-only`, which still lets
+  it read files and run read-only commands. It is contained, not inert, and the
+  persona's "you are running headless with no tools" line is therefore not
+  strictly true on codex.
+- **Codex reports no per-call price.** It is on a ChatGPT subscription, so
+  `cost_usd` is `None` and `billing` is `"subscription"`. The daemon's money
+  counter stays at zero on codex, which is correct but means `luna status` is
+  not a like-for-like comparison between the two agents.
 - **Tier 3 (derived profile) not implemented.** Phase 3.
 - **Semantic recall not implemented** — tier 2 is FTS5 keyword only. Phase 3.
 - **`fallback_on_empty` cannot be disabled.** Every Luna recording leaves the

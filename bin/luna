@@ -171,6 +171,15 @@ def cmd_session(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_codex_profile(args: argparse.Namespace) -> int:
+    with Client(timeout=30) as client:
+        resp = client.call("codex.profile")
+    if not resp.get("ok"):
+        return fail(resp)
+    print(f"wrote {resp['path']}\nuse it with: {resp['usage']}")
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     with Client(timeout=15) as client:
         resp = client.call("status")
@@ -543,6 +552,11 @@ def build_parser() -> argparse.ArgumentParser:
     ss.add_argument("action", choices=["reset"])
     ss.add_argument("conversation", nargs="?", default=None)
     ss.set_defaults(func=cmd_session)
+
+    cp = sub.add_parser("codex-profile",
+                        help="write the `luna` codex profile so that "
+                             "`codex -p luna` boots Codex as Luna")
+    cp.set_defaults(func=cmd_codex_profile)
 
     dp = sub.add_parser("dispatch", help="hand a task to an agent in the "
                                         "luna workspace")

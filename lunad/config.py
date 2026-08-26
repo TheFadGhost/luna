@@ -98,6 +98,43 @@ ROUTER_MAX_TRANSCRIPT_CHARS = 8_000
 AGENT_TIMEOUT_S = 180
 DEFAULT_MODEL = None                               # None -> agent's own default
 
+# --- Codex adapter --------------------------------------------------------
+#
+# codex has no `--tools ""`, so the sandbox *is* the tool policy. A
+# conversational ask has no business writing to the disk, so it runs read-only;
+# a dispatched job is real work and gets what Omarchy itself gives codex.
+#
+# Values: "read-only", "workspace-write", "danger-full-access", or "bypass"
+# (which means --dangerously-bypass-approvals-and-sandbox, not a sandbox mode).
+
+CODEX_ASK_SANDBOX = "read-only"
+CODEX_DISPATCH_SANDBOX = "bypass"
+
+# codex's analogue of claude's --safe-mode: do not load the user's own
+# ~/.codex/config.toml or their execpolicy .rules into Luna's turns. Luna must
+# not inherit the user's Codex setup, and must not change it either.
+CODEX_IGNORE_USER_CONFIG = True
+
+# Which config key carries Luna's persona into codex. codex 0.149.1 has no
+# --append-system-prompt, so this is a `-c <key>=<persona>` override.
+#
+#   "developer_instructions" — layers a developer message on top of codex's
+#       own base instructions. The default, and the measured better of the two:
+#       same persona capture, 4,874 prompt tokens against 5,422, and a
+#       dispatched session keeps codex's tool and patch guidance.
+#   "instructions" — also captures the persona, but *replaces* codex's base
+#       instructions. Costs more and strips the tool guidance. Switch here if
+#       a harder identity override is ever wanted.
+#
+# Both are accepted under `--strict-config`; `base_instructions`,
+# `system_prompt`, `persona` and `experimental_instructions_file` are not.
+CODEX_PERSONA_KEY = "developer_instructions"
+
+# Where the user's codex state lives. Read only to check that auth exists —
+# Luna never writes here.
+CODEX_HOME = _xdg("CODEX_HOME", HOME / ".codex")
+CODEX_AUTH = CODEX_HOME / "auth.json"
+
 # --- Dispatch (ARCHITECTURE.md section 6) ---------------------------------
 #
 # Luna's own special workspace. `scratchpad` is already bound to SUPER+S and

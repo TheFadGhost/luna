@@ -61,7 +61,7 @@ allowlist. Nothing else in the package may deliver a signal (section 7).
 | piper worker | venv python, lazy + idle-unload | ~330 MB while loaded, 0 when idle | Spawned by `lunad`, so `lunad`'s cgroup reads ~470 MB while speaking and ~13 MB otherwise. Estimate of ~60 MB was WRONG. |
 | embeddings | sentence-transformers / ONNX | ~90 MB | Loaded lazily, unloaded after 5 min idle. |
 | voxtype | already running | ~208 MB | Untouched. We only add a post_process hook. |
-| agent session | foot + codex | ~150-300 MB | Transient, only while working. |
+| agent session | foot + claude or codex | ~150-300 MB | Transient, only while working. Which CLI comes from `defaults/agent`; the runner script is written by that agent's adapter (section 6a). |
 
 ## 3. IPC
 
@@ -366,6 +366,40 @@ Two more measured details: `hyprctl activeworkspace` never reports a special
 workspace — read `monitors[].specialWorkspace.name` instead. And `foot` *does*
 propagate its child's exit code, though `run.sh` writes `exit` to disk anyway,
 because that is the copy that survives a daemon restart.
+
+## 6a. Agent adapters — BUILT
+
+`lunad` never calls a model API. It shells out to whichever headless agent CLI
+`~/.config/omarchy/defaults/agent` names, so Luna follows the desktop's default
+rather than inventing her own. Two adapters are real, both verified against the
+binaries actually installed here.
+
+The two CLIs share almost nothing, and the differences are the design:
+
+| | `claude` (2.1.241) | `codex` (0.149.1) |
+|---|---|---|
+| headless entry | `claude -p <prompt>` | `codex exec -` (prompt on stdin) |
+| system prompt | `--append-system-prompt` | **no such flag** — `-c developer_instructions=` |
+| machine output | `--output-format json`, one object | `--json`, JSONL events |
+| tool policy | `--tools ""` | the sandbox: `-s read-only` |
+| user config off | `--safe-mode` | `--ignore-user-config --ignore-rules` |
+| session id | caller chooses, `--session-id` | codex assigns, read from `thread.started` |
+| cost | dollars, metered | none — ChatGPT subscription |
+
+**The missing system-prompt flag is the whole problem.** Luna's persona and her
+frozen tier-1 block have to reach the model somehow. codex takes `-c key=value`
+overrides whose value it parses as TOML and falls back to a raw literal when
+that fails, and `developer_instructions` is the key that layers a developer
+message on top of codex's own base instructions. `instructions` also works but
+*replaces* them, costs more, and would strip a dispatched session's tool
+guidance; `base_instructions`, `system_prompt` and `persona` are rejected
+outright under `--strict-config`.
+
+**Cost is not comparable between the two and is not pretended to be.**
+`AgentReply.billing` says `"metered"` or `"subscription"`. On codex `cost_usd`
+is `None` and tokens are reported instead, because tokens are what was spent.
+The daemon only ever adds a truthy `cost_usd`, so a subscription reply moves
+the money counter by nothing, which is the truth.
 
 ## 7. Safety under full autonomy — BUILT
 
