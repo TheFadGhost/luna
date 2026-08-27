@@ -156,7 +156,8 @@ class ServerNamespaceTests(TempMemoryCase):
                    sol_memory=self.sol_memory(), audit=self.audit,
                    dispatcher=dispatch.Dispatcher(
                        jobs_dir=self.root / "jobs", hypr=FakeHyprland(),
-                       audit=self.audit, agent_bin="/bin/true"))
+                       audit=self.audit, terminal="/bin/bash",
+                       agent_bin="/bin/true"))
         self.addCleanup(d.close)
         return d
 

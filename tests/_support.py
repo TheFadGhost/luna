@@ -11,6 +11,11 @@ once, here, for every case.
 Since the Jarvis pass the settings singleton is redirected too, and for a
 sharper reason: a test that read the *real* config would pass or fail
 depending on what the user last changed in the GUI.
+
+Importing this module also disarms ``config.TERMINAL_BIN`` for the whole test
+process. See ``FORBIDDEN_TERMINAL`` below: a dispatch test that forgets to
+stub the terminal opens real windows on the user's desktop, and that is not a
+failure the suite can be trusted to notice on its own.
 """
 
 from __future__ import annotations
@@ -23,9 +28,26 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lunad import audit as audit_mod, safety, settings as settings_mod  # noqa: E402
+from lunad import (audit as audit_mod, config, safety,  # noqa: E402
+                   settings as settings_mod)
 from lunad.memory import (EpisodeStore, Memory, SolMemory,  # noqa: E402
                           Tier1File)
+
+#: What ``config.TERMINAL_BIN`` is replaced with for the whole test process.
+#:
+#: ``Dispatcher`` shells out to Omarchy's real terminal, and three cases used
+#: to build one without stubbing it: every suite run opened three ``foot``
+#: windows on the live desktop, each of which then segfaulted when teardown
+#: deleted the ``run.sh`` it was executing out from under it -- three core
+#: dumps and three "Process crashed" notifications per run, plus the stray
+#: ``/tmp/luna-test-*`` the dying job's watcher thread recreated on its way
+#: out. A test must never reach the user's desktop, so the name is replaced
+#: with one that cannot resolve: ``Dispatcher.available()`` reports it as not
+#: on PATH and ``dispatch()`` raises ``DispatchUnavailable`` naming the fix,
+#: which is a loud in-test failure rather than a window.
+FORBIDDEN_TERMINAL = "luna-tests-must-pass-terminal=/bin/bash"
+
+config.TERMINAL_BIN = FORBIDDEN_TERMINAL
 
 
 class FakeHyprland:
@@ -78,6 +100,8 @@ class TempMemoryCase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="luna-test-")
         self.root = Path(self._tmp.name)
+        # Registered first, so it runs last: every ``close`` a case registers
+        # below drains its own workers before the tree they write into goes.
         self.addCleanup(self._tmp.cleanup)
         # Redirect the globals before anything can touch the real ones.
         self.ledger = safety.SpawnLedger(self.root / "spawned.json")

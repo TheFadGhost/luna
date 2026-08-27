@@ -294,6 +294,15 @@ saves. It is kept for conversational continuity, not for money.
 - **The themed OSD depends on `/usr/share/omarchy/shell/{Commons,Ui}`.** An
   `omarchy update` that renames a token would break it, and the failure mode
   is a QML import error at OSD launch, not at dictation time.
+- **Fixed (2026-08-27): the test suite used to open real `foot` windows.**
+  `Dispatcher(terminal=...)` defaulted to `config.TERMINAL_BIN` *in the
+  signature*, so three cases that omitted it spawned three terminals per run on
+  the live desktop — each segfaulting when teardown deleted its `run.sh`, and
+  each firing a "Process crashed" toast. Terminal is now resolved at
+  construction, `tests/_support.py` pins `config.TERMINAL_BIN` to an
+  unresolvable sentinel so a stray Dispatcher fails loudly instead, and
+  `Dispatcher.close()` drains its watcher threads (bounded) so no
+  `dispatch.finish` lands after the tempdir is gone.
 
 ## Blocked / needs the user
 - **Voice approval** — jenny_dioco is in use; alba was never compared aloud.

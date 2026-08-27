@@ -298,7 +298,7 @@ class Dispatcher:
     def __init__(self, *, jobs_dir: Path = config.JOBS_DIR,
                  hypr: Hyprland | None = None,
                  audit: audit_mod.AuditLog | None = None,
-                 terminal: str = config.TERMINAL_BIN,
+                 terminal: str | None = None,
                  app_id: str = config.LUNA_APP_ID,
                  agent_bin: str | None = None,
                  agent_name: str | None = None,
@@ -309,7 +309,12 @@ class Dispatcher:
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self.hypr = hypr if hypr is not None else Hyprland(app_id=app_id)
         self.audit = audit if audit is not None else audit_mod.audit()
-        self.terminal = terminal
+        # Resolved here, not in the signature default: a default is
+        # bound at import time, so `config.TERMINAL_BIN = ...` would
+        # have no effect on it. The test suite patches exactly that
+        # name to keep a stray Dispatcher from opening a real window
+        # on the user's desktop, and needs the late read to do it.
+        self.terminal = terminal or config.TERMINAL_BIN
         self.app_id = app_id
         self._agent_bin = agent_bin
         # Which CLI's flags the runner script is written in. Read from
@@ -326,6 +331,7 @@ class Dispatcher:
         self.spawn = spawn or safety.spawn
         self._jobs: dict[str, Job] = {}
         self._procs: dict[str, subprocess.Popen] = {}
+        self._watchers: list[threading.Thread] = []
         self._lock = threading.Lock()
 
     # -- helpers ---------------------------------------------------------
@@ -460,8 +466,12 @@ class Dispatcher:
         log.info("dispatched", extra={"job_id": job_id, "to": to,
                                       "pid": proc.pid, "placed": placed})
 
-        threading.Thread(target=self._watch, args=(job, proc, timeout),
-                         daemon=True, name=f"luna-job-{job_id}").start()
+        watcher = threading.Thread(target=self._watch, args=(job, proc, timeout),
+                                   daemon=True, name=f"luna-job-{job_id}")
+        with self._lock:
+            self._watchers = [t for t in self._watchers if t.is_alive()]
+            self._watchers.append(watcher)
+        watcher.start()
         return job
 
     def _runner_script(self, job: Job, timeout: float, linger: float) -> str:
@@ -654,15 +664,34 @@ exit "$rc"
         return {"running": running, "jobs_dir": str(self.jobs_dir),
                 "workspace": self.hypr.state()}
 
-    def close(self) -> None:
+    def close(self, join_timeout: float = 5.0) -> None:
         """Daemon shutdown. Dispatched jobs are deliberately left running.
 
         Killing them would be the wrong default: a job is somebody's work in
         progress, the terminal is visible to the user, and the ledger entry is
         durable so a restarted daemon can still signal it if asked.
+
+        The *watchers* are a different matter. ``_watch`` wakes when the
+        terminal exits and only then writes ``dispatch.finish``, so a watcher
+        that outlives its dispatcher goes on appending to an audit log its
+        owner has finished with -- under test, to one inside a temporary tree
+        that teardown is deleting, which recreates the tree and leaves a stray
+        directory behind. So close waits for them, but only for a bounded
+        while: a job that is still genuinely running has a watcher that will
+        not return for as long as the job lasts, and shutdown must not hang on
+        somebody's hour-long task.
         """
         with self._lock:
             self._procs.clear()
+            watchers = [t for t in self._watchers if t.is_alive()]
+        deadline = time.monotonic() + join_timeout
+        for thread in watchers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(remaining)
+        with self._lock:
+            self._watchers = [t for t in self._watchers if t.is_alive()]
 
 
 def jid_is_dead(data: dict[str, Any], live: dict[str, Any]) -> bool:
