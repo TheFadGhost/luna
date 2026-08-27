@@ -85,6 +85,11 @@ NOTIFY_BIN = "omarchy-notification-send"
 CONFIRM_POLL_S = 0.25                # how often a waiting thread checks
 
 # --- Memory caps (ARCHITECTURE.md section 4, tier 1) ----------------------
+#
+# Fallback defaults. `[memory] luna_cap_chars` and `[memory] user_cap_chars`
+# override these at read time, so a cap changed in the GUI applies to the very
+# next write. SOL_MD_CAP has no key of its own: Sol's namespace is not part of
+# the user-facing contract, so it stays a constant on purpose.
 
 LUNA_MD_CAP = 3000
 USER_MD_CAP = 2000
@@ -92,8 +97,18 @@ SOL_MD_CAP = 3000
 ENTRY_DELIMITER = "§"                         # section sign, from Hermes
 
 # --- Salience / decay -----------------------------------------------------
+#
+# Fallback default for `[memory] decay_half_life_days`.
+#
+# 30, not the 14 this constant carried before the config contract was wired.
+# Nothing user-facing ever said 14: CONFIG-SCHEMA.md, the Jarvis GUI and the
+# user's own config.toml all said 30, and 14 only won because the setting was
+# never read. Half-life is a *ranking* lift on recall, not a delete, and the
+# salience score already carries a recency term of its own; a fortnight on top
+# of that sinks a month-old episode below anything said this week, which is
+# how a tier-2 store stops being worth searching.
 
-SALIENCE_HALF_LIFE_DAYS = 14.0
+SALIENCE_HALF_LIFE_DAYS = 30.0
 CORRECTION_SALIENCE = 1.0                          # exempt from decay
 
 # --- Voice / TTS (ARCHITECTURE.md section 5) ------------------------------
@@ -107,9 +122,19 @@ VENV_PYTHON = VENV_DIR / "bin" / "python"
 PIPER_WORKER = PKG_DIR / "piper_worker.py"
 
 VOICES_DIR = STATE_DIR / "voices"
-VOICE_NAME = "en_GB-jenny_dioco-medium"
+VOICE_NAME = "en_GB-jenny_dioco-medium"                 # `[voice] piper_voice`
 VOICE_ONNX = VOICES_DIR / f"{VOICE_NAME}.onnx"
 VOICE_CONFIG = VOICES_DIR / f"{VOICE_NAME}.onnx.json"   # sample rate read here
+
+
+def voice_paths(name: str) -> tuple[Path, Path]:
+    """The model and its config, for one piper voice name.
+
+    Derived rather than stored so `[voice] piper_voice` can name any voice
+    downloaded into VOICES_DIR without a second setting for each path.
+    """
+    return (VOICES_DIR / f"{name}.onnx", VOICES_DIR / f"{name}.onnx.json")
+
 
 APLAY_BIN = "aplay"
 
@@ -117,7 +142,11 @@ APLAY_BIN = "aplay"
 # holding the model permanently is the wrong trade. Unload when idle.
 SPEECH_IDLE_UNLOAD_S = 300.0
 SPEECH_START_TIMEOUT_S = 60.0        # cold import of onnxruntime, then the model
-SPEECH_MAX_CHARS = 700               # spoken replies are short; detail goes to screen
+# Fallback default for `[voice] max_spoken_chars`. 400, matching
+# ARCHITECTURE.md section 5, CONFIG-SCHEMA.md and the GUI — the 700 this
+# carried before was the odd one out and only ever surfaced when the config
+# file was missing entirely.
+SPEECH_MAX_CHARS = 400               # spoken replies are short; detail goes to screen
 SPEECH_MAX_SENTENCE_CHARS = 260      # one aplay-fed unit; longer gets sub-split
 SPEECH_PLACEHOLDER = "it's on screen"
 
@@ -174,12 +203,14 @@ CODEX_AUTH = CODEX_HOME / "auth.json"
 #
 # Luna's own special workspace. `scratchpad` is already bound to SUPER+S and
 # belongs to the user; taking it would break a keybind they use.
+# Fallback default for `[dispatch] workspace`.
 LUNA_WORKSPACE = "luna"
 
 # NOT `org.omarchy.agent`. That app-id is what `omarchy-launch-tui` gives the
 # user's own agent terminals — there are several open on this machine right
 # now — and a workspace rule matching it would sweep the user's live sessions
 # into Luna's hidden workspace. Luna's terminals get an app-id of their own.
+# Fallback default for `[dispatch] app_id`.
 LUNA_APP_ID = "org.omarchy.luna"
 
 TERMINAL_BIN = "foot"                              # Omarchy's terminal

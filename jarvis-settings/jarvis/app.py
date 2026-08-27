@@ -127,7 +127,7 @@ class JarvisApp(Gtk.Application):
             self.win.present()
             return
 
-        self.themer = theme.ThemeWatch()
+        self.themer = theme.ThemeWatch(follows=self.theme_follows_omarchy)
         self.themer.apply()
         self.themer.start()
 
@@ -139,8 +139,13 @@ class JarvisApp(Gtk.Application):
             print(f"jarvis: could not create config: {exc}", file=sys.stderr)
 
         self.editor = Editor(on_status=self.set_status,
-                             on_external_reload=self.reload_controls)
+                             on_external_reload=self.reload_controls,
+                             on_applied=self.settings_applied)
         self.editor.watch()
+        # The themer was built before the editor could say whether the user
+        # wants the Omarchy palette at all, so it defaulted to yes. Now that
+        # the file has been read, ask again.
+        self.settings_applied(["ui.theme_follows_omarchy"])
         self.binder = panes.Binder(self.editor)
 
         self.win = Gtk.ApplicationWindow(application=self)
@@ -301,6 +306,30 @@ class JarvisApp(Gtk.Application):
             fn = getattr(w, "jarvis_refresh", None)
             if fn:
                 fn()
+        self.settings_applied(keys)
+
+    # ------------------------------------------------------------ [ui] keys
+    def theme_follows_omarchy(self):
+        """`[ui] theme_follows_omarchy`, defaulting to on.
+
+        Read from the editor rather than cached: the themer asks on every
+        re-theme, and the editor is the only object that knows what the file
+        currently says.
+        """
+        if self.editor is None:
+            return True
+        value = self.editor.get("ui.theme_follows_omarchy")
+        return True if value is None else bool(value)
+
+    def settings_applied(self, keys):
+        """Re-chrome the window for settings that change the app itself.
+
+        lunad hot-reloads its own half through the config file; nothing in
+        that path can restyle a GTK window, so the one `[ui]` key that is
+        about this app is applied here.
+        """
+        if self.themer is not None and "ui.theme_follows_omarchy" in set(keys):
+            self.themer.apply()
 
     def start_daemon(self):
         ok, detail = client.start_daemon()

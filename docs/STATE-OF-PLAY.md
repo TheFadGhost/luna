@@ -1,4 +1,4 @@
-# State of play — 2026-08-25
+# State of play — 2026-08-27
 
 ## Done and verified
 
@@ -154,7 +154,18 @@ saves. It is kept for conversational continuity, not for money.
 3. Semantic recall (sqlite-vec + local embeddings) and decay in tier 2.
 4. Tier 3 derived profile.
 5. Wire `luna hush` to a keybind so a spoken reply can be cut off by hand.
-6. Parallel worker fan-out — `dispatch` is one job per call today.
+6. Parallel worker fan-out — `dispatch` is one job per call today. This is what
+   `[dispatch] max_parallel` is waiting on: an admission gate (semaphore around
+   the spawn), a pending queue with its own state under `jobs/`, and an answer
+   for what `luna jobs` shows for a job accepted but not yet started.
+7. A job GC pass, for `[dispatch] job_retention_days`. Nothing under
+   `~/.local/share/luna/jobs/` is ever collected today. Needs a deletion policy
+   — finished, past the window, never the last N — and an audit entry per
+   deletion, since those directories are the only record of what a dispatched
+   agent did.
+8. A tier-1 consolidation pass, for `[memory] consolidate_every_turns`. Reads
+   recent tier-2 episodes, proposes tier-1 edits through the model, applies
+   them under the same cap rules. There is no turn counter to hang it on yet.
 
 ### Phase 2b — the codex adapter (2026-08-26)
 
@@ -224,6 +235,125 @@ saves. It is kept for conversational continuity, not for money.
 - `luna` and `jarvis` are both on PATH (`~/.local/bin`, symlinks to
   `bin/luna`); `bin/jarvis` is a symlink in the repo.
 - 447 tests pass, up from 325.
+
+### Phase 2c — making the config contract true (2026-08-27)
+
+`docs/CONFIG-SCHEMA.md` called itself the contract and the GUI wrote the whole
+of it, but the daemon only ever *read* `[assistant]`, `[voice]` and
+`[confirm]`. Everything else was accepted, stored, round-tripped and displayed
+while hard-coded constants decided the behaviour. A settings app that lies is
+worse than one with fewer settings, so the rest is wired, and the handful that
+cannot be wired without building a subsystem is now named in the document
+instead of being quietly stubbed.
+
+**Wired this pass** — all live, none needing a restart:
+
+- **`[voice] piper_voice`** picks the local ONNX. A worker already holding a
+  different model is unloaded and reloaded: one piper worker is one model and
+  cannot be re-pointed, so ignoring the change would have been the only other
+  option.
+- **`[voice] speed`** reaches both providers in each one's own units — piper
+  takes `length_scale = 1/speed` on the synthesis request, OpenRouter takes
+  `speed` in the request body. Sent to OpenRouter **only when it is not 1.0**:
+  not every model behind it implements the field, and a 400 on an unknown key
+  for the default value would have broken speech for everyone who never touched
+  the setting. Off the default a rejection falls back to piper, which honours
+  the speed anyway.
+- **`[memory] luna_cap_chars` / `user_cap_chars`** are now the caps
+  `Tier1File` enforces, resolved per read rather than frozen at construction.
+  Lowering one below the current contents still rejects rather than truncates —
+  that is the tier-1 contract and it did not change.
+- **`[memory] decay_half_life_days`** is the half-life recall uses. Decay is
+  applied at read time, so a change reaches the next recall.
+- **`[dispatch] workspace` / `app_id`** place the window. The Lua guard that
+  stops window rules stacking is now keyed on a digest of the pair rather than
+  a fixed name — with a fixed name the *old* rule's guard would have suppressed
+  installing the new one, and every job after a change would have opened on the
+  active workspace, visibly, until the next Hyprland config reload. Windows
+  already open keep their app-id: it is set at map time and cannot be changed.
+- **`[ui] notify_on_finish`** puts a toast up when a dispatched job ends. The
+  job's window is hidden by design, so without it the only way to find out was
+  to go and look. Failures are `critical` and carry the exit code; a missing
+  `omarchy-notification-send` is logged and swallowed.
+- **`[ui] theme_follows_omarchy`** is honoured by the Jarvis GTK app, which is
+  the only process that draws anything. Off, the built-in monochrome palette is
+  pinned and `colors.toml` is never opened. The geometry tokens are not part of
+  the switch — they mirror Hyprland's own rounding and border, and a window
+  that stops matching every other window is not a theme choice.
+
+**Two mismatches resolved, deliberately, both toward the documented value:**
+
+- **`max_spoken_chars`: 400.** `ARCHITECTURE.md` §5, `CONFIG-SCHEMA.md`, the
+  GUI and the user's own `config.toml` all said 400; only
+  `config.SPEECH_MAX_CHARS` said 700, and it only ever surfaced when the config
+  file was missing entirely. The odd one out lost.
+- **`decay_half_life_days`: 30.** Same shape — 30 everywhere a human could see,
+  14 in the constant that actually won. Nothing user-facing ever said 14. On
+  the merits, too: half-life is a *ranking* lift on recall, not a delete, and
+  the salience score already carries a recency term of its own; a fortnight on
+  top of that sinks a month-old episode below anything said this week, which is
+  how a tier-2 store stops being worth searching. The user's live
+  `config.toml` already held 30, so nothing they had set was changed.
+
+`tests/test_contract.py::DriftCase` now fails if any schema default and its
+fallback constant disagree again — that is the drift both mismatches were.
+
+**The gotcha this pass produced, and the class of bug behind it.** Wiring
+`[ui] notify_on_finish` put roughly ten *real* Omarchy toasts on the user's
+live desktop in a single suite run, carrying test fixture text — "Luna: job
+53b9da29 failed — exit 2 — read the README", "exit 2 — rm -f
+/tmp/jarvis-test". The mechanism is worth writing down because it is the same
+one that opened three `foot` windows a run a day earlier, in a sibling
+parameter nobody thought to check:
+
+> A binary name bound as a **signature default** — `def __init__(self,
+> notify_bin: str = config.NOTIFY_BIN)` — is evaluated once, at import.
+> `tests/_support.py` can set `config.NOTIFY_BIN` to a sentinel all it likes;
+> the constructor was already holding the real name and will hand it out
+> forever. Stubbing the *object* is not enough, because the real program is
+> reached anyway.
+
+It fired here because five test modules legitimately pass `terminal="/bin/bash"`
+so a job runs headlessly — and the job then genuinely *finishes*, which is
+precisely when the new notifier ran.
+
+Fixed as a class, not as two instances. Every `config` name in `lunad/` that
+reaches the outside world is now read late, in the constructor body, and
+replaced process-wide by `tests/_support.py` with something that cannot
+resolve:
+
+| name | what it would do to the machine running the suite |
+|---|---|
+| `TERMINAL_BIN` | opens a window on the user's desktop |
+| `NOTIFY_BIN` | puts a toast on the user's desktop |
+| `APLAY_BIN` | plays audio out of the user's speakers |
+| `HYPRCTL_BIN` | installs window rules and moves the user's workspaces |
+| `VENV_PYTHON` | forks a real 331 MB piper worker |
+
+`tests/test_guards.py` is new and asserts the whole arrangement — that each
+sentinel is installed, that none of them can actually resolve, that an explicit
+argument still wins (the five modules that need `/bin/bash` must keep working),
+and, by `inspect.signature`, that **none of these parameters may go back to
+being a signature default**. There had been no test for the terminal guard at
+all, which is why the same bug landed twice.
+
+**Corrections to the premise this pass started from.** `assistant.name`,
+`assistant.specialist`, `voice.enabled` and `voice.max_spoken_chars` were
+*already* wired, not inert: the name and the specialist reach every prompt,
+toast and log label through `settings_mod.assistant_name()`, and the voice
+settings are read per utterance in `speech._voice_settings()`. What was wrong
+with `max_spoken_chars` was only its fallback constant, not its wiring.
+
+**Deliberately not wired**, and now documented as such rather than stubbed:
+`[memory] consolidate_every_turns`, `[dispatch] max_parallel`,
+`[dispatch] job_retention_days`, and the whole of `[listen]`. Each needs a
+subsystem that does not exist, or belongs to another process; see
+`docs/CONFIG-SCHEMA.md` §Not wired for what each one actually requires.
+
+- 484 tests pass in the root suite, up from 447; 59 in `jarvis-settings`, up
+  from 53. Verified on the final run: no window opened, no toast fired
+  (`journalctl --user` clean), no `/tmp/luna-test-*` left behind, and no core
+  dump produced.
 
 ## Known limitations / stubbed
 - **The confirmation system cannot see inside a running job.** It is enforced

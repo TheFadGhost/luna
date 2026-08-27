@@ -34,6 +34,7 @@ the obvious one.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -101,14 +102,51 @@ class Hyprland:
     the right key names from the wrong ones.
     """
 
-    _RULE_GLOBAL = "luna_workspace_rule"
+    def __init__(self, hyprctl: str | None = None,
+                 workspace: str | None = None,
+                 app_id: str | None = None) -> None:
+        # Late read, like the terminal and the notifier. `hyprctl repl` installs
+        # window rules and `hyprctl dispatch` moves workspaces: a test that
+        # built one of these unstubbed would rearrange the user's live desktop,
+        # and a signature default cannot be patched to stop it.
+        self.hyprctl = hyprctl or config.HYPRCTL_BIN
+        # Kept as overrides. With neither given, both come from `[dispatch]`
+        # on every read, so a workspace or app-id changed in the GUI applies
+        # to the next dispatch without a restart. Windows already open keep
+        # the app-id they were born with — an app-id is set at map time and
+        # cannot be changed afterwards — so a change moves new jobs only.
+        self._workspace_override = workspace
+        self._app_id_override = app_id
 
-    def __init__(self, hyprctl: str = config.HYPRCTL_BIN,
-                 workspace: str = config.LUNA_WORKSPACE,
-                 app_id: str = config.LUNA_APP_ID) -> None:
-        self.hyprctl = hyprctl
-        self.workspace = workspace
-        self.app_id = app_id
+    @property
+    def workspace(self) -> str:
+        if self._workspace_override is not None:
+            return self._workspace_override
+        return (str(settings_mod.get("dispatch.workspace") or "").strip()
+                or config.LUNA_WORKSPACE)
+
+    @property
+    def app_id(self) -> str:
+        if self._app_id_override is not None:
+            return self._app_id_override
+        return (str(settings_mod.get("dispatch.app_id") or "").strip()
+                or config.LUNA_APP_ID)
+
+    @property
+    def rule_global(self) -> str:
+        """The Lua guard's name, keyed on what the rule actually says.
+
+        A single fixed global was right while the app-id was a constant. Now
+        that both halves are settings, a fixed name would let the guard from
+        the *old* rule suppress installing the new one, and every job after a
+        change would open on the active workspace instead — visibly, in the
+        user's face, and only until the next Hyprland config reload, which is
+        the hardest kind of bug to catch. Keying the guard on a digest of the
+        pair means changing either one installs a rule again.
+        """
+        digest = hashlib.sha256(
+            f"{self.app_id}\0{self.workspace}".encode()).hexdigest()[:12]
+        return f"luna_workspace_rule_{digest}"
 
     # -- plumbing --------------------------------------------------------
 
@@ -163,11 +201,12 @@ class Hyprland:
         own Lua state does both for free.
         """
         klass = "^" + re.escape(self.app_id) + "$"
+        guard = self.rule_global
         lua = (
-            f"if not _G.{self._RULE_GLOBAL} then "
+            f"if not _G.{guard} then "
             f'hl.window_rule({{ match = {{ class = "{_lua_escape(klass)}" }}, '
             f'workspace = "special:{self.workspace} silent" }}); '
-            f"_G.{self._RULE_GLOBAL} = true; return \"added\" end "
+            f"_G.{guard} = true; return \"added\" end "
             'return "present"'
         )
         rc, out = self._run(["repl", lua])
@@ -276,6 +315,18 @@ class Job:
         return text
 
 
+def _reap_notify(proc: subprocess.Popen) -> None:
+    """Wait on the toast so it never becomes a zombie, then release the pid."""
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        safety.reap(proc)
+    except Exception:  # noqa: BLE001 - reaping a toast must not raise
+        pass
+
+
 def _read(path: Path, limit: int) -> str:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -299,11 +350,12 @@ class Dispatcher:
                  hypr: Hyprland | None = None,
                  audit: audit_mod.AuditLog | None = None,
                  terminal: str | None = None,
-                 app_id: str = config.LUNA_APP_ID,
+                 app_id: str | None = None,
                  agent_bin: str | None = None,
                  agent_name: str | None = None,
                  sol_memory_dir: Path = config.SOL_MEMORY_DIR,
                  confirm: confirm_mod.ConfirmBroker | None = None,
+                 notify_bin: str | None = None,
                  spawn: Any = None) -> None:
         self.jobs_dir = Path(jobs_dir)
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
@@ -315,7 +367,13 @@ class Dispatcher:
         # name to keep a stray Dispatcher from opening a real window
         # on the user's desktop, and needs the late read to do it.
         self.terminal = terminal or config.TERMINAL_BIN
-        self.app_id = app_id
+        # Resolved here and not in the signature, for exactly the reason the
+        # terminal is: a default is bound at import, so `config.NOTIFY_BIN =
+        # ...` would have no effect on it. The suite patches that name to keep
+        # a finished job from putting a real toast on the user's desktop --
+        # and it did, ten of them, the first time this was wired without the
+        # late read.
+        self.notify_bin = notify_bin or config.NOTIFY_BIN
         self._agent_bin = agent_bin
         # Which CLI's flags the runner script is written in. Read from
         # Omarchy's default rather than hard-coded, because `claude -p` and
@@ -349,6 +407,17 @@ class Dispatcher:
         except agent_mod.AgentUnavailable as exc:
             return False, str(exc)
         return self.hypr.available()
+
+    @property
+    def app_id(self) -> str:
+        """One source of truth, and it is the compositor handle's.
+
+        Two copies of this used to exist — one here, one on ``Hyprland`` — and
+        an injected fake compositor made them disagree: the window rule matched
+        one class while ``foot`` was launched with the other, which places
+        every job on the active workspace. Ask the object that writes the rule.
+        """
+        return self.hypr.app_id
 
     def announce(self, job: Job) -> str:
         """One line, as the persona spec requires: who, and why.
@@ -562,6 +631,49 @@ exit "$rc"
         log.info("job finished", extra={"job_id": job.id,
                                         "exit_code": job.exit_code,
                                         "state": job.state})
+        self.notify_finished(job)
+
+    # -- `[ui] notify_on_finish` -----------------------------------------
+
+    def notify_finished(self, job: Job) -> bool:
+        """Tell the user a dispatched job ended. Returns whether it notified.
+
+        The window is on a hidden workspace by design, so without this the
+        only way to learn a job finished is to go and look. Gated on
+        `[ui] notify_on_finish`, read here rather than at construction so the
+        toggle takes effect on the very next job.
+
+        Failure to notify is logged and swallowed. A missing
+        ``omarchy-notification-send`` is a desktop that cannot show a toast,
+        not a job that did not finish, and it must never turn a completed job
+        into a failed one.
+        """
+        if not bool(settings_mod.get("ui.notify_on_finish", True)):
+            return False
+        who = settings_mod.assistant_name()
+        ok = job.exit_code == 0
+        headline = f"{who}: job {job.id} {'finished' if ok else job.state}"
+        body = job.task.strip().replace("\n", " ")[:160] or "(no task text)"
+        if not ok and job.exit_code is not None:
+            body = f"exit {job.exit_code} — {body}"
+        argv = [self.notify_bin, "--app-name", "Jarvis",
+                "-u", "normal" if ok else "critical",
+                "-g", "󰄬" if ok else "󰀦",
+                headline, body]
+        try:
+            proc = safety.spawn(
+                argv, kind="job-notify", durable=False,
+                note=f"job {job.id} finished",
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+        except (OSError, safety.SignalRefused) as exc:
+            log.warning("could not send the job-finished notification",
+                        extra={"detail": str(exc), "bin": self.notify_bin,
+                               "job_id": job.id})
+            return False
+        threading.Thread(target=_reap_notify, args=(proc,), daemon=True,
+                         name=f"luna-job-notify-{job.id}").start()
+        return True
 
     def _exit_code(self, job: Job, proc: subprocess.Popen | None) -> int | None:
         """The script's own record wins over the terminal's status.

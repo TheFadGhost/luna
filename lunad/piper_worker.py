@@ -67,6 +67,15 @@ def main(argv: list[str]) -> int:
         _note(f"piper is not importable in this interpreter: {exc}")
         return 3
 
+    # `[voice] speed` reaches synthesis as a length_scale on the request, so
+    # it needs no reload. SynthesisConfig is imported separately and
+    # tolerantly: an older piper without it still speaks, at 1.0, rather than
+    # refusing to start over a setting nobody may have changed.
+    try:
+        from piper import SynthesisConfig  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        SynthesisConfig = None
+
     try:
         voice = PiperVoice.load(str(model_path),
                                 str(config_path) if config_path else None)
@@ -97,6 +106,11 @@ def main(argv: list[str]) -> int:
             job_id = str(job.get("id") or "")
             job_seq = int(job.get("_seq") or 0)
             sentences = [s for s in job.get("sentences") or [] if s.strip()]
+            syn_cfg = None
+            scale = job.get("length_scale")
+            if SynthesisConfig is not None and isinstance(scale, (int, float)):
+                if scale > 0 and abs(float(scale) - 1.0) > 1e-9:
+                    syn_cfg = SynthesisConfig(length_scale=float(scale))
             _emit(f"BEGIN {job_id}\n")
             status, detail = "ok", "-"
             try:
@@ -104,7 +118,7 @@ def main(argv: list[str]) -> int:
                     if is_cancelled(job_seq):
                         status = "cancelled"
                         break
-                    for chunk in voice.synthesize(sentence):
+                    for chunk in voice.synthesize(sentence, syn_cfg):
                         if is_cancelled(job_seq):
                             status = "cancelled"
                             break

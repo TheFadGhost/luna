@@ -346,12 +346,15 @@ class ConfirmBroker:
 
     def __init__(self, *, settings: settings_mod.Settings | None = None,
                  audit: audit_mod.AuditLog | None = None,
-                 notify_bin: str = config.NOTIFY_BIN,
+                 notify_bin: str | None = None,
                  asker: Callable[[Pending, str], None] | None = None,
                  clock: Callable[[], float] = time.monotonic) -> None:
         self._settings = settings
         self.audit = audit if audit is not None else audit_mod.audit()
-        self.notify_bin = notify_bin
+        # Late read, not a signature default: see Dispatcher.__init__. A
+        # default bound at import is unpatchable, and an unpatchable notifier
+        # means the test suite toasts the user.
+        self.notify_bin = notify_bin or config.NOTIFY_BIN
         # Injectable so the suite can exercise every branch without a desktop.
         self.asker = asker if asker is not None else self._ask_on_desktop
         self.clock = clock

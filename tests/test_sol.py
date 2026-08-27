@@ -80,7 +80,7 @@ class NamespaceTests(TempMemoryCase):
     def test_the_cap_rejects_rather_than_truncates_for_sol_too(self):
         sol = SolMemory(self.root / "capped")
         self.addCleanup(sol.close)
-        sol.sol.cap = 80
+        sol.sol.cap_default = 80
         sol.sol.append("short one")
         with self.assertRaises(LunaMemoryError):
             sol.sol.append("x" * 200)

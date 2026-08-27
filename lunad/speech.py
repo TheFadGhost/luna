@@ -267,6 +267,34 @@ class SpeechUnavailable(RuntimeError):
     """TTS cannot run. Reported to the client; never fatal to the daemon."""
 
 
+#: `[voice] speed`'s range, and the range the OpenAI-shaped /audio/speech
+#: endpoint documents. The schema already validates against it; clamping again
+#: here is for the fallback path, where a value can arrive from a raw dict.
+SPEED_MIN, SPEED_MAX = 0.25, 4.0
+
+
+def _clamp_speed(value: Any) -> float:
+    """`[voice] speed` as a usable multiplier. Never raises."""
+    try:
+        speed = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if speed != speed or speed <= 0:            # NaN, zero, negative
+        return 1.0
+    return min(SPEED_MAX, max(SPEED_MIN, speed))
+
+
+def length_scale(speed: float) -> float:
+    """piper's knob, from ours.
+
+    piper measures duration, we measure rate, so they are reciprocals: speed
+    2.0 is length_scale 0.5. Naming it here rather than inlining ``1/speed``
+    because getting the direction backwards is silent — it still speaks, just
+    wrongly, and nothing in the pipeline would flag it.
+    """
+    return round(1.0 / _clamp_speed(speed), 6)
+
+
 def read_sample_rate(config_path: Path | None = None) -> int:
     """Read the voice's own sample rate from its ``.onnx.json``.
 
@@ -347,6 +375,7 @@ def parse_wav(data: bytes) -> Wav:
 
 
 def synthesise(text: str, *, model: str, voice: str, api_key: str,
+               speed: float = 1.0,
                url: str = config.OPENROUTER_SPEECH_URL,
                timeout: float = config.OPENROUTER_TIMEOUT_S) -> Wav:
     """One sentence, one request. Raises :class:`RemoteSpeechFailed`.
@@ -359,8 +388,16 @@ def synthesise(text: str, *, model: str, voice: str, api_key: str,
         raise RemoteSpeechFailed(
             "no OpenRouter API key; set OPENROUTER_API_KEY in "
             f"{config.SECRETS_PATH}")
-    payload = json.dumps({"model": model, "input": text,
-                          "voice": voice}).encode("utf-8")
+    body_json: dict[str, Any] = {"model": model, "input": text, "voice": voice}
+    # Sent only when it is not 1.0. `speed` is in the OpenAI /audio/speech
+    # shape this endpoint copies, but not every model behind OpenRouter
+    # implements it, and a request that 400s on an unknown field for the
+    # default value would break speech for everyone who never touched the
+    # setting. Off the default, a rejection is a fallback to piper — which
+    # honours the speed anyway — and it is reported, not swallowed.
+    if _clamp_speed(speed) != 1.0:
+        body_json["speed"] = _clamp_speed(speed)
+    payload = json.dumps(body_json).encode("utf-8")
     request = urllib.request.Request(
         url, data=payload, method="POST",
         headers={"Authorization": f"Bearer {api_key}",
@@ -394,7 +431,7 @@ def synthesise(text: str, *, model: str, voice: str, api_key: str,
 class _Job:
     __slots__ = ("id", "sentences", "text", "cancelled", "done", "started",
                  "error", "played_bytes", "first_audio", "provider",
-                 "fell_back", "voice", "sample_rate", "cfg")
+                 "fell_back", "voice", "sample_rate", "cfg", "speed")
 
     def __init__(self, sentences: list[str], text: str,
                  cfg: dict[str, Any] | None = None) -> None:
@@ -410,6 +447,7 @@ class _Job:
         self.first_audio: float | None = None   # proves streaming, not batching
         self.provider = str(self.cfg.get("provider", "piper"))
         self.voice = str(self.cfg.get("voice", ""))
+        self.speed = _clamp_speed(self.cfg.get("speed", 1.0))
         self.sample_rate: int | None = None
         # Set when a remote request failed and piper finished the utterance.
         # Reported rather than swallowed: silent degradation is how a broken
@@ -435,8 +473,13 @@ class Speech:
         settings: Any = None,
         synth: Any = None,
     ) -> None:
-        self.model = model or config.VOICE_ONNX
-        self.voice_config = voice_config or config.VOICE_CONFIG
+        # Kept as *overrides*, not as resolved values: with neither given,
+        # `model` and `voice_config` are derived from `[voice] piper_voice`
+        # on every read, so changing the voice in the GUI swaps the model
+        # without a restart. Tests pass explicit paths and keep them.
+        self._model_override = Path(model) if model is not None else None
+        self._voice_config_override = (Path(voice_config)
+                                       if voice_config is not None else None)
         self.python = python or config.VENV_PYTHON
         self.idle_unload_s = (config.SPEECH_IDLE_UNLOAD_S
                               if idle_unload_s is None else idle_unload_s)
@@ -449,6 +492,10 @@ class Speech:
         self._proc: subprocess.Popen | None = None
         self._stdout: Any = None
         self._sample_rate: int | None = None
+        # Which piper voice the running worker actually holds. A worker is one
+        # loaded ONNX model and cannot be re-pointed, so a change to
+        # `[voice] piper_voice` has to unload it rather than be ignored.
+        self._loaded_voice: str | None = None
         self._lock = threading.RLock()          # guards worker + job slot
         self._speak_lock = threading.Lock()     # serialises playback threads
         self._job: _Job | None = None
@@ -471,12 +518,31 @@ class Speech:
         return (self._settings if self._settings is not None
                 else settings_mod.settings())
 
+    def piper_voice(self) -> str:
+        """`[voice] piper_voice`, or the fallback default."""
+        if self._model_override is not None:
+            return self._model_override.name.removesuffix(".onnx")
+        name = str(self._voice_settings().get("piper_voice") or "").strip()
+        return name or config.VOICE_NAME
+
+    @property
+    def model(self) -> Path:
+        if self._model_override is not None:
+            return self._model_override
+        return config.voice_paths(self.piper_voice())[0]
+
+    @property
+    def voice_config(self) -> Path:
+        if self._voice_config_override is not None:
+            return self._voice_config_override
+        return config.voice_paths(self.piper_voice())[1]
+
     def available(self) -> tuple[bool, str]:
         missing = [str(p) for p in (self.python, self.model, self.voice_config)
                    if not p.exists()]
         if missing:
             return False, "missing: " + ", ".join(missing)
-        return True, f"{config.VOICE_NAME} via {self.python}"
+        return True, f"{self.piper_voice()} via {self.python}"
 
     def _reported_rate(self) -> int | None:
         """Sample rate for status/report payloads.
@@ -518,6 +584,8 @@ class Speech:
             "fallback": str(cfg.get("fallback", "piper")),
             "max_spoken_chars": int(cfg.get("max_spoken_chars",
                                             config.SPEECH_MAX_CHARS)),
+            "piper_voice": str(cfg.get("piper_voice") or config.VOICE_NAME),
+            "speed": _clamp_speed(cfg.get("speed", 1.0)),
         }
 
     def say(self, text: str, wait: bool = False,
@@ -555,7 +623,7 @@ class Speech:
             "spoken": spoken, "sentences": len(sentences), "id": job.id,
             "sample_rate": job.sample_rate or self._reported_rate(),
             "waited": wait, "cancelled": job.cancelled,
-            "provider": job.provider, "voice": job.voice or config.VOICE_NAME,
+            "provider": job.provider, "voice": job.voice or self.piper_voice(),
         }
         if job.fell_back:
             payload["fell_back_to"] = "piper"
@@ -597,8 +665,9 @@ class Speech:
                 "speaking": speaking,
                 "provider": cfg["provider"],
                 "voice": (cfg["voice"] if cfg["provider"] == "openrouter"
-                          else config.VOICE_NAME),
-                "piper_voice": config.VOICE_NAME,
+                          else self.piper_voice()),
+                "piper_voice": self.piper_voice(),
+                "speed": cfg["speed"],
                 "model": cfg["model"],
                 "fallback": cfg["fallback"],
                 "enabled": cfg["enabled"],
@@ -694,6 +763,7 @@ class Speech:
                 try:
                     outcome: Any = self.synth(
                         sentence, model=model, voice=voice, api_key=key,
+                        speed=job.speed,
                         timeout=config.OPENROUTER_TIMEOUT_S)
                 except RemoteSpeechFailed as exc:
                     outcome = exc
@@ -765,7 +835,8 @@ class Speech:
         if job.cancelled:
             return
         if not self._send(proc, {"op": "say", "id": job.id,
-                                 "sentences": sentences}):
+                                 "sentences": sentences,
+                                 "length_scale": length_scale(job.speed)}):
             raise SpeechUnavailable("the piper worker vanished mid-request")
 
         player: subprocess.Popen | None = None
@@ -851,6 +922,17 @@ class Speech:
     # -- worker lifecycle ------------------------------------------------
 
     def _ensure_worker(self) -> tuple[subprocess.Popen, Any]:
+        wanted = self.piper_voice()
+        # Outside the lock: _unload takes it, and a worker holding the wrong
+        # model has to go before the branch below can decide it is reusable.
+        with self._lock:
+            stale = (self._proc is not None and self._proc.poll() is None
+                     and self._loaded_voice not in (None, wanted))
+        if stale:
+            log.info("piper voice changed; reloading",
+                     extra={"was": self._loaded_voice, "now": wanted})
+            self._sample_rate = None
+            self._unload(f"voice changed to {wanted}")
         with self._lock:
             if self._closed:
                 raise SpeechUnavailable("speech worker is shut down")
@@ -893,6 +975,7 @@ class Speech:
             self._sample_rate = (meta.get("sample_rate")
                                  or read_sample_rate(self.voice_config))
             self._load_ms = int((time.monotonic() - started) * 1000)
+            self._loaded_voice = wanted
             self._proc, self._stdout = proc, proc.stdout
             self._last_used = time.monotonic()
             self.counters["loads"] += 1
@@ -917,6 +1000,7 @@ class Speech:
     def _unload(self, reason: str) -> None:
         with self._lock:
             proc, self._proc, self._stdout = self._proc, None, None
+            self._loaded_voice = None
         if proc is None:
             return
         self.counters["unloads"] += 1
