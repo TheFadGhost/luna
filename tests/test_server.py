@@ -108,6 +108,7 @@ class DaemonCase(TempMemoryCase):
         dispatcher = dispatch.Dispatcher(jobs_dir=self.root / "jobs",
                                          hypr=self.hypr, audit=self.audit,
                                          sol_memory_dir=self.root / "sol",
+                                         terminal="/bin/bash",
                                          agent_bin="/bin/true")
         daemon = Daemon(agent_name="claude", memory=self.memory(),
                         sol_memory=self.sol_memory(), audit=self.audit,
