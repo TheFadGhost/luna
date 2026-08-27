@@ -1,0 +1,59 @@
+name: Feature request
+description: Suggest a capability or a change of behaviour
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before opening this, please skim `docs/STATE-OF-PLAY.md` — it records
+        what is built, what is deliberately not built, and what was tried and
+        rejected. If your idea is in the last category, the note there will say
+        why, and that is worth arguing with rather than restating.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: |
+        What are you actually trying to do, and where does Luna get in the way?
+        Describe the situation, not the solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like instead
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of Luna
+      options:
+        - lunad (daemon, socket, protocol)
+        - memory (tiers, recall, salience)
+        - dispatch (jobs, workspaces, the audit log)
+        - speech (piper, TTS providers, the voice router)
+        - jarvis-settings (the GTK app)
+        - CLI (bin/luna)
+        - docs
+        - other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Does this need a config key?
+      description: |
+        If so, propose the section and name. Note that `docs/CONFIG-SCHEMA.md`
+        is a contract: a key that is added must be wired, or explicitly
+        documented as unwired and why.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Including "do nothing" — say why that is not enough.

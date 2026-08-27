@@ -1,0 +1,98 @@
+name: Bug report
+description: Something in Luna behaves incorrectly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Luna touches a live desktop, so the environment
+        details below usually matter more than they would for an ordinary
+        library — please fill them in even if they seem irrelevant.
+
+        **Do not paste API keys.** Redact anything from `secrets.env`, and
+        check `luna status` output before pasting it.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands, in order.
+      placeholder: |
+        1. `bin/luna dispatch "..."`
+        2. ...
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: lunad version
+      description: Output of `python3 -m lunad --version`. If you are on a git checkout, also give the commit — `git rev-parse --short HEAD`.
+      placeholder: "0.x.y (abc1234)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: status
+    attributes:
+      label: "`luna status` output"
+      description: Output of `bin/luna status`. Redact anything sensitive.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: journal
+    attributes:
+      label: Relevant journal lines
+      description: |
+        Output of `journalctl --user -u lunad --since "10 min ago"`, trimmed to
+        the relevant part. If the daemon will not start at all, include
+        everything since the last start.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        Distribution, Python version (`python3 -V`), compositor, and whether
+        you are running under Omarchy or a plain Hyprland.
+      placeholder: |
+        Distro: Arch, Omarchy 3.x
+        Python: 3.14.7
+        Compositor: Hyprland 0.4x
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: desktop-effects
+    attributes:
+      label: Did anything reach the desktop?
+      description: |
+        This project has a specific failure mode where code that should be
+        inert instead talks to the real desktop. Tick anything you saw.
+      options:
+        - label: A terminal window opened that I did not ask for
+        - label: A desktop notification appeared unexpectedly
+        - label: A new core dump appeared (`coredumpctl list`)
+        - label: Stray `/tmp/luna-test-*` directories were left behind
+        - label: None of the above
+
+  - type: checkboxes
+    id: tests
+    attributes:
+      label: Test suites
+      options:
+        - label: I ran `python3 -m unittest discover -s tests -t .` and have included the result if it failed
