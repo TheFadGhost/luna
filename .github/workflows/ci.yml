@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lunad:
+    name: lunad suite (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the real floor: the code uses `tomllib`, which is stdlib from
+        # 3.11 onward. Nothing in the source needs anything newer — no PEP 695
+        # syntax, no StrEnum, no TaskGroup — so the floor is tested as well as
+        # the version development actually happens on (3.14).
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # No `pip install` step, deliberately: lunad and its test suite import
+      # nothing outside the standard library. If this ever needs dependencies,
+      # that is a change worth noticing in review.
+
+      - name: Environment check
+        run: |
+          python -V
+          python - <<'PY'
+          import sqlite3, sys
+          # lunad refuses to start without FTS5 (exit 78) and tier-2 recall
+          # tests need it, so fail here with a legible message rather than
+          # forty confusing errors further down.
+          con = sqlite3.connect(":memory:")
+          try:
+              con.execute("CREATE VIRTUAL TABLE t USING fts5(x)")
+          except sqlite3.OperationalError as exc:
+              sys.exit(f"sqlite3 has no FTS5 support: {exc}")
+          print("sqlite3", sqlite3.sqlite_version, "with FTS5: ok")
+          PY
+
+      - name: Run the lunad suite
+        run: python -m unittest discover -s tests -t . -v
+
+      # This repository's specific failure mode is test code reaching the real
+      # desktop -- a Dispatcher that spawned actual terminal windows, a
+      # notifier that put real toasts on screen. There is no desktop on a
+      # runner to notice that on, but the stray temporary directories the
+      # dying jobs left behind are visible here, so they are checked.
+      - name: No stray test directories left behind
+        if: always()
+        run: |
+          if compgen -G "/tmp/luna-test-*" > /dev/null; then
+            echo "::error::stray /tmp/luna-test-* directories survived the run"
+            ls -ld /tmp/luna-test-*
+            exit 1
+          fi
+          echo "no stray test directories"
+        shell: bash
+
+# The jarvis-settings suite is deliberately NOT run here.
+#
+# jarvis/theme.py, app.py, panes.py, widgets.py and editor.py all do
+# `import gi; from gi.repository import Gtk` at module scope, so the suite
+# cannot even be collected without PyGObject bound to GTK 4. On a GitHub
+# runner that means apt-installing gir1.2-gtk-4.0 and friends and hoping the
+# system PyGObject matches the setup-python interpreter -- which it does not,
+# so it also means either building PyGObject from source against the right
+# headers or abandoning the version matrix and using the runner's system
+# python. Both are slow and both break whenever the runner image moves.
+#
+# The suite itself is fine: it runs fully headless, with no display, no D-Bus
+# and no session, and passes locally in well under a second. The obstacle is
+# purely getting `gi` importable reliably on a runner.
+#
+# A red or flaky badge on a public repository is worse than an honest gap, so
+# for now the jarvis-settings suite is a local requirement instead: see
+# CONTRIBUTING.md, which requires both suites green before a PR is merged, and
+# the pull request template, which asks for both counts.

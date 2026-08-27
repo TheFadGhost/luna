@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/TheFadGhost/luna/security/advisories/new
+    about: >-
+      Do not open a public issue for anything exploitable. Report it privately
+      here, and read SECURITY.md first — a dispatched job runs with permissions
+      bypassed by design, and that is documented rather than a bug.
+  - name: Architecture and design
+    url: https://github.com/TheFadGhost/luna/blob/main/docs/ARCHITECTURE.md
+    about: How Luna is put together, and why. Read before proposing structural changes.
+  - name: What is actually built
+    url: https://github.com/TheFadGhost/luna/blob/main/docs/STATE-OF-PLAY.md
+    about: Current state, known gaps, and approaches that were tried and rejected.

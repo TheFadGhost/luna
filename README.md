@@ -1,5 +1,9 @@
 # Luna
 
+[![CI](https://github.com/TheFadGhost/luna/actions/workflows/ci.yml/badge.svg)](https://github.com/TheFadGhost/luna/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+
 A resident personal assistant for [Omarchy](https://omarchy.org) — a supervised
 daemon with a voice, a memory that compounds, and the run of the desktop.
 
@@ -125,7 +129,19 @@ hardware — Luna uses a local embedding index instead. And Hermes has no decay,
 so memories only get tidied at the cap; Luna scores salience and lets trivia age
 out.
 
+## Contributing
+
+Bug reports and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for how to run the daemon and both test suites, the branch → PR → merge rule,
+and the one hard rule of this codebase: **a test must never reach the real
+terminal, notifier, `aplay`, `hyprctl` or piper.** It has twice failed to hold,
+and CONTRIBUTING.md explains the mechanism so it does not happen a third time.
+
+Luna runs as you, on your machine, and a dispatched job runs with permissions
+bypassed. [SECURITY.md](SECURITY.md) describes that blast radius honestly, and
+how to report a vulnerability privately.
+
 ## Licence
 
-MIT. Piper (GPL-3.0) is invoked as a separate binary over a pipe and does not
-affect this licence.
+[MIT](LICENSE). Piper (GPL-3.0) is invoked as a separate binary over a pipe and
+does not affect this licence.
