@@ -170,13 +170,16 @@ class FallbackCase(TempMemoryCase):
     def setUp(self) -> None:
         super().setUp()
         self.calls: list[str] = []
+        self.speeds: list[float] = []
 
     def speech_with(self, outcomes) -> _Speech:  # noqa: ANN001
         """`outcomes` is one entry per sentence: bytes, or an exception."""
         queue = list(outcomes)
 
-        def synth(text, *, model, voice, api_key, timeout=None):  # noqa: ANN001
+        def synth(text, *, model, voice, api_key, speed=1.0,  # noqa: ANN001
+                  timeout=None):
             self.calls.append(text)
+            self.speeds.append(speed)
             outcome = queue.pop(0)
             if isinstance(outcome, Exception):
                 raise outcome
@@ -249,7 +252,8 @@ class FallbackCase(TempMemoryCase):
     def test_the_configured_voice_reaches_the_request(self) -> None:
         seen: list[str] = []
 
-        def synth(text, *, model, voice, api_key, timeout=None):  # noqa: ANN001
+        def synth(text, *, model, voice, api_key, speed=1.0,  # noqa: ANN001
+                  timeout=None):
             seen.append(voice)
             return speech.parse_wav(make_wav())
 

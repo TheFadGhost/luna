@@ -12,10 +12,14 @@ Since the Jarvis pass the settings singleton is redirected too, and for a
 sharper reason: a test that read the *real* config would pass or fail
 depending on what the user last changed in the GUI.
 
-Importing this module also disarms ``config.TERMINAL_BIN`` for the whole test
-process. See ``FORBIDDEN_TERMINAL`` below: a dispatch test that forgets to
-stub the terminal opens real windows on the user's desktop, and that is not a
-failure the suite can be trusted to notice on its own.
+Importing this module also disarms every ``config`` name that reaches the
+outside world -- the terminal, the notifier, ``aplay``, ``hyprctl`` and the
+piper interpreter -- for the whole test process. See ``FORBIDDEN_TERMINAL``
+and the block after it: a test that forgets to stub one of these opens windows,
+toasts, audio or workspaces on the user's live desktop, and that is not a
+failure the suite can be trusted to notice on its own. ``tests/test_guards.py``
+asserts the whole arrangement, including that none of these may go back to
+being a signature default.
 """
 
 from __future__ import annotations
@@ -48,6 +52,37 @@ from lunad.memory import (EpisodeStore, Memory, SolMemory,  # noqa: E402
 FORBIDDEN_TERMINAL = "luna-tests-must-pass-terminal=/bin/bash"
 
 config.TERMINAL_BIN = FORBIDDEN_TERMINAL
+
+#: The rest of the same class of bug, disarmed the same way.
+#:
+#: A binary name bound as a *signature default* is fixed at import and cannot
+#: be patched afterwards, so a test can stub the object and still reach the
+#: real program. That is how three ``foot`` windows a run happened, and then
+#: how a wall of ten real Omarchy toasts happened the moment
+#: ``[ui] notify_on_finish`` was wired: five test modules legitimately pass
+#: ``terminal="/bin/bash"`` so a job runs headlessly, the job then genuinely
+#: *finishes*, and the finish handler notified the user's actual desktop with
+#: test fixture text ("fail please", "rm -f /tmp/jarvis-test").
+#:
+#: So every name here is (a) read late at construction in the module that uses
+#: it, and (b) replaced process-wide with something that cannot resolve. The
+#: sentinel names the fix, because the failure it produces is a caller that
+#: forgot to stub, not a broken program.
+#:
+#: What each one would otherwise do to the machine running the suite:
+#:   NOTIFY_BIN   - puts a real toast on the user's desktop
+#:   APLAY_BIN    - plays audio out of the user's speakers
+#:   HYPRCTL_BIN  - installs window rules and moves the user's workspaces
+#:   VENV_PYTHON  - forks a real 331 MB piper worker
+FORBIDDEN_NOTIFIER = "luna-tests-must-pass-notify_bin=/bin/true"
+FORBIDDEN_APLAY = "luna-tests-must-pass-aplay=/bin/true"
+FORBIDDEN_HYPRCTL = "luna-tests-must-pass-hypr=FakeHyprland"
+FORBIDDEN_PYTHON = Path("/nonexistent/luna-tests-must-pass-python")
+
+config.NOTIFY_BIN = FORBIDDEN_NOTIFIER
+config.APLAY_BIN = FORBIDDEN_APLAY
+config.HYPRCTL_BIN = FORBIDDEN_HYPRCTL
+config.VENV_PYTHON = FORBIDDEN_PYTHON
 
 
 class FakeHyprland:

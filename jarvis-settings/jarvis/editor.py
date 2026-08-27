@@ -37,11 +37,17 @@ SELF_WRITE_GRACE_S = 1.5    # ignore our own file events for this long
 
 
 class Editor:
-    def __init__(self, on_status=None, on_external_reload=None):
+    def __init__(self, on_status=None, on_external_reload=None,
+                 on_applied=None):
         self.values, self.unknown, self.warnings = config.load()
         self.settings = client.Settings()
         self.on_status = on_status or (lambda text, kind: None)
         self.on_external_reload = on_external_reload or (lambda keys: None)
+        # Fired for a change the app itself made. `on_external_reload` only
+        # covers edits from outside, so without this a setting that changes
+        # the app's own chrome would apply everywhere except the window the
+        # user just clicked in.
+        self.on_applied = on_applied or (lambda keys: None)
         self._pending: dict = {}
         self._timer = 0
         self._last_self_write = 0.0
@@ -109,6 +115,7 @@ class Editor:
         route = ("applied live via the socket and written to config.toml"
                  if live else "written to config.toml (daemon reloads it)")
         self.on_status(f"Saved {names} — {route}", "ok")
+        self.on_applied(sorted(batch))
         return False
 
     # ------------------------------------------------------------- watching

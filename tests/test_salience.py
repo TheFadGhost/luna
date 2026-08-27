@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import unittest
 
+from ._support import TempMemoryCase
+
 from lunad import config
 from lunad.memory import (
     CONSEQUENCE_SATURATES_AT,
@@ -96,12 +98,18 @@ class ScoreTests(unittest.TestCase):
                            score_salience("tidy up", "I had a look"))
 
 
-class DecayTests(unittest.TestCase):
+class DecayTests(TempMemoryCase):
+    """Decay now reads `[memory] decay_half_life_days` when no half-life is
+    passed, so these run against a redirected settings file. A plain TestCase
+    here would read -- and, on a machine that had never opened Jarvis, create
+    -- the user's real ~/.config/jarvis/config.toml, and would pass or fail on
+    whatever they last changed in the GUI."""
+
     def test_no_decay_at_zero_age(self):
         self.assertAlmostEqual(decayed_salience(0.8, 0.0), 0.8, places=6)
 
     def test_halves_over_one_half_life(self):
-        hl = config.SALIENCE_HALF_LIFE_DAYS
+        hl = self.settings.get("memory.decay_half_life_days")
         self.assertAlmostEqual(decayed_salience(0.8, hl * DAY), 0.4, places=4)
         self.assertAlmostEqual(decayed_salience(0.8, 2 * hl * DAY), 0.2, places=4)
 

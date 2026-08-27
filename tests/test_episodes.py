@@ -124,7 +124,10 @@ class EpisodeStoreTests(TempMemoryCase):
 
     def test_decay_is_applied_at_read_time_and_rows_are_untouched(self):
         store = self.episodes()
-        old_ts = time.time() - config.SALIENCE_HALF_LIFE_DAYS * DAY
+        # The setting, not the constant: decay reads `[memory]
+        # decay_half_life_days`, and the constant is only its fallback.
+        hl = self.settings.get("memory.decay_half_life_days")
+        old_ts = time.time() - hl * DAY
         ep = store.record("the old note about kettles", "mm",
                           ts=old_ts, salience=0.8)
         [row] = store.recent()

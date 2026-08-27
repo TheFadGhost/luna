@@ -44,7 +44,10 @@ default `Luna`). `jarvis` and `luna` are the same command. Configuration lives
 in `~/.config/jarvis/config.toml` (0600, in a 0700 directory) — see
 `docs/CONFIG-SCHEMA.md` — and `lunad` watches it and hot-reloads, so a change
 to the voice, the model or the confirmation policy takes effect on the next
-request rather than on the next restart. Secrets never go in that file: the
+request rather than on the next restart. That document's §Wiring table says
+what reads each key and when it lands, and names the three keys that are still
+honoured by nothing rather than leaving them to be discovered. Secrets never go
+in that file: the
 OpenRouter key lives in `~/.config/jarvis/secrets.env` and reaches the daemon
 through a systemd drop-in.
 

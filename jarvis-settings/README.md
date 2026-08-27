@@ -5,6 +5,14 @@ single source of truth `lunad` reads and hot-reloads. Seven panes, one per
 section of [`docs/CONFIG-SCHEMA.md`](../docs/CONFIG-SCHEMA.md); every key in
 that contract is editable here, and a test proves it.
 
+One key in the contract is this app's own rather than the daemon's:
+`[ui] theme_follows_omarchy`. `lunad` draws nothing, so it is honoured here in
+`jarvis/theme.py` — on, the palette follows `omarchy theme set`; off, the
+built-in monochrome palette is pinned and the theme's `colors.toml` is never
+opened. The geometry tokens are deliberately outside the switch: they mirror
+Hyprland's own rounding and border, and a window that stops matching every
+other window is not a theme choice.
+
 ![Confirmations pane](docs/pane-confirm.png)
 
 ## Run it

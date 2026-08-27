@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from . import config
+from . import settings as settings_mod
 
 # =========================================================================
 # Errors
@@ -124,13 +125,31 @@ class Tier1File:
     """
 
     path: Path
-    cap: int
+    cap_default: int
     name: str = ""
+    cap_key: str = ""
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def __post_init__(self) -> None:
         if not self.name:
             self.name = self.path.name
+
+    @property
+    def cap(self) -> int:
+        """The cap in force *right now*.
+
+        Resolved per call rather than frozen at construction: `[memory]
+        luna_cap_chars` hot-reloads, and a cap captured when the daemon came
+        up would keep rejecting writes at the old size until a restart —
+        which is the failure hot reload exists to prevent. ``cap_key`` is
+        empty for files with no key of their own (SOL.md), and those keep
+        ``cap_default`` forever.
+        """
+        if self.cap_key:
+            value = settings_mod.get(self.cap_key)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+        return self.cap_default
 
     # -- reading ---------------------------------------------------------
 
@@ -312,12 +331,28 @@ def score_salience(
     return round(min(1.0, max(0.0, score)), 4)
 
 
+def half_life_days_setting() -> float:
+    """`[memory] decay_half_life_days`, or the fallback default.
+
+    A function and not a module constant: decay is applied at read time, so a
+    half-life changed in the GUI has to reach the very next recall without a
+    restart. A module-level default argument would be bound at import.
+    """
+    value = settings_mod.get("memory.decay_half_life_days")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        return float(value)
+    return float(config.SALIENCE_HALF_LIFE_DAYS)
+
+
 def decayed_salience(
     salience: float,
     age_seconds: float,
-    half_life_days: float = config.SALIENCE_HALF_LIFE_DAYS,
+    half_life_days: float | None = None,
 ) -> float:
     """Apply exponential time decay to a stored salience.
+
+    ``half_life_days`` defaults to `[memory] decay_half_life_days`, read on
+    every call. Pass a number to override it — the tests do.
 
     Applied at READ time. Rows are never mutated by decay: a stored score is a
     fact about the moment it was written, and rewriting history every time the
@@ -328,6 +363,8 @@ def decayed_salience(
     """
     if salience >= config.CORRECTION_SALIENCE:
         return salience
+    if half_life_days is None:
+        half_life_days = half_life_days_setting()
     if half_life_days <= 0:
         return salience
     age_days = max(0.0, age_seconds) / 86400.0
@@ -619,8 +656,10 @@ class Memory:
         user_md: Path = config.USER_MD,
         episodes_db: Path = config.EPISODES_DB,
     ) -> None:
-        self.luna = Tier1File(luna_md, config.LUNA_MD_CAP, "LUNA.md")
-        self.user = Tier1File(user_md, config.USER_MD_CAP, "USER.md")
+        self.luna = Tier1File(luna_md, config.LUNA_MD_CAP, "LUNA.md",
+                              cap_key="memory.luna_cap_chars")
+        self.user = Tier1File(user_md, config.USER_MD_CAP, "USER.md",
+                              cap_key="memory.user_cap_chars")
         self.episodes = EpisodeStore(episodes_db)
 
     def file(self, name: str) -> Tier1File:

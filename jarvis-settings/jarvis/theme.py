@@ -78,11 +78,21 @@ def border_from_hypr(spec):
     return f"alpha(#{rgb}, {alpha:.2f})"
 
 
-def read_theme(theme_dir: str = THEME_DIR) -> dict:
+def read_theme(theme_dir: str = THEME_DIR, follow: bool = True) -> dict:
     """Parse the *current* theme's colors.toml so Jarvis follows
-    `omarchy theme set` instead of pinning one palette."""
+    `omarchy theme set` instead of pinning one palette.
+
+    `follow` is `[ui] theme_follows_omarchy`. Off, the palette above is used
+    verbatim and colors.toml is never opened, so `omarchy theme set` leaves
+    Jarvis alone — which is the whole point of a user turning it off. The
+    tokens (radius, spacing, font sizes) are not part of the switch: they
+    mirror Hyprland's own geometry, and a window that stops matching the
+    rounding of every other window on the desktop is not a theme choice.
+    """
     import tomllib
     colors = dict(FALLBACK)
+    if not follow:
+        return colors
     path = os.path.join(theme_dir, "colors.toml")
     try:
         with open(path, "rb") as fh:
@@ -355,19 +365,29 @@ def css_for(c: dict) -> str:
 class ThemeWatch:
     """Owns the CSS provider and the two-level theme watch."""
 
-    def __init__(self):
+    def __init__(self, follows=None):
         self.css_provider = None
         self.theme_monitor = None
         self.theme_dir_monitor = None
         self._theme_id = 0
         self.colors = dict(FALLBACK)
         self.on_change = None
+        # A callable, not a bool: the themer is built before the settings
+        # editor exists, and a value read once at construction would pin the
+        # answer from before the config file had been read at all.
+        self.follows = follows or (lambda: True)
+
+    def following(self) -> bool:
+        try:
+            return bool(self.follows())
+        except Exception:
+            return True
 
     def apply(self):
         display = Gdk.Display.get_default()
         if display is None:
             return
-        self.colors = read_theme()
+        self.colors = read_theme(follow=self.following())
         provider = Gtk.CssProvider()
         provider.load_from_data(css_for(self.colors).encode())
         if self.css_provider is not None:
