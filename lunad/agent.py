@@ -164,6 +164,13 @@ class BaseAdapter:
     #: Both were observed. See persona.operating_notes.
     ask_has_tools = False
 
+    #: Whether a turn can carry an image. Asked as a capability rather than
+    #: inferred from the adapter's class, because the alternative — dropping an
+    #: image the agent cannot take and answering anyway — produces a confident
+    #: description of a screen nobody looked at, assembled from the window
+    #: title in the context line. Better to say "this agent cannot see".
+    accepts_images = False
+
     def binary(self) -> str:
         raise NotImplementedError
 
@@ -587,6 +594,10 @@ class CodexAdapter(BaseAdapter):
         # default", and for codex-as-Luna that default is a real slug rather
         # than whatever codex would have picked.
         self.model = model or config.CODEX_ASK_MODEL
+
+    #: `codex exec -i/--image <FILE>...`, and `gpt-5.6-luna` has vision
+    #: natively. No second model, no vision service, no HTTP call.
+    accepts_images = True
 
     @property
     def ask_has_tools(self) -> bool:
