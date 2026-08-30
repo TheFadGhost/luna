@@ -88,7 +88,7 @@ this laptop is ``BAT1``, not ``BAT0``, and it reports in *energy* units with no
 device's ``type`` and then uses ``capacity`` and ``status``, which every
 power_supply driver has.
 
-This one is **off by default**, and that is the interesting decision. Omarchy
+**Off by default too, and for the same reason as the crash hook.** Omarchy
 already notifies: ``shell/plugins/services/battery/Service.qml`` polls every
 30 s and runs ``omarchy-battery-low`` at 10%, and UPower hibernates at 2%. A
 second nagging source at the same moment is worse than none. The hook exists
@@ -96,7 +96,8 @@ because the user may want an *earlier* warning than the desktop's, and its
 defaults sit either side of Omarchy's rather than on top of it (20% and 5%),
 but nothing fires until the user turns it on.
 
-**`omarchy update`.** This is the one that matters more than it looks. Updates
+**`omarchy update`.** The only one that is **on**, and the only one nothing
+else on this machine watches. It also matters more than it looks. Updates
 here are pacman, not git: ``omarchy-update`` runs
 ``pacman -Syu --overwrite '/usr/share/omarchy/*'``, which **rewrites
 `/usr/share/omarchy` wholesale**. That is exactly how this machine's
