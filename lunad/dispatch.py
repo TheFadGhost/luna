@@ -560,6 +560,18 @@ class Dispatcher:
 
         job_id = uuid.uuid4().hex[:8]
         job_dir = self.jobs_dir / job_id
+        # `parents=True` would rebuild the whole tree, and there is one caller
+        # that must never be allowed to: a watcher that won the race in
+        # `_admit_next` and reached here after `close()` gave up joining it.
+        # Under test that resurrects the temporary tree teardown has already
+        # deleted -- the stray `/tmp/luna-test-*` this suite has a CI check
+        # for, and the one that failed twice on the 3.13 runner and nowhere
+        # else. In production the state directory always exists, so this
+        # cannot fire; when it does, `_admit_next` already treats
+        # `DispatchUnavailable` as "this job could not start" and moves on.
+        if not self.jobs_dir.parent.is_dir():
+            raise DispatchUnavailable(
+                f"{self.jobs_dir.parent} has gone; refusing to recreate it")
         job_dir.mkdir(parents=True, exist_ok=True)
         job = Job(id=job_id, task=task, to=to, dir=job_dir)
 
