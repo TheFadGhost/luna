@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import sqlite3
 import statistics
@@ -105,20 +106,59 @@ _DELIM = config.ENTRY_DELIMITER
 _ENTRY_RE = re.compile(rf"^{re.escape(_DELIM)}[ \t]?", re.MULTILINE)
 
 
+def _fsync_best_effort(fd: int) -> None:
+    """fsync, but never let a filesystem/platform that refuses it raise here.
+
+    Durability is an upgrade over plain atomicity, not a replacement for it:
+    the rename in :func:`atomic_write` is what every reader's correctness
+    depends on, and that already works without this. A `tmpfs` scratch dir,
+    a sandboxed test tree, or a platform where `fsync` is refused on a
+    directory descriptor must not turn a memory write into an unhandled
+    exception on the answer path -- so this is best-effort and silent.
+    """
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+
+
 def atomic_write(path: Path, text: str) -> None:
     """Write ``text`` so that no reader ever sees a half-written file.
 
-    Temp file beside the target, then ``Path.replace``, which is ``os.replace``
-    and is atomic within one filesystem. Every file memory owns goes through
-    here — the tier-1 files and the tier-3 profile alike — because the failure
-    being prevented is identical for both: a daemon killed mid-write leaving a
+    Temp file beside the target, ``fsync``ed, then ``Path.replace`` (which is
+    ``os.replace``, atomic within one filesystem), then the containing
+    directory is ``fsync``ed too. Every file memory owns goes through here —
+    the tier-1 files and the tier-3 profile alike — because the failure being
+    prevented is identical for both: a daemon killed mid-write leaving a
     truncated ``LUNA.md``, which is worse than no file at all because it still
     parses. One mechanism that is known to work beats two that look similar.
+
+    The rename alone is atomic against a killed process: a reader sees either
+    the old file or the new one, never a mix. It is not durable against power
+    loss, because a rename can sit in the page cache and vanish with it --
+    the old file, the new file, or (transiently, mid-rename, on some
+    filesystems) neither may be what is on disk after the machine comes back.
+    The two ``fsync`` calls close that gap: one flushes the new content to
+    disk before the rename is attempted, the other flushes the directory
+    entry the rename changed. Both are best-effort (see
+    :func:`_fsync_best_effort`) — they harden this against a lost write, they
+    do not gate it.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        _fsync_best_effort(f.fileno())
     tmp.replace(path)
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        _fsync_best_effort(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def parse_entries(text: str) -> list[str]:
