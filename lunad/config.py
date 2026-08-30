@@ -316,3 +316,31 @@ def ensure_dirs() -> None:
     # directory that is only private on the day it was created is not private.
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_DIR.chmod(CONFIG_DIR_MODE)
+
+
+class VanishedDirectory(OSError):
+    """The directory a file lives in existed once and has since been removed.
+
+    Every sink in the daemon creates its own directory on first use, which is
+    right on a first run and wrong afterwards: a directory that existed and no
+    longer does was deleted underneath a live object, and rebuilding it makes
+    the deletion look like it never happened.
+
+    In production nothing deletes `~/.local/share/luna` or `~/.config/jarvis`
+    out from under a running daemon, so this cannot fire. Under test it fires
+    constantly in one specific shape -- a thread outliving the case that
+    started it, writing into a temporary tree teardown has already removed,
+    and rebuilding the tree on the way in. That is the stray `/tmp/luna-test-*`
+    CI fails a run for, and it is why every caller here is already inside a
+    `try: ... except OSError` that logs and carries on: a write that cannot
+    land is not a reason to take the daemon down.
+    """
+
+
+def ensure_parent(path: Path, *, existed: bool) -> None:
+    """Create ``path``'s directory, unless it existed once and has vanished."""
+    parent = path.parent
+    if existed and not parent.is_dir():
+        raise VanishedDirectory(
+            f"{parent} has gone since it was opened; refusing to recreate it")
+    parent.mkdir(parents=True, exist_ok=True)
