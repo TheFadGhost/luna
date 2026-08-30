@@ -243,15 +243,21 @@ def cmd_status(args: argparse.Namespace) -> int:
              else f", unloads after {sp.get('idle_unload_s', 0):.0f}s idle"))
     dsp = resp.get("dispatch") or {}
     ws = dsp.get("workspace") or {}
+    waiting = dsp.get("queued") or []
     if ws.get("available"):
         print(f"  workspace {ws['workspace']} — "
               f"{'visible' if ws.get('visible') else 'hidden'}, "
               f"{ws.get('windows', 0)} window(s), "
-              f"{len(dsp.get('running', []))} job(s) running")
+              f"{len(dsp.get('running', []))} of "
+              f"{dsp.get('max_parallel', 1)} job(s) running"
+              + (f", {len(waiting)} queued" if waiting else ""))
     else:
         print(f"  workspace unavailable — {ws.get('detail', '?')}")
     for job in dsp.get("running", []):
         print(f"    - {job['id']} → {job['to']} {job['elapsed_s']}s "
+              f"{job['task'][:60]!r}")
+    for job in waiting:
+        print(f"    - {job['id']} → {job['to']} queued {job['queued_s']}s "
               f"{job['task'][:60]!r}")
     spawned = resp.get("spawned") or {}
     aud = resp.get("audit") or {}
@@ -399,7 +405,8 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
 
 def _job_line(job: dict) -> str:
     mark = {"finished": "ok  ", "failed": "FAIL", "running": "run ",
-            "cancelled": "cxl ", "orphaned": "orph"}.get(job["state"], "?   ")
+            "queued": "wait", "cancelled": "cxl ", "orphaned": "orph"
+            }.get(job["state"], "?   ")
     code = "" if job.get("exit_code") is None else f" exit {job['exit_code']}"
     return (f"{BOLD}{job['id']}{RESET} {mark} {job['to']:<6} "
             f"{job['elapsed_s']:>6.1f}s{code}  {DIM}{job['iso']}{RESET}\n"

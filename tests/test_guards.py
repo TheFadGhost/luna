@@ -24,7 +24,8 @@ import shutil
 import unittest
 from pathlib import Path
 
-from ._support import (FORBIDDEN_APLAY, FORBIDDEN_HYPRCTL, FORBIDDEN_NOTIFIER,
+from ._support import (FORBIDDEN_APLAY, FORBIDDEN_HYPRCTL,
+                       FORBIDDEN_JOBS_DIR, FORBIDDEN_NOTIFIER,
                        FORBIDDEN_PYTHON, FORBIDDEN_STATE_FILE,
                        FORBIDDEN_TERMINAL, FakeHyprland, TempMemoryCase)
 
@@ -71,7 +72,7 @@ class LateReadCase(unittest.TestCase):
     """
 
     SIGNATURES = (
-        (dispatch.Dispatcher.__init__, ("terminal", "notify_bin")),
+        (dispatch.Dispatcher.__init__, ("terminal", "notify_bin", "jobs_dir")),
         (dispatch.Hyprland.__init__, ("hyprctl",)),
         (confirm.ConfirmBroker.__init__, ("notify_bin",)),
         (speech.Speech.__init__, ("aplay", "python")),
@@ -112,6 +113,20 @@ class ConstructionCase(TempMemoryCase):
         self.addCleanup(s.close)
         self.assertEqual(s.aplay, FORBIDDEN_APLAY)
         self.assertEqual(s.python, FORBIDDEN_PYTHON)
+
+    def test_a_dispatcher_with_no_jobs_dir_is_nowhere_near_the_real_one(self) -> None:
+        """The collector deletes directories. It must never find the user's.
+
+        `[dispatch] job_retention_days` turned this parameter from "where new
+        job directories appear" into "what `collect()` may remove", so the
+        default has to be patchable and the patch has to hold.
+        """
+        d = dispatch.Dispatcher(hypr=FakeHyprland(), audit=self.audit,
+                                agent_bin="/bin/true")
+        self.assertEqual(d.jobs_dir, FORBIDDEN_JOBS_DIR)
+        self.assertNotEqual(d.jobs_dir, config.STATE_DIR / "jobs")
+        self.assertFalse(str(d.jobs_dir).startswith(str(Path.home())),
+                         "a stray Dispatcher is collecting inside $HOME")
 
     def test_an_explicit_value_still_wins(self) -> None:
         # The guard must not take the argument away from callers that need it:

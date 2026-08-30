@@ -75,6 +75,10 @@ class Daemon:
         # through `luna confirm`, because the pending map it looks in would be
         # the other object's.
         self.dispatcher.confirm = self.confirm
+        # `[dispatch] job_retention_days`, on a timer in its own thread. Not on
+        # the request path: it walks a directory tree, and nobody should wait
+        # for it to answer a question about the weather.
+        self.dispatcher.start_gc()
         self.runs = agent.RunRegistry()
         # `--agent` beats the config, the config beats Omarchy's default. The
         # CLI flag is an operator override for one run and must not be silently
@@ -149,11 +153,14 @@ class Daemon:
         """React to a config change without a restart.
 
         Most settings need nothing done: they are read at the point of use, so
-        the next request already sees them. Two do. Her *name* is part of the
+        the next request already sees them. Three do. Her *name* is part of the
         cacheable system prompt, so a rename must retire the live sessions or
         the next turn resumes a conversation with the old identity frozen into
         its prefix. The agent is a different binary entirely, so switching it
-        needs a new adapter.
+        needs a new adapter. And `max_parallel` is read at every admission
+        decision, but admission only *happens* when a job ends or a new one
+        arrives — so raising the limit has to poke the queue here, or waiting
+        work sits there until something else moves and the setting looks inert.
         """
         keys = {c["key"] for c in changes}
         self.audit.append("settings.reloaded", ok=True,
@@ -178,6 +185,14 @@ class Daemon:
             except agent.AgentError as exc:
                 log.warning("cannot switch agent; keeping the current one",
                             extra={"wanted": wanted, "detail": str(exc)})
+        if "dispatch.max_parallel" in keys:
+            # Lowering it admits nothing and kills nothing, which is the point:
+            # the running count drains on its own.
+            started = self.dispatcher.admit_ready()
+            if started:
+                log.info("the raised parallel limit admitted waiting jobs",
+                         extra={"started": started,
+                                "max_parallel": self.dispatcher.max_parallel})
 
     # -- operations ------------------------------------------------------
 
@@ -655,14 +670,22 @@ class Daemon:
         return protocol.ok(req.get("id"), **payload)
 
     def _wait_for_job(self, job: dispatch.Job, timeout: float) -> dict[str, Any]:
+        # `queued` counts as in progress: a caller that asked to wait wants the
+        # outcome, and returning the instant the job was accepted would report
+        # a job that has not started as though it had nothing to say.
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if job.state != "running":
+            if job.state not in ("running", "queued"):
                 break
             time.sleep(0.5)
         payload = job.to_dict(output=job.read_output())
         if job.state == "running":
             payload["note"] = (f"still running after {timeout:.0f}s; "
+                               f"`luna jobs` for the outcome")
+        elif job.state == "queued":
+            payload["note"] = (f"still queued after {timeout:.0f}s behind "
+                               f"[dispatch] max_parallel = "
+                               f"{self.dispatcher.max_parallel}; "
                                f"`luna jobs` for the outcome")
         return payload
 
@@ -673,7 +696,8 @@ class Daemon:
             return protocol.ok(req.get("id"), cancelled=1 if stopped else 0,
                                target=str(target),
                                note="" if stopped else
-                                    "no running job with that id in this daemon")
+                                    "no running or queued job with that id "
+                                    "in this daemon")
         jobs = self.dispatcher.jobs(limit=int(req.get("limit")
                                               or config.JOB_LIST_LIMIT),
                                     with_output=bool(req.get("output")))

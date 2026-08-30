@@ -89,7 +89,9 @@ pid 1470712: REFUSED
 **Everything is written down.** `~/.local/share/luna/audit.jsonl` is
 append-only and fsync'd per line: every dispatch, spawn, signal, refusal and
 memory write, with what it was for and how it ended. Where an action has a real
-inverse it is recorded; where it does not, nothing is invented.
+inverse it is recorded; where it does not, nothing is invented. It rotates to
+numbered siblings rather than growing forever, and the rotation writes its own
+entry so a gap in the record explains itself.
 
 ## Voice
 

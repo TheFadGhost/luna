@@ -547,7 +547,7 @@ def jobs_pane(b):
         group("Dispatch",
               *[b.bound_row(f"dispatch.{f.key}",
                             width=240 if isinstance(f, schema.Text) else 140)
-                for f in schema.sections_for("jobs")[0].fields]),
+                for f in schema.section_for("dispatch").fields]),
         recent)
     p.jarvis_refresh = rebuild
     return p
@@ -653,7 +653,10 @@ def about_pane(b, on_start):
         statuscard,
         group("Interface",
               *[b.bound_row(f"ui.{f.key}")
-                for f in schema.sections_for("about")[0].fields]),
+                for f in schema.section_for("ui").fields]),
+        group("Audit log",
+              *[b.bound_row(f"audit.{f.key}", width=140)
+                for f in schema.section_for("audit").fields]),
         group("Files", audit, cfg),
         unknown)
     p.jarvis_refresh = rebuild

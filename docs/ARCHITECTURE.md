@@ -436,9 +436,9 @@ about 100 ms for a short sentence.)
 - **Sol** is a specialist she enrols for deep technical work: own system prompt,
   own memory namespace (`memory/sol/SOL.md` + its own episode store), reports
   back to Luna not to the user. Spec in `data/sol-persona.md`.
-- **Workers** are anonymous, disposable. Fan-out grunt work. Parallel fan-out
-  is not built: `dispatch` is one job per call. Nothing stops several being in
-  flight, but Luna does not plan a fan-out for you.
+- **Workers** are anonymous, disposable. Fan-out grunt work. Luna still does
+  not *plan* a fan-out for you — one `dispatch` call is one job — but several
+  can now be in flight and the number is bounded: see the admission gate below.
 
 Luna announces who she enrolled and why, in one line. The line is composed in
 `dispatch.py`, not asked of a model — an announcement that cost four seconds
@@ -480,6 +480,38 @@ Four things the design got wrong, corrected here:
   not stack duplicates and nothing under `~/.config/hypr` is edited. It
   disappears on the next Hyprland config reload, at which point the next
   dispatch adds it again.
+
+### The admission gate and the collector — BUILT
+
+Two things that were pending long enough to be documented as pending, and are
+now real.
+
+**`[dispatch] max_parallel` is an admission gate with a queue, not a refusal.**
+A dispatch over the limit is accepted: it gets its id, its directory and its
+composed prompt immediately, is written to `jobs/` in a `queued` state, shows
+in `luna jobs` as `wait`, and can be cancelled there — it simply has no pid
+until a slot frees. Admission is FIFO even when a slot is free, because
+admitting a newcomer past jobs already waiting turns a queue into a lottery.
+The limit is read at each admission decision rather than captured, so lowering
+it stops admitting without touching anything already running and the count
+drains on its own; raising it releases waiting work at once, because the
+settings listener pokes the queue rather than waiting for the next job to end.
+A queued job is **dropped** on daemon shutdown, recorded as cancelled with the
+reason: the queue only ever existed in one process's memory, and a `queued`
+directory left behind by a dead daemon is a promise nobody is going to keep.
+`luna jobs` says so too — such a directory reads as `orphaned`, not `queued`.
+
+**`[dispatch] job_retention_days` is a GC pass with a stated policy.** A job
+directory is aged from when the job *stopped* — `finished`, falling back to
+`started`, falling back to the manifest's mtime — because retention is about
+how long the record is kept and a six-hour job's record begins when it ends.
+Nothing running or queued is collected at any age; an orphan is, once past the
+window, because it will never finish and one crash should not pin a directory
+for the life of the machine. **Zero means never**, which is the opposite of
+what "zero days" reads like and is the entire reason the case exists. The pass
+runs on a six-hour timer in its own thread plus once at start-up, never on the
+request path, and every deletion is an audit entry with no `undo`, because
+there is not one.
 
 ### The Hyprland incantation — the thing that cost the time
 
@@ -596,10 +628,24 @@ precisely so self-termination cannot be reached by accident.
 ### Audit log — `lunad/audit.py`
 
 `~/.local/share/luna/audit.jsonl`. Opened `"a"`, fsync'd per line, never
-truncated, never rotated. A log Luna can rewrite is not evidence. Every
+truncated, never edited in place. A log Luna can rewrite is not evidence. Every
 dispatch, spawn, signal, refusal and memory write, with `why` (the intent, not
 the mechanics), the outcome, and the exit status. `luna audit [--since 30m]`
 reads it back newest first.
+
+**Rotation moves bytes; it does not drop them.** This file used to grow forever
+on purpose, and the purpose was sound — a rotation that quietly loses the week
+you are asking about is worse than a large file. So past `[audit] max_mb` the
+live log becomes `audit.jsonl.1`, each sibling shifts up one, and only the
+oldest of `[audit] keep` is deleted. That deletion is itself an entry,
+`audit.rotated`, written as the **first line of the new live file** and naming
+what was renamed and what was dropped, so the chain reads backwards from the
+live file and any gap in it explains itself. The rename happens between two
+whole lines, while the lock is held and after the previous line's `fsync`, so
+the append-only contract is never broken mid-write; a reader that already
+opened the file goes on reading the renamed inode. `luna audit` reads the
+siblings too, stopping at the first file that cannot hold anything the query
+asked for. `max_mb = 0` never rotates.
 
 **Undo journal — deliberately sparse.** An inverse is recorded only where one
 genuinely exists and is known at the time: a tier-1 *append* is undone by

@@ -233,13 +233,42 @@ SCHEMA: tuple[Section, ...] = (
     ),
     Section(
         "dispatch",
-        align=12,
+        align=18,
         keys=(
             Key("workspace", "luna", "str",
                 comment="hyprland special workspace name"),
             Key("app_id", "org.omarchy.luna", "str"),
-            Key("max_parallel", 1, "int", minimum=1, maximum=16),
-            Key("job_retention_days", 14, "int", minimum=1, maximum=3650),
+            Key("max_parallel", 1, "int", minimum=1, maximum=16,
+                comment="jobs running at once; the rest queue"),
+            # Minimum 0, and 0 means *never collect*. The obvious minimum of 1
+            # would make the smallest value a user can type the most
+            # destructive one — "keep jobs for the shortest time I can" would
+            # delete yesterday's work — and there would then be no way to say
+            # "keep everything" at all. `settings.set(..., -1)` is rejected as
+            # out of range; 0 is the off switch.
+            Key("job_retention_days", 14, "int", minimum=0, maximum=3650,
+                comment="finished job directories older than this are "
+                        "collected; 0 = never"),
+        ),
+    ),
+    Section(
+        "audit",
+        align=6,
+        header=(
+            "The append-only record. Rotation moves bytes, it never drops "
+            "them:",
+            "audit.jsonl -> audit.jsonl.1 -> ... -> audit.jsonl.N, oldest "
+            "deleted last.",
+        ),
+        keys=(
+            # 0 = never rotate, for the same reason job_retention_days has an
+            # off switch: an audit log is evidence, and somebody keeping a
+            # machine under scrutiny must be able to say "grow without bound"
+            # in the file rather than by patching the daemon.
+            Key("max_mb", 8, "int", minimum=0, maximum=1024,
+                comment="rotate once the live log passes this; 0 = never"),
+            Key("keep", 5, "int", minimum=1, maximum=100,
+                comment="numbered siblings kept; the oldest is deleted"),
         ),
     ),
     Section(

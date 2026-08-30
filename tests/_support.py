@@ -13,8 +13,9 @@ sharper reason: a test that read the *real* config would pass or fail
 depending on what the user last changed in the GUI.
 
 Importing this module also disarms every ``config`` name that reaches the
-outside world -- the terminal, the notifier, ``aplay``, ``hyprctl`` and the
-piper interpreter -- for the whole test process. See ``FORBIDDEN_TERMINAL``
+outside world -- the terminal, the notifier, ``aplay``, ``hyprctl``, the piper
+interpreter and, since the job collector exists, the jobs directory itself --
+for the whole test process. See ``FORBIDDEN_TERMINAL``
 and the block after it: a test that forgets to stub one of these opens windows,
 toasts, audio or workspaces on the user's live desktop, and that is not a
 failure the suite can be trusted to notice on its own. ``tests/test_guards.py``
@@ -76,6 +77,8 @@ config.TERMINAL_BIN = FORBIDDEN_TERMINAL
 #:   APLAY_BIN    - plays audio out of the user's speakers
 #:   HYPRCTL_BIN  - installs window rules and moves the user's workspaces
 #:   VENV_PYTHON  - forks a real 331 MB piper worker
+#:   JOBS_DIR     - lets the job collector delete the user's own job records
+#:                  (see FORBIDDEN_JOBS_DIR below; that one has to resolve)
 FORBIDDEN_NOTIFIER = "luna-tests-must-pass-notify_bin=/bin/true"
 FORBIDDEN_APLAY = "luna-tests-must-pass-aplay=/bin/true"
 FORBIDDEN_HYPRCTL = "luna-tests-must-pass-hypr=FakeHyprland"
@@ -98,6 +101,29 @@ atexit.register(shutil.rmtree, _STATE_DIR, True)
 FORBIDDEN_STATE_FILE = _STATE_DIR / "state"
 
 config.STATE_FILE = FORBIDDEN_STATE_FILE
+
+#: The same idea for the jobs tree, with the one difference that matters: this
+#: sentinel has to *work*.
+#:
+#: ``config.JOBS_DIR`` is not a binary, it is a directory the daemon creates
+#: (``config.ensure_dirs``) and, since ``[dispatch] job_retention_days`` was
+#: wired, one the dispatcher *deletes from*. An unresolvable sentinel would
+#: break every case that builds a ``Daemon``; the real path would put
+#: ``Dispatcher.collect()`` on the user's own job directories, which is the
+#: worst outward effect anything in this suite could have — the audit log
+#: aside, those directories are the only record of what a dispatched agent did.
+#:
+#: So it points at a throwaway tree for the life of the test *process*, removed
+#: at interpreter exit. The cleanup is registered with ``atexit`` rather than
+#: left to ``TemporaryDirectory``'s own finaliser, which announces itself with
+#: a ``ResourceWarning`` on the last line of an otherwise clean run. Cases
+#: still pass ``jobs_dir=self.root / "jobs"``; this is what catches the one
+#: that forgets.
+_JOBS_GUARD = tempfile.TemporaryDirectory(prefix="luna-tests-jobs-")
+atexit.register(_JOBS_GUARD.cleanup)
+FORBIDDEN_JOBS_DIR = Path(_JOBS_GUARD.name) / "jobs"
+
+config.JOBS_DIR = FORBIDDEN_JOBS_DIR
 
 
 class FakeHyprland:

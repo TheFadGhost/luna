@@ -13,11 +13,14 @@ linger — without needing a Wayland session.
 from __future__ import annotations
 
 import json
+import os
+import threading
 import time
 import unittest
 from pathlib import Path
 
 from lunad import config, dispatch, persona, safety
+from lunad import settings as settings_mod
 
 from ._support import FakeHyprland, TempMemoryCase
 
@@ -188,6 +191,380 @@ class CancelTests(DispatcherCase):
 
     def test_cancelling_an_unknown_job_is_not_an_error(self):
         self.assertFalse(self.dispatcher().cancel("no-such-job"))
+
+
+class QueueTests(DispatcherCase):
+    """`[dispatch] max_parallel`: the admission gate and the pending queue.
+
+    Every case here holds the first job open with a long ``linger`` so the
+    second one's fate is decided by the gate and not by a race. The fake agent
+    exits immediately; ``linger`` is the only thing keeping the terminal alive,
+    which makes "is there a slot" a question the test controls.
+    """
+
+    def blocker(self, d: dispatch.Dispatcher) -> dispatch.Job:
+        """A job that stays running until the test cancels it."""
+        job = d.dispatch("hold the only slot", timeout=30, linger=20)
+        self.addCleanup(_stop_quietly, d, job)
+        self.assertEqual(job.state, "running")
+        return job
+
+    def wait_for(self, job: dispatch.Job, *states: str,
+                 timeout: float = 20.0) -> str:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if job.state in states:
+                return job.state
+            time.sleep(0.05)
+        self.fail(f"job {job.id} stayed {job.state!r}, never reached {states}")
+
+    def test_a_job_over_the_limit_queues_instead_of_spawning(self):
+        d = self.dispatcher()
+        self.blocker(d)
+        second = d.dispatch("wait your turn", timeout=30, linger=0)
+        self.assertEqual(second.state, "queued")
+        self.assertIsNone(second.pid, "a queued job has no process yet")
+        self.assertEqual(len(self.ledger), 1,
+                         "the second job must not have forked anything")
+
+    def test_simultaneous_dispatches_cannot_both_take_the_last_slot(self):
+        """The daemon answers each connection on its own thread.
+
+        The slot is reserved at the admission *decision*, not when the ``Popen``
+        appears, or two callers arriving together would both look at an empty
+        process map and both be let through a limit of one.
+        """
+        import threading
+
+        d = self.dispatcher()
+        self.settings.set("dispatch.max_parallel", 2)
+        ready = threading.Barrier(4)
+        jobs: list[dispatch.Job] = []
+        lock = threading.Lock()
+
+        def go(n: int) -> None:
+            ready.wait(timeout=10)
+            job = d.dispatch(f"racer {n}", timeout=30, linger=20)
+            with lock:
+                jobs.append(job)
+
+        threads = [threading.Thread(target=go, args=(n,)) for n in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        for job in jobs:
+            self.addCleanup(_stop_quietly, d, job)
+        self.assertEqual(len(jobs), 4)
+        running = [j for j in jobs if j.state == "running"]
+        self.assertEqual(len(running), 2,
+                         "the gate let more than max_parallel through")
+        self.assertEqual(len([j for j in jobs if j.state == "queued"]), 2)
+
+    def test_a_queued_job_is_a_first_class_job_in_the_listing(self):
+        d = self.dispatcher()
+        self.blocker(d)
+        second = d.dispatch("wait your turn", timeout=30, linger=0)
+        listed = {j["id"]: j for j in d.jobs()}
+        self.assertEqual(listed[second.id]["state"], "queued")
+        self.assertEqual(listed[second.id]["elapsed_s"], 0.0,
+                         "a job that has not run has not run for any time")
+        self.assertTrue((second.dir / "job.json").exists(),
+                        "a queued job has its directory and its prompt already")
+        self.assertTrue((second.dir / "system.txt").read_text().strip())
+
+    def test_the_queue_drains_when_a_slot_frees(self):
+        d = self.dispatcher()
+        first = self.blocker(d)
+        second = d.dispatch("wait your turn", timeout=30, linger=0)
+        d.cancel(first.id)
+        self.wait_for(second, "running", "finished")
+        self.assertIsNotNone(second.pid)
+        self.assertEqual(self.wait_for(second, "finished", "failed"),
+                         "finished")
+
+    def test_the_queue_is_first_in_first_out(self):
+        d = self.dispatcher()
+        first = self.blocker(d)
+        # The second job lingers too, so the slot it inherits stays taken and
+        # the third's state is the gate's answer rather than a race with it.
+        second = d.dispatch("second", timeout=30, linger=20)
+        self.addCleanup(_stop_quietly, d, second)
+        third = d.dispatch("third", timeout=30, linger=0)
+        self.assertEqual([j.id for j in d.queued()], [second.id, third.id])
+        d.cancel(first.id)
+        self.wait_for(second, "running")
+        self.assertEqual(third.state, "queued",
+                         "one slot means one job admitted at a time")
+
+    def test_a_free_slot_does_not_let_a_newcomer_overtake_the_queue(self):
+        # Admission is FIFO even when there is room: a job that arrives while
+        # the queue is draining must not jump the two already waiting.
+        d = self.dispatcher()
+        first = self.blocker(d)
+        second = d.dispatch("second", timeout=30, linger=0)
+        self.settings.set("dispatch.max_parallel", 2)
+        third = d.dispatch("third", timeout=30, linger=0)
+        self.assertEqual(third.state, "queued")
+        self.assertEqual([j.id for j in d.queued()], [second.id, third.id])
+        # Drain, and wait for it: a case that returns with jobs mid-flight
+        # leaves watchers writing into a temporary tree teardown is deleting.
+        d.cancel(first.id)
+        self.wait_for(second, "finished", "failed")
+        self.wait_for(third, "finished", "failed")
+
+    def test_a_queued_job_can_be_cancelled_before_it_ever_starts(self):
+        d = self.dispatcher()
+        first = self.blocker(d)
+        second = d.dispatch("never mind", timeout=30, linger=0)
+        self.assertTrue(d.cancel(second.id))
+        self.assertEqual(second.state, "cancelled")
+        self.assertIsNone(second.pid)
+        self.assertEqual(d.queued(), [])
+        # And it does not come back to life when the slot frees.
+        d.cancel(first.id)
+        time.sleep(0.5)
+        self.assertEqual(second.state, "cancelled")
+        self.assertEqual([e for e in self.audit.read(action="dispatch.spawn")
+                          if e["job_id"] == second.id], [],
+                         "a cancelled job was spawned by the drain")
+
+    def test_cancelling_a_queued_job_signals_nothing(self):
+        """The firewall is never involved: there is no process to refuse."""
+        d = self.dispatcher()
+        self.blocker(d)
+        second = d.dispatch("never mind", timeout=30, linger=0)
+        d.cancel(second.id)
+        [entry] = [e for e in self.audit.read(action="dispatch.cancel")
+                   if e["job_id"] == second.id]
+        self.assertEqual(entry["was"], "queued")
+        self.assertEqual([e for e in self.audit.read(action="signal.")], [])
+
+    def test_raising_the_limit_admits_waiting_work(self):
+        d = self.dispatcher()
+        self.blocker(d)
+        second = d.dispatch("wait your turn", timeout=30, linger=0)
+        self.settings.set("dispatch.max_parallel", 2)
+        self.assertEqual(d.admit_ready(), [second.id])
+        self.wait_for(second, "running", "finished")
+
+    def test_lowering_the_limit_kills_nothing_already_running(self):
+        d = self.dispatcher()
+        self.settings.set("dispatch.max_parallel", 2)
+        first = self.blocker(d)
+        second = d.dispatch("also running", timeout=30, linger=20)
+        self.addCleanup(_stop_quietly, d, second)
+        self.assertEqual(second.state, "running")
+        self.settings.set("dispatch.max_parallel", 1)
+        self.assertEqual(d.admit_ready(), [], "nothing new is admitted")
+        self.assertTrue(safety.is_alive(first.pid))
+        self.assertTrue(safety.is_alive(second.pid),
+                        "lowering the limit must not reach into running work")
+        third = d.dispatch("waits for the count to drain", timeout=30, linger=0)
+        self.assertEqual(third.state, "queued")
+
+    def test_a_queued_job_is_dropped_on_shutdown_rather_than_left_promised(self):
+        d = self.dispatcher()
+        first = self.blocker(d)
+        # Held so the job can be stopped *after* close(), which has already
+        # let go of the process map on purpose: a running job outlives the
+        # daemon by design, and only a queued one is dropped.
+        proc = d._procs[first.id]
+        second = d.dispatch("never going to run", timeout=30, linger=0)
+        d.close(join_timeout=0.5)
+        self.assertEqual(second.state, "cancelled")
+        self.assertIn("daemon stopped", second.note)
+        on_disk = json.loads((second.dir / "job.json").read_text())
+        self.assertEqual(on_disk["state"], "cancelled")
+        self.assertEqual(d.queued(), [])
+        self.assertTrue(safety.is_alive(first.pid),
+                        "close() must not have touched the running job")
+        # And now stop it, and wait for its watcher to finish writing, so
+        # nothing is still holding the temporary tree teardown is about to
+        # delete. That stray-directory bug is on the record already.
+        safety.terminate(proc, reason="test teardown")
+        self.wait_for(first, "finished", "failed", "cancelled")
+
+    def test_a_queued_job_left_by_a_dead_daemon_reads_as_orphaned(self):
+        """A queue lives in one process. Nothing else can still be waiting."""
+        job_dir = self.root / "jobs" / "cafebabe"
+        job_dir.mkdir(parents=True)
+        (job_dir / "job.json").write_text(json.dumps({
+            "id": "cafebabe", "task": "accepted, never started", "to": "worker",
+            "state": "queued", "pid": None, "started": time.time(),
+            "iso": "x", "elapsed_s": 0.0, "exit_code": None,
+            "dir": str(job_dir)}), encoding="utf-8")
+        listed = {j["id"]: j for j in self.dispatcher().jobs()}
+        self.assertEqual(listed["cafebabe"]["state"], "orphaned")
+        self.assertIn("never started", listed["cafebabe"]["note"])
+
+    def test_the_queue_entry_is_audited_with_the_cancel_that_undoes_it(self):
+        d = self.dispatcher()
+        self.blocker(d)
+        second = d.dispatch("wait your turn", timeout=30, linger=0)
+        [entry] = self.audit.read(action="dispatch.queued")
+        self.assertEqual(entry["job_id"], second.id)
+        self.assertEqual(entry["position"], 1)
+        self.assertEqual(entry["max_parallel"], 1)
+        self.assertEqual(entry["undo"]["cmd"][:3], ["luna", "jobs", "--cancel"])
+
+    def test_the_spawn_entry_records_how_long_the_job_waited(self):
+        d = self.dispatcher()
+        first = self.blocker(d)
+        second = d.dispatch("wait your turn", timeout=30, linger=0)
+        time.sleep(0.3)
+        d.cancel(first.id)
+        self.wait_for(second, "running", "finished")
+        [entry] = [e for e in self.audit.read(action="dispatch.spawn")
+                   if e["job_id"] == second.id]
+        self.assertGreater(entry["queued_s"], 0.0)
+        # And the job that never waited does not carry a zero on the line
+        # somebody is reading for the pid.
+        [straight] = [e for e in self.audit.read(action="dispatch.spawn")
+                      if e["job_id"] == first.id]
+        self.assertNotIn("queued_s", straight)
+
+
+class CollectTests(DispatcherCase):
+    """`[dispatch] job_retention_days`: the GC pass, and what it refuses.
+
+    Job directories are written by hand here rather than dispatched: the pass
+    reads `job.json` and the filesystem, and building the state directly is the
+    only way to have a job that finished three weeks ago.
+    """
+
+    OLD = 40 * 86_400.0
+    RECENT = 2 * 86_400.0
+
+    def job_dir(self, jid: str, *, state: str = "finished",
+                finished: float | None = None, started: float | None = None,
+                pid: int | None = 4_194_303, manifest: bool = True) -> Path:
+        now = time.time()
+        path = self.root / "jobs" / jid
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "output.txt").write_text("what the agent wrote\n",
+                                         encoding="utf-8")
+        if manifest:
+            (path / "job.json").write_text(json.dumps({
+                "id": jid, "task": f"task {jid}", "to": "worker",
+                "state": state, "pid": pid,
+                "started": now - (self.OLD if started is None else started),
+                "iso": "x", "elapsed_s": 1.0, "exit_code": 0,
+                "dir": str(path)}
+                | ({} if finished is None else {"finished": now - finished})),
+                encoding="utf-8")
+        return path
+
+    def test_a_finished_job_past_the_window_is_collected(self):
+        d = self.dispatcher()
+        old = self.job_dir("00000001", finished=self.OLD)
+        report = d.collect()
+        self.assertFalse(old.exists())
+        self.assertEqual(report["collected"], 1)
+        self.assertGreater(report["freed_bytes"], 0)
+
+    def test_a_job_inside_the_window_is_kept(self):
+        d = self.dispatcher()
+        recent = self.job_dir("00000002", finished=self.RECENT)
+        self.assertEqual(d.collect()["collected"], 0)
+        self.assertTrue(recent.exists())
+
+    def test_zero_days_means_never_delete_not_delete_everything(self):
+        """The footgun. Read as a duration, 0 would mean "keep nothing"."""
+        d = self.dispatcher()
+        old = self.job_dir("00000003", finished=self.OLD)
+        self.settings.set("dispatch.job_retention_days", 0)
+        report = d.collect()
+        self.assertEqual(report["collected"], 0)
+        self.assertIn("never", report["note"])
+        self.assertTrue(old.exists(), "0 must not have deleted the archive")
+
+    def test_a_negative_retention_is_refused_and_would_also_mean_never(self):
+        # The schema stops one reaching the daemon at all; `collect` is written
+        # so that if one ever did -- a hand-edited file, a future default --
+        # it still deletes nothing.
+        with self.assertRaises(settings_mod.SettingsError):
+            self.settings.set("dispatch.job_retention_days", -5)
+
+        class _Negative(dispatch.Dispatcher):
+            @property
+            def retention_days(self) -> int:
+                return -5
+
+        d = _Negative(jobs_dir=self.root / "jobs", hypr=self.hypr,
+                      audit=self.audit, terminal="/bin/bash",
+                      agent_bin=str(self.fake_agent))
+        self.addCleanup(d.close)
+        old = self.job_dir("00000004", finished=self.OLD)
+        self.assertEqual(d.collect()["collected"], 0)
+        self.assertTrue(old.exists())
+
+    def test_a_running_job_is_never_collected_however_old(self):
+        d = self.dispatcher()
+        # `pid` is this very process, so the liveness check says it is running.
+        running = self.job_dir("00000005", state="running", pid=os.getpid())
+        self.assertEqual(d.collect()["collected"], 0)
+        self.assertTrue(running.exists())
+
+    def test_a_queued_job_is_never_collected_however_old(self):
+        d = self.dispatcher()
+        self.blocker = d.dispatch("hold the slot", timeout=30, linger=20)
+        self.addCleanup(_stop_quietly, d, self.blocker)
+        queued = d.dispatch("waiting", timeout=30, linger=0)
+        self.assertEqual(queued.state, "queued")
+        # Backdate it past any conceivable window: state, not age, decides.
+        data = json.loads((queued.dir / "job.json").read_text())
+        data["started"] = time.time() - self.OLD
+        (queued.dir / "job.json").write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(d.collect()["collected"], 0)
+        self.assertTrue(queued.dir.exists())
+
+    def test_an_orphaned_job_is_collected_once_past_the_window(self):
+        """It says "running" and never will be. One crash must not pin a
+        directory for the life of the machine."""
+        d = self.dispatcher()
+        orphan = self.job_dir("00000006", state="running", pid=4_194_303)
+        self.assertEqual(d.collect()["collected"], 1)
+        self.assertFalse(orphan.exists())
+
+    def test_the_age_is_taken_from_when_the_job_stopped(self):
+        d = self.dispatcher()
+        # Started long ago, finished yesterday: the record is a day old.
+        long_runner = self.job_dir("00000007", started=self.OLD,
+                                   finished=self.RECENT)
+        self.assertEqual(d.collect()["collected"], 0)
+        self.assertTrue(long_runner.exists())
+
+    def test_a_directory_with_no_manifest_ages_from_itself(self):
+        d = self.dispatcher()
+        stump = self.job_dir("00000008", manifest=False)
+        self.assertEqual(d.collect()["collected"], 0,
+                         "just created, so inside any window")
+        os.utime(stump, (0, 0))
+        self.assertEqual(d.collect()["collected"], 1)
+        self.assertFalse(stump.exists())
+
+    def test_every_deletion_is_audited_and_claims_no_undo(self):
+        d = self.dispatcher()
+        self.job_dir("00000009", finished=self.OLD)
+        d.collect()
+        [entry] = self.audit.read(action="job.collected")
+        self.assertEqual(entry["job_id"], "00000009")
+        self.assertEqual(entry["state"], "finished")
+        self.assertGreater(entry["age_days"], 14)
+        self.assertNotIn("undo", entry,
+                         "there is no inverse for a deleted directory")
+
+    def test_the_collector_runs_on_its_own_thread_and_stops_with_close(self):
+        d = self.dispatcher()
+        old = self.job_dir("0000000a", finished=self.OLD)
+        d.start_gc(interval=3600.0)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and old.exists():
+            time.sleep(0.05)
+        self.assertFalse(old.exists(), "the pass on the way up never ran")
+        d.close(join_timeout=10.0)
+        self.assertFalse(d._gc.is_alive(), "the collector outlived close()")
 
 
 class PeekTests(DispatcherCase):
