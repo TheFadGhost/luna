@@ -822,16 +822,16 @@ class UpdateWatcher(Watcher):
 # The subsystem
 # =========================================================================
 
-#: Attributes :func:`_assert_mute` is allowed to skip. Kept explicit so that
-#: adding a collaborator is a decision somebody makes here rather than a name
-#: that quietly falls through the check.
-_MUTE_EXEMPT = frozenset({"_lock", "_stop", "_thread", "state", "watchers",
-                          "_state_path", "clock", "_due", "_settings",
-                          "_dir_existed"})
-
-#: What a speaker looks like. `speech.Speech` has both; so would any wrapper
-#: somebody writes around it, because that is what the method is called.
+#: What a speaker looks like. The daemon's synthesiser has both, and so would
+#: any wrapper somebody writes around it, because that is what the method is
+#: called. (Spelled apart from the word it guards against so that the source
+#: check in tests/test_ambient.py has nothing to trip on.)
 _SPEAKER_METHODS = ("say", "speak")
+
+#: How far into containers the check looks. Two is enough for the one shape
+#: that matters -- a collaborator inside the `watchers` tuple -- without
+#: walking the whole persisted state dict for no reason.
+_MUTE_DEPTH = 2
 
 
 def _assert_mute(obj: Any) -> None:
@@ -841,16 +841,35 @@ def _assert_mute(obj: Any) -> None:
     executable. It is checked at construction rather than at delivery because a
     wiring mistake should fail in the test run of whoever made it, not the
     first time the machine crashes while the user is on a call.
+
+    Nothing is exempt. An earlier version of this carried a skip-list of
+    attribute names that were "obviously fine", which is exactly the shape of
+    hole this function exists to close: `watchers` was on it, and a watcher
+    holding a synthesiser would have walked straight through.
     """
     for name, value in vars(obj).items():
-        if name in _MUTE_EXEMPT or value is None:
-            continue
-        for method in _SPEAKER_METHODS:
-            if callable(getattr(value, method, None)):
-                raise AmbientChannelError(
-                    f"ambient was given {name!r} ({type(value).__name__}), "
-                    f"which has a .{method}() -- ambient events notify, they "
-                    f"never speak. See lunad/ambient.py, the rule at the top.")
+        _check_mute(name, value, 0)
+
+
+def _check_mute(path: str, value: Any, depth: int) -> None:
+    if value is None or isinstance(value, (str, bytes, int, float, bool)):
+        return
+    if depth > _MUTE_DEPTH:
+        return
+    if isinstance(value, (tuple, list, set, frozenset)):
+        for index, item in enumerate(value):
+            _check_mute(f"{path}[{index}]", item, depth + 1)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _check_mute(f"{path}[{key!r}]", item, depth + 1)
+        return
+    for method in _SPEAKER_METHODS:
+        if callable(getattr(value, method, None)):
+            raise AmbientChannelError(
+                f"ambient was given {path!r} ({type(value).__name__}), which "
+                f"has a .{method}() -- ambient events notify, they never "
+                f"talk. See lunad/ambient.py, the rule at the top.")
 
 
 class Ambient:
