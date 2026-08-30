@@ -51,7 +51,7 @@ class SettingsOpCase(JarvisDaemonCase):
     def test_settings_get_returns_the_whole_config_and_the_schema(self) -> None:
         resp = self.daemon().dispatch({"op": "settings.get", "id": "1"})
         self.assertTrue(resp["ok"])
-        self.assertEqual(resp["settings"]["voice"]["voice"], "flux-sienna-en")
+        self.assertEqual(resp["settings"]["voice"]["voice"], "flux-alexis-en")
         self.assertEqual(resp["defaults"]["assistant"]["name"], "Luna")
         sections = {s["section"] for s in resp["schema"]}
         self.assertIn("confirm.prompt", sections)

@@ -282,7 +282,7 @@ Piper specifics (researched, not assumed):
 
 ### 5a. OpenRouter TTS — BUILT, piper kept underneath
 
-The default voice is now **`flux-sienna-en`** (female) through
+The default voice is now **`flux-alexis-en`** (female) through
 `deepgram/flux-tts:free`, with **`flux-donovan-en`** as the alternate.
 `POST https://openrouter.ai/api/v1/audio/speech`, JSON `{model, input, voice}`,
 answering **RIFF/WAV, 24 kHz mono 16-bit**.
@@ -312,7 +312,7 @@ whether she feels responsive):
 | | short utterance | two-sentence utterance |
 |---|---|---|
 | piper, local | 96–124 ms | 341–409 ms |
-| OpenRouter `flux-sienna-en` | 1.5–1.8 s | 2.3–2.9 s |
+| OpenRouter `flux-sienna-en` (measured; alexis is the same model) | 1.5–1.8 s | 2.3–2.9 s |
 
 So the remote voice costs roughly **1.4–2.5 s of extra latency before the first
 word**, in exchange for a markedly better voice. It is a real trade, not a free

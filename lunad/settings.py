@@ -149,7 +149,7 @@ SCHEMA: tuple[Section, ...] = (
                 choices=("openrouter", "piper"),
                 comment="openrouter | piper"),
             Key("model", "deepgram/flux-tts:free", "str"),
-            Key("voice", "flux-sienna-en", "str", comment="DEFAULT (female)"),
+            Key("voice", "flux-alexis-en", "str", comment="DEFAULT (female)"),
             Key("voice_male", "flux-donovan-en", "str",
                 comment="the alternate, selectable in the GUI"),
             Key("fallback", "piper", "str", choices=("piper", "none"),

@@ -215,7 +215,7 @@ saves. It is kept for conversational continuity, not for money.
 - **An invalid value warns and falls back**; `settings.set` over the socket
   refuses instead. Ops `settings.get` / `settings.set` also hand back the whole
   schema, so the settings GUI can build itself from the daemon.
-- **OpenRouter TTS**: `deepgram/flux-tts:free`, default voice `flux-sienna-en`,
+- **OpenRouter TTS**: `deepgram/flux-tts:free`, default voice `flux-alexis-en`,
   alternate `flux-donovan-en`. WAV parsed chunk by chunk, PCM fed to the same
   single `aplay`, one request per sentence with one sentence of look-ahead.
 - **piper is still there and still the fallback.** Verified by pointing

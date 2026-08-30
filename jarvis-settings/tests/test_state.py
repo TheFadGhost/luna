@@ -146,14 +146,14 @@ class VoicesTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         d = pathlib.Path(tmp.name)
-        for v in ("flux-zzz-en", "flux-donovan-en", "flux-sienna-en"):
+        for v in ("flux-zzz-en", "flux-donovan-en", "flux-alexis-en"):
             (d / f"deepgram_{v}.wav").write_text("")
         got = voices.available(d)
-        self.assertEqual(got[:2], ["flux-sienna-en", "flux-donovan-en"])
+        self.assertEqual(got[:2], ["flux-alexis-en", "flux-donovan-en"])
         self.assertIn("flux-zzz-en", got)
 
     def test_the_two_contract_voices_are_annotated(self):
-        self.assertIn("female", voices.label_for("flux-sienna-en"))
+        self.assertIn("female", voices.label_for("flux-alexis-en"))
         self.assertIn("male", voices.label_for("flux-donovan-en"))
         self.assertEqual(voices.label_for("flux-kai-en"), "flux-kai-en")
 
