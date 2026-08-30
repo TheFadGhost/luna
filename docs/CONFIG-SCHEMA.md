@@ -44,7 +44,7 @@ enabled      = true
 provider     = "openrouter"  # openrouter | local
 model        = "fish-audio/transcribe-1"
 language     = "en"
-keybind      = "SUPER + ALT + L"
+keybind      = "F10"
 
 [confirm]
 # The safety model. NOT hard blocks — Jarvis asks first, then proceeds.

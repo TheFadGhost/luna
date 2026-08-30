@@ -96,7 +96,7 @@ starts on the first one (measured: first audio at 45 ms) while the rest is still
 being synthesised. Code, paths, URLs and long numbers are never read aloud; they
 become "it's on screen".
 
-**In** — `SUPER+ALT+L` runs `voxtype record toggle --profile luna`. The profile's
+**In** — `F10` runs `voxtype record toggle --profile luna`. The profile's
 `post_process_command` is `bin/luna-voice-router`, which forwards the transcript
 to the daemon and prints nothing.
 

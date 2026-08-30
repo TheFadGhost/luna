@@ -25,7 +25,8 @@
   Measured hand-off 30 ms against a 2000 ms budget. Full loop verified end to
   end from a real microphone: spoken question -> transcript -> router -> Luna
   answered in 4.4 s -> spoken aloud.
-- **Keybind** SUPER+ALT+L, verified free and verified registered.
+- **Keybind** F10, verified free and verified registered. Sits next to F9
+  dictation on purpose: F9 types what you say, F10 sends it to Luna.
 - **Plain dictation regression-tested and intact.** Recorded through the
   unprofiled path into a scratch window: 94 bytes typed, no profile override, no
   post-processing. The voxtype config backup is a byte-identical prefix of the
@@ -436,5 +437,20 @@ subsystem that does not exist, or belongs to another process; see
 
 ## Blocked / needs the user
 - **Voice approval** — jenny_dioco is in use; alba was never compared aloud.
-- **Whether SUPER+ALT+L is the right key.** Picked because it was free and
-  mnemonic, not because it was asked for.
+
+## Resolved with the user (2026-08-30)
+- **Keybind: F10, toggle.** Asked and answered. SUPER+ALT+L was the wrong
+  shape for a press-and-talk assistant. F9 was the only F-key bound on this
+  machine, so F10 sits directly next to it and the pair reads as one idea:
+  F9 types what you say, F10 sends it to Luna. Still `record toggle`, not
+  push-to-talk — a question to Luna is usually a whole sentence.
+- **VoiceMem (`xzf-thu/VoiceMem`) evaluated and rejected as a dependency.**
+  Apache-2.0, genuinely runnable, and its "dual-brain" split (factual
+  schema/entity memory vs. an emotion/persona accumulator) is a good worked
+  design for exactly the tier-3 stub below. But it cannot run here: ~3.27 GB
+  of models loaded concurrently on top of torch + transformers + funasr +
+  sherpa-onnx, against ~3-4 GB of free RAM and no GPU. Its ASR is
+  Chinese-first, so it is a downgrade for English dictation, and there is no
+  hosted API to fall back to. **Decision: read it for design, do not import
+  it.** If semantic recall lands, use a small ONNX embedding model under
+  `onnxruntime` alone — not sentence-transformers.
