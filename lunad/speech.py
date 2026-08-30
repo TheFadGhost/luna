@@ -580,7 +580,7 @@ class Speech:
             "enabled": bool(cfg.get("enabled", True)),
             "provider": str(cfg.get("provider", "openrouter")),
             "model": str(cfg.get("model", "deepgram/flux-tts:free")),
-            "voice": str(cfg.get("voice", "flux-sienna-en")),
+            "voice": str(cfg.get("voice", "flux-alexis-en")),
             "fallback": str(cfg.get("fallback", "piper")),
             "max_spoken_chars": int(cfg.get("max_spoken_chars",
                                             config.SPEECH_MAX_CHARS)),

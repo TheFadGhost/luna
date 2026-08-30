@@ -32,7 +32,7 @@ model        = ""            # "" = agent default
 enabled      = true
 provider     = "openrouter"  # openrouter | piper
 model        = "deepgram/flux-tts:free"
-voice        = "flux-sienna-en"     # DEFAULT (female)
+voice        = "flux-alexis-en"     # DEFAULT (female)
 voice_male   = "flux-donovan-en"    # the alternate, selectable in the GUI
 fallback     = "piper"       # piper | none — used when the network/provider fails
 piper_voice  = "en_GB-jenny_dioco-medium"

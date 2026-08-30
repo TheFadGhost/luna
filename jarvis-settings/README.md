@@ -89,7 +89,7 @@ Two buttons, because they do genuinely different things:
   whatever is currently configured — the end-to-end check.
 
 The status line reports the exact command path taken, e.g.
-`Preview: aplay sample: aplay -q /home/ghost/Music/luna-voices/deepgram_flux-sienna-en.wav`.
+`Preview: aplay sample: aplay -q /home/ghost/Music/luna-voices/deepgram_flux-alexis-en.wav`.
 If a voice has no local sample, Preview falls through to the daemon and says so.
 
 ## The four immovable denies

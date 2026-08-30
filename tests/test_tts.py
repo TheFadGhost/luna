@@ -134,12 +134,12 @@ class SynthesiseCase(TempMemoryCase):
         self.addCleanup(setattr, speech.urllib.request, "urlopen", old)
 
         wav = speech.synthesise("Good morning.", model="deepgram/flux-tts:free",
-                                voice="flux-sienna-en", api_key="sk-test")
+                                voice="flux-alexis-en", api_key="sk-test")
         self.assertEqual(wav.rate, 24_000)
         self.assertEqual(captured["url"], config.OPENROUTER_SPEECH_URL)
         self.assertEqual(captured["body"], {"model": "deepgram/flux-tts:free",
                                             "input": "Good morning.",
-                                            "voice": "flux-sienna-en"})
+                                            "voice": "flux-alexis-en"})
         self.assertIn("Bearer sk-test", str(captured["headers"]))
 
     def test_a_502_becomes_a_remote_failure(self) -> None:
@@ -260,7 +260,7 @@ class FallbackCase(TempMemoryCase):
         obj = _Speech(synth=synth, settings=self.settings)
         self.addCleanup(obj.close)
         obj._play(self.job(["One."]))
-        self.assertEqual(seen, ["flux-sienna-en"])
+        self.assertEqual(seen, ["flux-alexis-en"])
 
         self.settings.set("voice.voice", "flux-donovan-en")
         obj._play(self.job(["Two."]))
@@ -275,7 +275,7 @@ class VoiceSettingsCase(TempMemoryCase):
 
     def test_settings_are_read_per_utterance_not_at_construction(self) -> None:
         obj = self.obj()
-        self.assertEqual(obj._voice_settings()["voice"], "flux-sienna-en")
+        self.assertEqual(obj._voice_settings()["voice"], "flux-alexis-en")
         self.settings.set("voice.voice", "flux-donovan-en")
         self.assertEqual(obj._voice_settings()["voice"], "flux-donovan-en")
 
@@ -296,7 +296,7 @@ class VoiceSettingsCase(TempMemoryCase):
     def test_status_reports_the_live_provider_and_voice(self) -> None:
         status = self.obj().status()
         self.assertEqual(status["provider"], "openrouter")
-        self.assertEqual(status["voice"], "flux-sienna-en")
+        self.assertEqual(status["voice"], "flux-alexis-en")
         self.assertEqual(status["piper_voice"], config.VOICE_NAME)
         self.assertEqual(status["fallback"], "piper")
 

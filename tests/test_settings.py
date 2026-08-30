@@ -31,7 +31,7 @@ class DefaultsCase(TempMemoryCase):
         self.addCleanup(cfg.stop_watching)
         self.assertTrue(path.exists())
         self.assertEqual(cfg.get("assistant.name"), "Luna")
-        self.assertEqual(cfg.get("voice.voice"), "flux-sienna-en")
+        self.assertEqual(cfg.get("voice.voice"), "flux-alexis-en")
         self.assertEqual(cfg.get("voice.voice_male"), "flux-donovan-en")
         self.assertEqual(cfg.get("voice.model"), "deepgram/flux-tts:free")
         self.assertEqual(cfg.get("confirm.delete_files"), "ask")
@@ -48,7 +48,7 @@ class DefaultsCase(TempMemoryCase):
         first = settings_mod.defaults()
         first["voice"]["voice"] = "mutated"
         self.assertEqual(settings_mod.defaults()["voice"]["voice"],
-                         "flux-sienna-en")
+                         "flux-alexis-en")
 
 
 class RoundTripCase(TempMemoryCase):
@@ -72,7 +72,7 @@ class RoundTripCase(TempMemoryCase):
     def test_the_written_file_is_valid_toml_and_keeps_the_comments(self) -> None:
         text = self.settings.path.read_text(encoding="utf-8")
         parsed = tomllib.loads(text)
-        self.assertEqual(parsed["voice"]["voice"], "flux-sienna-en")
+        self.assertEqual(parsed["voice"]["voice"], "flux-alexis-en")
         self.assertIn("# display name + how she refers to herself", text)
         self.assertIn("# openrouter | piper", text)
         self.assertIn("#   restarting omarchy-shell", text)
@@ -153,12 +153,12 @@ class ValidationCase(TempMemoryCase):
 class HotReloadCase(TempMemoryCase):
     def test_an_edit_on_disk_reaches_get_without_a_restart(self) -> None:
         cfg = self.settings
-        self.assertEqual(cfg.get("voice.voice"), "flux-sienna-en")
+        self.assertEqual(cfg.get("voice.voice"), "flux-alexis-en")
         cfg.path.write_text('[voice]\nvoice = "flux-donovan-en"\n',
                             encoding="utf-8")
         changes = cfg.poll()
         self.assertEqual(cfg.get("voice.voice"), "flux-donovan-en")
-        self.assertIn({"key": "voice.voice", "from": "flux-sienna-en",
+        self.assertIn({"key": "voice.voice", "from": "flux-alexis-en",
                        "to": "flux-donovan-en"}, changes)
 
     def test_poll_is_a_no_op_when_the_file_has_not_moved(self) -> None:
@@ -178,7 +178,7 @@ class HotReloadCase(TempMemoryCase):
     def test_a_same_size_same_second_edit_is_still_noticed(self) -> None:
         """mtime alone is not enough; a one-character toggle proves it."""
         cfg = self.settings
-        cfg.path.write_text('[voice]\nvoice = "flux-sienna-en"\n',
+        cfg.path.write_text('[voice]\nvoice = "flux-alexis-en"\n',
                             encoding="utf-8")
         cfg.reload()
         cfg.path.write_text('[voice]\nvoice = "flux-donovan-eN"\n',

@@ -38,7 +38,7 @@ SAMPLE_LINE = ("Jarvis here. This is how I sound when I read something back "
 # rest are listed by id, because inventing a gender for 34 voices from their
 # filenames would be a guess presented as fact.
 ANNOTATED = {
-    "flux-sienna-en": "default · female",
+    "flux-alexis-en": "default · female",
     "flux-donovan-en": "alternate · male",
 }
 
@@ -55,7 +55,7 @@ def available(sample_dir: Path | None = None) -> list[str]:
             f"{SAMPLE_PREFIX}*.wav"))
     except OSError:
         found = []
-    head = [v for v in ("flux-sienna-en", "flux-donovan-en") if v in found]
+    head = [v for v in ("flux-alexis-en", "flux-donovan-en") if v in found]
     return head + [v for v in found if v not in head]
 
 
