@@ -456,10 +456,63 @@ CREATE TABLE IF NOT EXISTS meta (
 CONSOLIDATED_THROUGH = "consolidated_through_id"
 
 _FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
-_STOPWORDS = frozenset(
-    "a an the and or of to in on for with what when did we i you is are was "
-    "were be been it that this about how why".split()
-)
+
+# Deliberately large. The old ~30-word list let filler survive: "so anyway do
+# you think I should do something about this" kept "do", "so", "think" and
+# "something", which OR-joined into a query that matched 10 of 15 episodes in
+# the real database on pure noise. Every word below is either closed-class
+# (article, preposition, conjunction, pronoun, auxiliary/modal verb) or a
+# generic verb/quantifier so common it carries no discriminating power on its
+# own ("think", "get", "something"). Domain words never belong here — the
+# risk of dropping something meaningful is in the rare-token gate below, not
+# in this list, so this list can be generous.
+_STOPWORDS = frozenset("""
+    a an the and or of to in on for with what when did we i you is are was
+    were be been it that this about how why who which whom whose where
+    do does did doing done am have has had having will would shall should
+    can could may might must
+    i you we he she it they me him her us them my your his its our their
+    mine yours ours theirs myself yourself himself herself itself ourselves
+    yourselves themselves
+    think thinks thought thinking know knows knew knowing knowledge
+    want wants wanted wanting need needs needed needing
+    like likes liked liking get gets got getting gotten
+    go goes going went gone make makes made making
+    say says said saying tell tells told telling ask asks asked asking
+    come comes came coming look looks looked looking see sees saw seeing
+    let lets letting
+    so anyway anyways well just really very quite actually basically
+    literally honestly probably maybe perhaps kind sort okay ok um uh
+    yeah yep nope hey hi hello
+    something anything nothing everything someone anyone everyone nobody
+    some any all much many more most less least few several little lot lots
+    bit thing things stuff way ways
+    also too still even ever never always right one please thanks thank
+    now then today tomorrow yesterday here there
+""".split())
+
+#: Minimum length for a survivor token to count as "reasonably rare" and
+#: therefore worth building a query around at all. Below this, a query is
+#: treated as content-free even if a handful of short non-stopword tokens
+#: happen to survive — three or four two-and-three-letter leftovers are not a
+#: signal.
+_RARE_TOKEN_MIN_LEN = 4
+
+#: :meth:`Memory.recall_block` refuses to inject an episode whose
+#: ``coverage`` (fraction of the search query's content tokens actually
+#: present — see ``EpisodeStore.search``) is below this. Deliberately not a
+#: threshold on the raw BM25 score: BM25's IDF term collapses toward zero on
+#: a tiny corpus (a single-episode test database scores a perfect one-word
+#: match at bm25 ≈ 0, indistinguishable from noise), so it does not compare
+#: across corpus sizes. Coverage does — it is a token-count ratio, the same
+#: meaning whether the store holds 2 episodes or 20,000. Inclusive: an
+#: OR-widened hit needs at least half the query's content tokens present, so
+#: a two-token query sharing its one specific, already rarity-gated word
+#: ("what voice did we choose" against an episode about choosing a voice)
+#: still surfaces, while a three-token query sharing only one incidental
+#: word out of three does not. Every AND-pass hit is coverage 1.0 by
+#: construction and always clears it.
+RECALL_COVERAGE_FLOOR = 0.5
 
 
 def assert_fts5(conn: sqlite3.Connection | None = None) -> None:
@@ -486,19 +539,54 @@ def assert_fts5(conn: sqlite3.Connection | None = None) -> None:
             conn.close()
 
 
-def build_fts_query(raw: str) -> str | None:
+def _content_tokens(raw: str) -> list[str]:
+    """The lexical half of recall: tokenize, drop stopwords, gate on rarity.
+
+    Returns ``[]`` — not the stopword-only tokens — when nothing survives
+    that is worth searching on. The old behaviour fell back to the *raw*
+    tokens (stopwords included) whenever filtering emptied the list, which
+    is backwards: a query that is entirely filler ("what is it") is exactly
+    the case that should retrieve nothing, not the case that should retrieve
+    on the filler words verbatim. A query also has to clear
+    :data:`_RARE_TOKEN_MIN_LEN` on at least one surviving token — a handful
+    of short leftovers ("do", "so", "get" would already be gone, but e.g.
+    "bit", "way") is still not a signal worth building a query around.
+
+    This is the lexical (FTS5/BM25) half of recall only. The paraphrase half
+    — "how much charge is left" never matching an episode that says
+    "battery" — needs a semantic/embedding index, which is out of scope here
+    (no new dependency, no downloaded model). The seam for it is
+    :meth:`EpisodeStore.search`: run this function's FTS candidates and a
+    future ANN lookup over an embeddings table side by side, union the
+    episode ids, and let each candidate's relevance score (BM25 here, cosine
+    there) feed the same coverage/floor gate ``recall_block`` already
+    enforces. Nothing here needs to change shape to add that later — it is
+    an additional candidate source into the same funnel.
+    """
+    tokens = [t for t in _FTS_TOKEN_RE.findall(raw.lower()) if t not in _STOPWORDS]
+    if not any(len(t) >= _RARE_TOKEN_MIN_LEN or t.isdigit() for t in tokens):
+        return []
+    return tokens
+
+
+def build_fts_query(raw: str, mode: str = "or") -> str | None:
     """Turn free text into a safe FTS5 MATCH expression.
 
     User queries contain apostrophes, hyphens and question marks, all of which
-    are FTS5 syntax. Every token is quoted and stopwords are dropped; returns
-    ``None`` when nothing usable is left.
+    are FTS5 syntax. Every token is quoted; returns ``None`` when
+    :func:`_content_tokens` finds nothing usable.
+
+    ``mode="or"`` (the default, and what every existing caller gets) joins
+    permissively. ``mode="and"`` requires every surviving token to appear in
+    the same row — :meth:`EpisodeStore.search` tries that first and only
+    widens to ``"or"`` when it comes back empty, so a multi-word query cannot
+    match on a single incidental word the way a pure-OR query can.
     """
-    tokens = [t for t in _FTS_TOKEN_RE.findall(raw.lower()) if t not in _STOPWORDS]
-    if not tokens:
-        tokens = _FTS_TOKEN_RE.findall(raw.lower())
+    tokens = _content_tokens(raw)
     if not tokens:
         return None
-    return " OR ".join(f'"{t}"' for t in tokens)
+    joiner = " AND " if mode == "and" else " OR "
+    return joiner.join(f'"{t}"' for t in tokens)
 
 
 @dataclass
@@ -511,6 +599,14 @@ class Episode:
     salience: float
     effective_salience: float = 0.0
     rank: float = 0.0
+    #: Fraction of the search query's content tokens actually found in this
+    #: episode's text. 1.0 for every hit from the AND pass (all tokens
+    #: present, by construction) and for anything not fetched via
+    #: :meth:`EpisodeStore.search` at all (``recent``/``since``, where
+    #: coverage does not apply). Only the OR-widen fallback produces values
+    #: below 1.0 — see ``search`` and ``Memory.recall_block``'s relevance
+    #: floor.
+    coverage: float = 1.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -659,19 +755,10 @@ class EpisodeStore:
             row = self._conn.execute("SELECT max(id) AS m FROM episodes").fetchone()
         return int(row["m"] or 0)
 
-    def search(self, query: str, limit: int = 10) -> list[Episode]:
-        """Keyword recall, ranked by BM25 lifted by decayed salience.
-
-        Decay is applied here, at read time. A stale trivial episode sinks;
-        a correction from six months ago still surfaces.
-        """
-        match = build_fts_query(query)
-        if not match:
-            return []
-        now = time.time()
+    def _run_match(self, match: str, limit: int) -> list[sqlite3.Row]:
         try:
             with self._lock:
-                rows = self._conn.execute(
+                return self._conn.execute(
                     "SELECT e.*, bm25(episodes_fts) AS bm "
                     "FROM episodes_fts JOIN episodes e ON e.id = episodes_fts.rowid "
                     "WHERE episodes_fts MATCH ? "
@@ -679,9 +766,71 @@ class EpisodeStore:
                     (match, limit * 4),
                 ).fetchall()
         except sqlite3.Error as exc:
-            raise MemoryError(f"episode search failed for {query!r}: {exc}") from exc
+            raise MemoryError(f"episode search failed for {match!r}: {exc}") from exc
 
-        episodes = [self._hydrate(r, now, rank=float(r["bm"])) for r in rows]
+    def _token_hit_ids(self, token: str) -> set[int]:
+        """Every episode id the FTS index itself says contains ``token``.
+
+        Used to score coverage on the OR-widen fallback. Deliberately routed
+        back through the index rather than a plain-text ``token in text``
+        check: the index applies the porter stemmer, and a naive substring
+        check disagrees with it on irregular forms ("chose" is the matched
+        stem for a query token "choose" — MATCH finds it, `"choose" in text`
+        does not) and would under-count coverage for hits the index itself
+        considers legitimate.
+        """
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT rowid FROM episodes_fts WHERE episodes_fts MATCH ?",
+                    (f'"{token}"',),
+                ).fetchall()
+            return {int(r["rowid"]) for r in rows}
+        except sqlite3.Error:
+            return set()
+
+    def search(self, query: str, limit: int = 10) -> list[Episode]:
+        """Keyword recall, ranked by BM25 lifted by decayed salience.
+
+        AND-then-widen: tries every surviving content token required in the
+        same row first, and only falls back to OR (any token) when that
+        comes back empty. A pure-OR query is what let "so anyway do you
+        think I should do something about this" match 10 of 15 episodes in
+        the real database — six of the ten shared exactly one incidental
+        word with the query and nothing else. Requiring AND first means a
+        multi-word query only matches loosely when nothing matches it
+        fully, and the fallback hits are marked with their true
+        ``coverage`` (fraction of query tokens actually present) so
+        :meth:`Memory.recall_block` can refuse the weak ones rather than
+        inject them as if they were as good as an AND match.
+
+        Decay is applied here, at read time. A stale trivial episode sinks;
+        a correction from six months ago still surfaces.
+        """
+        tokens = _content_tokens(query)
+        if not tokens:
+            return []
+        now = time.time()
+        and_match = " AND ".join(f'"{t}"' for t in tokens)
+        rows = self._run_match(and_match, limit)
+        full_coverage = True
+        token_hits: dict[str, set[int]] | None = None
+        if not rows and len(tokens) > 1:
+            or_match = " OR ".join(f'"{t}"' for t in tokens)
+            rows = self._run_match(or_match, limit)
+            full_coverage = False
+            token_hits = {t: self._token_hit_ids(t) for t in tokens}
+
+        episodes = []
+        for row in rows:
+            ep = self._hydrate(row, now, rank=float(row["bm"]))
+            if full_coverage:
+                ep.coverage = 1.0
+            else:
+                rowid = int(row["id"])
+                found = sum(1 for t in tokens if rowid in token_hits[t])
+                ep.coverage = found / len(tokens)
+            episodes.append(ep)
         # bm25 is negative and lower is better; salience in [0,1] lifts a hit.
         episodes.sort(key=lambda e: e.rank - 2.0 * e.effective_salience)
         return episodes[:limit]
@@ -1184,8 +1333,19 @@ class Memory:
         return "\n\n".join(chunks)
 
     def recall_block(self, query: str, limit: int = config.RECALL_LIMIT) -> str:
-        """Relevant tier-2 episodes, rendered for the prompt. May be empty."""
-        hits = self.episodes.search(query, limit=limit)
+        """Relevant tier-2 episodes, rendered for the prompt. May be empty.
+
+        Filters out anything below :data:`RECALL_COVERAGE_FLOOR` first.
+        Injecting a weak match into the prompt is worse than injecting
+        nothing — it reads as confirmed context and actively misleads,
+        rather than just failing to help — so this is the one place in the
+        recall path that would rather come back empty than come back wrong.
+        ``EpisodeStore.search`` itself stays permissive, because other
+        callers (e.g. the raw ``mem search`` surface) want to see weak hits
+        to judge for themselves.
+        """
+        hits = [ep for ep in self.episodes.search(query, limit=limit)
+                if ep.coverage >= RECALL_COVERAGE_FLOOR]
         if not hits:
             return ""
         lines = []
