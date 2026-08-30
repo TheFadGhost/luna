@@ -221,27 +221,39 @@ class Tier1File:
     # -- reading ---------------------------------------------------------
 
     def text(self) -> str:
-        try:
-            return self.path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return ""
+        # Guarded by the same lock every write goes through. Safe today only
+        # by accident of `atomic_write`'s `os.replace` being atomic at the
+        # filesystem level -- a reader here was never able to observe a
+        # half-written file even without this -- but "the lock guards every
+        # access to this file" is the invariant the rest of the class is
+        # written against (`_check_cap` reads `entries()` from inside a held
+        # lock, which only works because RLock is reentrant), and a reader
+        # that quietly opted out of it was one refactor away from being
+        # wrong for a reason nobody would see in a diff.
+        with self._lock:
+            try:
+                return self.path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                return ""
 
     def entries(self) -> list[str]:
-        return parse_entries(self.text())
+        with self._lock:
+            return parse_entries(self.text())
 
     def usage(self) -> dict[str, Any]:
         """Current occupancy. ``pct`` is the number to show a human."""
-        entries = self.entries()
-        chars = len(render_entries(entries))
-        return {
-            "file": self.name,
-            "path": str(self.path),
-            "chars": chars,
-            "cap": self.cap,
-            "pct": round(100.0 * chars / self.cap, 1) if self.cap else 0.0,
-            "remaining": self.cap - chars,
-            "entries": len(entries),
-        }
+        with self._lock:
+            entries = self.entries()
+            chars = len(render_entries(entries))
+            return {
+                "file": self.name,
+                "path": str(self.path),
+                "chars": chars,
+                "cap": self.cap,
+                "pct": round(100.0 * chars / self.cap, 1) if self.cap else 0.0,
+                "remaining": self.cap - chars,
+                "entries": len(entries),
+            }
 
     # -- writing ---------------------------------------------------------
 
