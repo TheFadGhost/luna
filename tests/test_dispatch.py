@@ -425,6 +425,92 @@ class QueueTests(DispatcherCase):
         self.assertNotIn("queued_s", straight)
 
 
+class AdmissionLeakTests(DispatcherCase):
+    """`_start` used to leak `_admitting` on anything but `OSError`.
+
+    Anything past `spawn` raising something other than `OSError` left the job
+    id in `_admitting` forever, shrinking `max_parallel` by one until a
+    restart — and, when the leak happened inside `_watch`'s own call to
+    `_admit_next`, aborted the rest of `_watch` so the job that had actually
+    just finished never got its `notify_finished` either.
+    """
+
+    def wait_for(self, job: dispatch.Job, *states: str,
+                 timeout: float = 10.0) -> str:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if job.state in states:
+                return job.state
+            time.sleep(0.02)
+        self.fail(f"job {job.id} stayed {job.state!r}, never reached {states}")
+
+    def test_the_admitting_slot_is_released_on_an_unexpected_spawn_error(self):
+        d = self.dispatcher()
+
+        def boom(argv, **kw):
+            raise RuntimeError("not an OSError — the kind that used to leak")
+
+        d.spawn = boom
+        with self.assertRaises(RuntimeError):
+            d.dispatch("boom", timeout=5, linger=0)
+
+        # The reservation must be gone: nothing is running and nothing is
+        # still "admitting" on this job's behalf.
+        self.assertEqual(d._taken(), 0)
+
+        # And the limit must not actually be shrunk: a normal dispatch right
+        # after has to be admitted, not queued forever behind a phantom slot.
+        d.spawn = lambda argv, **kw: safety.spawn(
+            ["/bin/bash", argv[-1]], **kw)
+        job = self.run_job(d, "fine now")
+        self.assertEqual(job.state, "finished")
+
+    def test_watch_finishes_its_own_bookkeeping_despite_a_bad_admission(self):
+        d = self.dispatcher()
+        self.settings.set("dispatch.max_parallel", 1)
+
+        job_a = d.dispatch("first, finishes on its own", timeout=30, linger=0.3)
+        self.assertEqual(job_a.state, "running")
+        job_b = d.dispatch("second, queued behind the only slot",
+                           timeout=30, linger=0)
+        self.assertEqual(job_b.state, "queued")
+        self.addCleanup(_stop_quietly, d, job_a)
+        self.addCleanup(_stop_quietly, d, job_b)
+
+        real_spawn = d.spawn
+
+        def boom_once(argv, **kw):
+            d.spawn = real_spawn      # sabotage exactly one admission
+            raise RuntimeError("boom admitting the next job")
+
+        d.spawn = boom_once
+
+        notified: list[str] = []
+        orig_notify = d.notify_finished
+
+        def spy_notify(job: dispatch.Job) -> bool:
+            notified.append(job.id)
+            return orig_notify(job)
+
+        d.notify_finished = spy_notify
+
+        # Job A finishes on its own (its own spawn already happened before
+        # the sabotage above was installed); its `_watch` thread then tries
+        # to admit job B, hits the injected error, and must still finish its
+        # own bookkeeping regardless.
+        self.wait_for(job_a, "finished", "failed")
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and job_a.id not in notified:
+            time.sleep(0.02)
+        self.assertIn(job_a.id, notified,
+                     "job A's own notify_finished must fire even though "
+                     "admitting job B blew up")
+
+        # Job B's reservation is not leaked either, even though it never
+        # actually started.
+        self.assertEqual(d._taken(), 0)
+
+
 class CollectTests(DispatcherCase):
     """`[dispatch] job_retention_days`: the GC pass, and what it refuses.
 
