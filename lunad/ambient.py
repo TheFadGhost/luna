@@ -627,6 +627,14 @@ class BatteryWatcher(Watcher):
         super().__init__(state)
         self._dir = directory
         self._battery: Path | None = None
+        # The last reading, held in memory and deliberately NOT in `state`.
+        # `state` is persisted, and a percentage that moves while the machine
+        # charges would put a disk write on the SSD every time it ticked over
+        # one point -- for a number that is worthless after a restart anyway,
+        # since the next tick reads the real one. Only `armed` has to survive,
+        # because that is what stops a warning repeating.
+        self.pct: int | None = None
+        self.status: str = ""
 
     @property
     def directory(self) -> Path:
@@ -678,9 +686,7 @@ class BatteryWatcher(Watcher):
             return []
         pct, status = reading
         low, critical = self.thresholds()
-        self.state["seeded"] = True
-        self.state["pct"] = pct
-        self.state["status"] = status
+        self.pct, self.status = pct, status
         armed = str(self.state.get("armed") or "")
 
         if status != "Discharging" or pct > low:
@@ -722,8 +728,8 @@ class BatteryWatcher(Watcher):
         device = self.battery()
         low, critical = self.thresholds()
         snap.update({"device": str(device) if device else None,
-                     "pct": self.state.get("pct"),
-                     "status": self.state.get("status"),
+                     "pct": self.pct,
+                     "status": self.status or None,
                      "armed": self.state.get("armed") or None,
                      "low_pct": low, "critical_pct": critical})
         return snap

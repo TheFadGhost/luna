@@ -522,6 +522,31 @@ class BatteryCase(AmbientCase):
         self.battery(96)
         self.assertEqual(amb.tick(now=0.0), 0)
 
+    def test_a_charging_percentage_is_not_written_to_disk(self) -> None:
+        """Only the latch persists. The reading does not.
+
+        A percentage that moves while the machine charges would put a write on
+        the SSD every time it ticked over one point, for a number that is
+        worthless after a restart -- the next tick reads the real one. Caught
+        on a live instance whose state file was being rewritten every minute
+        while the laptop charged.
+        """
+        amb = self.build()
+        path = self.root / "ambient.json"
+        self.battery(70, status="Charging")
+        amb.tick(now=0.0)
+        stamp = path.stat().st_mtime_ns if path.exists() else None
+        for n, pct in enumerate((71, 72, 73, 74), start=1):
+            self.battery(pct, status="Charging")
+            amb.tick(now=n * 1000.0)
+        self.assertEqual(path.stat().st_mtime_ns if path.exists() else None,
+                         stamp, "a charging battery rewrote the state file")
+        # The latch, which does have to survive, still does.
+        self.battery(4, status="Discharging")
+        amb.tick(now=9000.0)
+        self.assertEqual(amb.state["battery"]["armed"], "critical")
+        self.assertNotIn("pct", amb.state["battery"])
+
     def test_a_critical_set_above_the_low_is_clamped_not_obeyed(self) -> None:
         # Both are independently settable, and a critical above the low would
         # make the low unreachable. A misconfigured threshold must still warn.
