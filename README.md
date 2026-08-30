@@ -52,9 +52,11 @@ in `~/.config/jarvis/config.toml` (0600, in a 0700 directory) — see
 `docs/CONFIG-SCHEMA.md` — and `lunad` watches it and hot-reloads, so a change
 to the voice, the model or the confirmation policy takes effect on the next
 request rather than on the next restart. That document's §Wiring table says
-what reads each key and when it lands, and names the three keys that are still
-honoured by nothing rather than leaving them to be discovered. Secrets never go
-in that file: the
+what reads each key and when it lands. Every key `lunad` owns is now honoured;
+the only ones that are not are `[listen]`, and they cannot be — listening
+belongs to voxtype, in another process with its own config file, and those keys
+are a mirror of it. The table says so rather than leaving it to be discovered.
+Secrets never go in that file: the
 OpenRouter key lives in `~/.config/jarvis/secrets.env` and reaches the daemon
 through a systemd drop-in.
 
