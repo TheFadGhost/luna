@@ -186,7 +186,7 @@ file and the file cannot re-enable them.
 |---|---|---|
 | `luna_cap_chars` | `memory.Tier1File.cap` | Live, per write **and per read**. Lowering it below the current contents does not truncate anything — the next write is rejected with what must be consolidated, which is the tier-1 contract. |
 | `user_cap_chars` | `memory.Tier1File.cap` | Live, same. |
-| `consolidate_every_turns` | `consolidate.Consolidator` | Live. Counts completed asks; on the Nth, a background pass reads the tier-2 episodes recorded since the last one, rebuilds the tier-3 profile, and proposes tier-1 edits through the model. **`0` means never** — nothing is counted, no pass starts, no tokens are spent. The pass is subject to the ordinary cap contract: a proposal that would overflow a file is rejected whole and recorded, and the file is left exactly as it was. Never blocks a reply. |
+| `consolidate_every_turns` | `consolidate.Consolidator` | Live. Counts completed asks; on the Nth, a background pass reads the tier-2 episodes recorded since the last one, rebuilds the tier-3 profile, and proposes tier-1 edits through the model. **`0` means never** — nothing is counted, no pass starts, no tokens are spent, and `luna memory consolidate` refuses too rather than spending money the setting has ruled out. The pass is subject to the ordinary cap contract: a proposal that would overflow a file is rejected whole and recorded, and the file is left exactly as it was. Never blocks a reply. The counter is the *automatic* trigger only: a pass asked for by hand runs whatever it says (above `0`) and leaves it untouched. |
 | `decay_half_life_days` | `memory.decayed_salience` | Live. Decay is applied at read time, so a change reaches the very next recall. Corrections score 1.0 and never decay regardless. |
 
 `SOL.md` has a cap of its own (`config.SOL_MD_CAP`) with no key: Sol's
@@ -235,6 +235,17 @@ call at all**, so an idle daemon spends nothing even at `= 1`; and the pass
 records no episode of its own, so it cannot feed itself. What it spends shows
 up in `luna status`, in the `consolidated` line in the log next to the ordinary
 `reply` line, and as one entry per pass in `luna audit`.
+
+You do not have to wait twelve turns to find out what a pass would do to your
+files. `luna memory consolidate` runs one now and prints what it changed;
+`luna memory consolidate --dry-run` makes the same call on the same episodes,
+prints the proposal in full and applies none of it — the watermark included, so
+the pass you allow afterwards sees exactly the batch you were shown. A run
+asked for by hand is past the turn counter and the five-minute floor, and past
+nothing else: one at a time still holds, and `= 0` refuses by hand too, because
+the whole promise of `0` is that no tokens are spent. Both cost the same as an
+automatic pass, and both are in `luna audit` with `manual: true` — a dry run
+with `dry_run: true` beside it, counting `would_add` rather than `added`.
 
 ## Not wired — and why
 

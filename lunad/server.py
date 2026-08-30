@@ -572,6 +572,28 @@ class Daemon:
                            block=self.memory.profile.block(payload),
                            status=self.memory.profile.status())
 
+    def op_memory_consolidate(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Run one consolidation pass now, or show what one would do.
+
+        Synchronous, which is the whole difference from the automatic pass.
+        That one runs on its own thread because a user waiting for a reply
+        must never wait for a librarian; this one runs on the request thread
+        because the user *is* waiting for the librarian, and there is nothing
+        to report to a client that has already been answered.
+
+        The guards are the consolidator's, not this method's — `run_manual`
+        owns the decision about which of them a person may override, because
+        the same decision has to hold for any other caller that ever reaches
+        it. All that is decided here is that it is the luna namespace: Sol has
+        no tier-1 pass to run, for the same reason he has no tier-3 profile.
+        """
+        dry_run = bool(req.get("dry_run"))
+        result = self.consolidator.run_manual(dry_run=dry_run)
+        log.info("consolidation asked for by hand",
+                 extra={"dry_run": dry_run, "ran": result.get("ran"),
+                        "reason": result.get("reason")})
+        return protocol.ok(req.get("id"), namespace="luna", **result)
+
     def op_memory_write(self, req: dict[str, Any]) -> dict[str, Any]:
         namespace, store = self._namespace(req)
         default = "SOL.md" if namespace == "sol" else "LUNA.md"
@@ -868,6 +890,7 @@ class Daemon:
             "memory.write": self.op_memory_write,
             "memory.search": self.op_memory_search,
             "memory.profile": self.op_memory_profile,
+            "memory.consolidate": self.op_memory_consolidate,
             "dispatch": self.op_dispatch,
             "jobs": self.op_jobs,
             "peek": self.op_peek,

@@ -184,6 +184,17 @@ def cmd_codex_profile(args: argparse.Namespace) -> int:
     return 0
 
 
+def _meter(pct: float, width: int = 20) -> str:
+    """The occupancy bar, in the one place that draws it.
+
+    Shared between `luna status` and the consolidation report so that a file
+    at 61% looks the same in both. Two bars drawn from the same number by two
+    pieces of code is a difference waiting to happen.
+    """
+    filled = min(width, int(width * pct / 100))
+    return "#" * filled + "." * (width - filled)
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     with Client(timeout=15) as client:
         resp = client.call("status")
@@ -199,10 +210,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"  agent    {a['name']} "
           f"({'ready' if a['available'] else 'UNAVAILABLE'}) — {a['detail']}")
     for name, u in m["tier1"].items():
-        bar_len = 20
-        filled = min(bar_len, int(bar_len * u["pct"] / 100))
-        bar = "#" * filled + "." * (bar_len - filled)
-        print(f"  {name:<8} [{bar}] {u['chars']}/{u['cap']} chars "
+        print(f"  {name:<8} [{_meter(u['pct'])}] "
+              f"{u['chars']}/{u['cap']} chars "
               f"({u['pct']}%) · {u['entries']} entries")
     t2 = m["tier2"]
     print(f"  episodes {t2['episodes']} rows, {t2['size_bytes']} bytes, "
@@ -223,6 +232,8 @@ def cmd_status(args: argparse.Namespace) -> int:
               f"({con['turns_since']} since) · {con['passes']} pass(es), "
               f"{con['added']} added, {con['removed']} removed, "
               f"${con['cost_usd']:.4f}"
+              + (f", {con['previews']} dry run(s)" if con.get("previews")
+                 else "")
               + (" · RUNNING" if con.get("running") else ""))
     else:
         print(f"  consolidate {DIM}off "
@@ -277,7 +288,14 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_memory(args: argparse.Namespace) -> int:
-    with Client(timeout=30) as client:
+    # Every memory op but one is a file read and answers instantly. A
+    # consolidation is a model call made on the daemon's own thread, so the
+    # client has to be willing to wait as long as the daemon will — plus the
+    # margin, or a pass that timed out at the far end looks from here like a
+    # daemon that died.
+    timeout = (config.CONSOLIDATE_TIMEOUT_S + 30
+               if args.mem_cmd == "consolidate" else 30)
+    with Client(timeout=timeout) as client:
         if args.mem_cmd == "show":
             resp = client.call("memory.read", file=args.file, limit=args.limit)
         elif args.mem_cmd == "search":
@@ -291,6 +309,8 @@ def cmd_memory(args: argparse.Namespace) -> int:
                                mode="remove", index=args.index)
         elif args.mem_cmd == "profile":
             resp = client.call("memory.profile", rebuild=args.rebuild)
+        elif args.mem_cmd == "consolidate":
+            resp = client.call("memory.consolidate", dry_run=args.dry_run)
         else:  # pragma: no cover - argparse guarantees a subcommand
             return 2
     if args.json:
@@ -314,6 +334,9 @@ def cmd_memory(args: argparse.Namespace) -> int:
 
     if args.mem_cmd == "profile":
         return _print_profile(resp)
+
+    if args.mem_cmd == "consolidate":
+        return _print_consolidation(resp)
 
     if args.mem_cmd in ("write", "rm"):
         u = resp["usage"]
@@ -374,6 +397,100 @@ def _print_profile(resp: dict) -> int:
     print(f"\n{DIM}derived from tier 2 and safe to delete; the next rebuild "
           f"reproduces it. {st.get('path')}{RESET}")
     return 0
+
+
+def _print_consolidation(resp: dict) -> int:
+    """One pass asked for by hand, printed for someone deciding to trust it.
+
+    Consolidation is the only thing in this program that rewrites curated
+    memory without being told entry by entry what to write, so the report is
+    what changed, verbatim, and what it cost. When nothing changed it is which
+    guard said no and how to get past it — silence and an exit code is the one
+    answer a person cannot act on, and every "did nothing" here has a
+    different remedy.
+
+    Exit 0 covers all of those: the daemon answered, and declining to spend
+    money is not a failure. The two real failures are an agent that could not
+    be reached and a reply that could not be read; both go to stderr and exit
+    1, because a script that ran this and got a 0 would be entitled to assume
+    a proposal had been considered.
+    """
+    dry = bool(resp.get("dry_run"))
+    if not resp.get("ran"):
+        reason = resp.get("reason")
+        if reason == "no new episodes":
+            print(f"{DIM}nothing to consolidate: no exchanges recorded since "
+                  f"the last pass (watermark: episode "
+                  f"{resp.get('after_id', 0)}). Nothing was spent.{RESET}")
+        elif reason == "already running":
+            print(f"{DIM}a pass is already running, so this one did not "
+                  f"start: two passes proposing edits against the same batch "
+                  f"is the one thing this refuses to do. `luna status` shows "
+                  f"when it finishes.{RESET}")
+        elif reason == "disabled":
+            print(f"{DIM}consolidation is off — [memory] "
+                  f"consolidate_every_turns = 0, which is honoured "
+                  f"completely: no pass runs, by hand or on the counter, and "
+                  f"nothing is spent. Turn it back on with{RESET}")
+            print("  luna settings set memory.consolidate_every_turns 12")
+        elif reason == "agent unavailable":
+            sys.stderr.write(
+                f"luna: the agent could not be reached, so nothing was "
+                f"consolidated and nothing was spent: "
+                f"{resp.get('detail', '(no detail)')}\n")
+            return 1
+        else:
+            print(f"{DIM}the pass did not run: {reason}{RESET}")
+        return 0
+
+    if dry:
+        print(f"{BOLD}dry run — nothing was written.{RESET}")
+    cost = resp.get("cost_usd")
+    print(f"{BOLD}{'would consolidate' if dry else 'consolidated'} "
+          f"{resp['episodes']} episode(s){RESET} "
+          f"{DIM}through #{resp['through_id']} · "
+          f"{resp.get('wall_ms', 0) / 1000:.1f}s · "
+          + (f"${cost:.4f}" if cost is not None else "subscription")
+          + f"{RESET}")
+    for name, rec in (resp.get("files") or {}).items():
+        u = rec.get("usage") or {}
+        # No usage means the pass had nothing to do to this file: `_apply`
+        # only measures a file it wrote, and saying "unchanged" is more
+        # honest than re-reading it here and implying this pass is why.
+        print(f"{BOLD}{name}{RESET} "
+              + (f"[{_meter(u['pct'])}] {DIM}{u['chars']}/{u['cap']} chars "
+                 f"({u['pct']}%), {u['entries']} entries{RESET}"
+                 if u else f"{DIM}unchanged{RESET}"))
+        index = rec.get("removed_index") or []
+        for entry in rec.get("added") or []:
+            print(f"  + {entry}")
+        for n, entry in enumerate(rec.get("removed") or []):
+            print(f"  - {f'[{index[n]}] ' if n < len(index) else ''}{entry}")
+        over = rec.get("over_cap")
+        if over:
+            print(f"  {DIM}rejected whole, and the file left exactly as it "
+                  f"was: over cap by {over['overflow']} chars "
+                  f"({over['proposed_chars']}/{over['cap']}){RESET}")
+            refused = rec.get("refused") or {}
+            for entry in refused.get("added") or []:
+                print(f"  {DIM}! would not have fitted: {entry}{RESET}")
+    if resp.get("note"):
+        print(f"{DIM}note: {resp['note']}{RESET}")
+    if not resp.get("parsed"):
+        sys.stderr.write("luna: the model's answer could not be read as a "
+                         "proposal, so nothing was applied. The call was "
+                         "still paid for; `luna log` has the reply.\n")
+    if dry:
+        print(f"\n{DIM}the watermark did not move, so the next pass — this "
+              f"one applied, or the automatic one — sees the same "
+              f"{resp['episodes']} episode(s). Apply a pass with{RESET}")
+        print("  luna memory consolidate")
+    floor = resp.get("floor_left_s") or 0
+    if floor:
+        sys.stderr.write(f"{DIM}[{floor:.0f}s of the interval floor between "
+                         f"passes was overridden: you asked for this "
+                         f"one]{RESET}\n")
+    return 0 if resp.get("parsed") else 1
 
 
 def cmd_dispatch(args: argparse.Namespace) -> int:
@@ -746,6 +863,12 @@ def build_parser() -> argparse.ArgumentParser:
     prof.add_argument("--rebuild", action="store_true",
                       help="regenerate it from episodic memory first")
     prof.add_argument("--limit", type=int, default=10)
+    con = msub.add_parser("consolidate",
+                          help="run one consolidation pass now, instead of "
+                               "waiting for the turn counter")
+    con.add_argument("--dry-run", action="store_true",
+                     help="make the same model call, print the proposal in "
+                          "full, and apply none of it")
     mem.set_defaults(func=cmd_memory)
 
     lg = sub.add_parser("log", help="tail the daemon log")
