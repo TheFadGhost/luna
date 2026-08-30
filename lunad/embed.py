@@ -213,19 +213,27 @@ SEMANTIC_FULL = 0.70
 #: the tokenizer drops the rest anyway; clipping here makes that explicit.
 EMBED_USER_CHARS = 900
 
-#: Episodes embedded per background batch. Small enough that a backfill can
-#: be interrupted at any point having lost at most this much work, and each
-#: batch is committed before the next begins -- which is the whole of the
-#: resumability story.
-BACKFILL_BATCH = 32
+#: Episodes embedded per background batch.
+#:
+#: Four, and small on purpose. Batching buys nothing here and costs memory
+#: linearly: measured on 256-token episodes, one at a time is 102 ms each at a
+#: 198 MB peak, four at a time is 121 ms each at 225 MB, thirty-two at a time
+#: is 126 ms each at **573 MB**. The attention tensors scale with batch times
+#: sequence squared and the worker is single-threaded by design, so a wide
+#: batch is a memory spike bought with nothing. Four keeps the peak inside
+#: what a 7.1 GB machine can spare while still committing only once per four
+#: episodes -- and a batch is the unit of work a kill can cost.
+BACKFILL_BATCH = 4
 
 #: Seconds the backfill thread sleeps between batches. Backfill is never
 #: urgent and must never compete with an answer for the same cores.
-BACKFILL_PAUSE_S = 0.5
+BACKFILL_PAUSE_S = 0.2
 
 #: Outstanding-episode count above which a backfill waits for mains power.
 #:
-#: Measured on this machine: ~35 ms of one core per episode. Catching up the
+#: Measured on this machine: 28 ms of one core per episode over the real
+#: corpus, 102 ms for one long enough to fill the model's 256-token window.
+#: Catching up the
 #: handful of episodes recorded since the last session is 1-2 seconds and not
 #: worth a policy. A first-ever index over thousands of episodes is minutes
 #: of sustained full-core work, which on a Ryzen 4500U is a visible chunk of
@@ -493,6 +501,11 @@ def _worker_main(argv: list[str]) -> int:
         options.intra_op_num_threads = 1
         options.inter_op_num_threads = 1
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        # The CPU arena allocator never returns memory to the OS, so a single
+        # wide backfill batch permanently sets the worker's resident size --
+        # measured at 486 MB with the arena on against 7.1 GB of machine.
+        # Off, it holds close to the graph itself and gives the pages back.
+        options.enable_cpu_mem_arena = False
         session = ort.InferenceSession(
             str(directory / "model.onnx"), options,
             providers=["CPUExecutionProvider"])
@@ -531,6 +544,20 @@ def _worker_main(argv: list[str]) -> int:
         return (pooled / np.clip(norms, 1e-9, None)).astype(np.float32)
 
     spaces: dict[str, dict[str, Any]] = {}
+
+    # Emitted only after the graph is loaded AND one warm-up forward pass has
+    # run. onnxruntime defers a good deal of allocation to the first call, so
+    # a READY sent before it would hand the parent a worker whose first real
+    # query costs 200 ms instead of 10 -- and that first query is on the ask
+    # path, which is the one place the budget is not there to spend.
+    try:
+        embed(["warm up"])
+    except Exception as exc:  # noqa: BLE001
+        _wnote(f"the model loaded but would not run: {exc}")
+        return 5
+    _emit_ready = json.dumps({"model": str(directory), "dim": EMBED_DIM,
+                              "max_seq": MAX_SEQ_LEN})
+    emit(f"READY {_emit_ready}\n")
 
     while True:
         line = stdin.readline()
@@ -576,7 +603,7 @@ def _worker_main(argv: list[str]) -> int:
                     else np.arange(len(scores))
                 pairs = sorted(((int(slot["ids"][i]), float(scores[i]))
                                 for i in top), key=lambda p: -p[1])
-                emit(f"HITS {req_id} {json.dumps(pairs)}\n")
+                emit(f"HITS {req_id} {json.dumps(pairs, separators=(',', ':'))}\n")
             elif op == "embed":
                 texts = [str(t) for t in req.get("texts") or []]
                 if not texts:
@@ -687,8 +714,19 @@ class Embedder:
                          daemon=True).start()
 
     def wait_ready(self, timeout: float = SPAWN_TIMEOUT_S) -> bool:
-        """Block until warm. Only ever called off the answer path."""
+        """Block until warm. Only ever called off the answer path.
+
+        Returns ``False`` at once — not after ``timeout`` — when nothing is
+        starting and nothing can. Waiting on an event no one is going to set
+        is how a machine with no model made every background backfill sit
+        still for thirty seconds before concluding what ``enabled()`` already
+        knew.
+        """
         self.warm()
+        with self._lock:
+            if not (self._starting or self._ready.is_set()
+                    or self._proc is not None):
+                return False
         return self._ready.wait(timeout)
 
     def _spawn(self) -> None:
@@ -745,18 +783,26 @@ class Embedder:
                 header = stream.readline()
                 if not header:
                     break
-                parts = header.decode("utf-8", "replace").rstrip("\n").split(" ", 3)
-                kind = parts[0]
+                # Parsed field by field rather than with one `split(" ", n)`:
+                # a HITS body is JSON and JSON contains spaces, while a VECS
+                # header has a fixed five fields. One maxsplit cannot be right
+                # for both, and getting it wrong on VECS leaves the binary
+                # payload unread in the pipe, which desynchronises every frame
+                # after it. That bug cost an afternoon; hence this comment.
+                kind, _, rest = header.decode("utf-8", "replace") \
+                    .rstrip("\n").partition(" ")
                 if kind == "READY":
                     self._ready.set()
-                elif kind == "HITS" and len(parts) >= 3:
-                    self._deliver(parts[1], ("hits", parts[2]))
-                elif kind == "VECS" and len(parts) >= 5:
-                    n, dim, nbytes = int(parts[2]), int(parts[3]), int(parts[4])
-                    payload = stream.read(nbytes) if nbytes else b""
-                    self._deliver(parts[1], ("vecs", (n, dim, payload)))
-                elif kind == "ERR" and len(parts) >= 2:
-                    self._deliver(parts[1], ("err", " ".join(parts[2:])))
+                elif kind == "HITS":
+                    req_id, _, body = rest.partition(" ")
+                    self._deliver(req_id, ("hits", body))
+                elif kind == "VECS":
+                    req_id, n, dim, nbytes = rest.split(" ", 3)
+                    payload = stream.read(int(nbytes)) if int(nbytes) else b""
+                    self._deliver(req_id, ("vecs", (int(n), int(dim), payload)))
+                elif kind == "ERR":
+                    req_id, _, detail = rest.partition(" ")
+                    self._deliver(req_id, ("err", detail))
                 elif kind == "LOADED":
                     pass
         except Exception as exc:  # noqa: BLE001

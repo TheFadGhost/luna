@@ -1031,9 +1031,9 @@ class EpisodeStore:
 
         # Episodes only the vector index knows about. These are the whole
         # point: they share no token with the query, so no BM25 exists for
-        # them and their rank is derived from the cosine instead (negated, to
-        # sit on the same lower-is-better axis, which keeps a real keyword
-        # hit ahead of a paraphrase at equal coverage).
+        # them and their rank is the negated cosine instead — the same
+        # lower-is-better axis, ordering the paraphrases among themselves.
+        lexical = set(found)
         for row in self._rows_by_id([i for i in semantic if i not in found]):
             ep = self._hydrate(row, now, rank=-float(semantic[int(row["id"])]))
             ep.coverage = 0.0
@@ -1046,9 +1046,22 @@ class EpisodeStore:
             ep.similarity = cos
             ep.coverage = max(ep.coverage, embed_mod.coverage_from_cosine(cos))
 
-        # bm25 is negative and lower is better; salience in [0,1] lifts a hit.
+        # Coverage first; then a hit that actually contains the words ahead
+        # of one that merely means the same; then the old key, bm25 lifted by
+        # decayed salience (bm25 is negative and lower is better, salience in
+        # [0,1] lifts a hit).
+        #
+        # That middle term is not a nicety. BM25's IDF collapses toward zero
+        # on a small corpus — a one-word match in a three-episode database
+        # scores about -1e-7 — so comparing it against a negated cosine would
+        # let a 0.9 paraphrase outrank a literal keyword hit purely because
+        # the two numbers are on incomparable scales. Splitting them into
+        # separate sort tiers means neither scale is ever compared with the
+        # other, and the ordering that existed before the vector index is
+        # reproduced exactly whenever the vector index has nothing to add.
         episodes = sorted(found.values(),
                           key=lambda e: (-e.coverage,
+                                         0 if e.id in lexical else 1,
                                          e.rank - 2.0 * e.effective_salience))
         return episodes[:limit]
 
@@ -1720,12 +1733,13 @@ class Memory:
         user_md: Path = config.USER_MD,
         episodes_db: Path = config.EPISODES_DB,
         profile_json: Path | None = None,
+        embedder: "embed_mod.Embedder | None" = None,
     ) -> None:
         self.luna = Tier1File(luna_md, config.LUNA_MD_CAP, "LUNA.md",
                               cap_key="memory.luna_cap_chars")
         self.user = Tier1File(user_md, config.USER_MD_CAP, "USER.md",
                               cap_key="memory.user_cap_chars")
-        self.episodes = EpisodeStore(episodes_db)
+        self.episodes = EpisodeStore(episodes_db, embedder=embedder)
         # The profile defaults to sitting *beside the episode store it is
         # derived from*, not to a fixed path. That is the honest relationship
         # — tier 3 is a function of tier 2 and belongs with its input — and it
