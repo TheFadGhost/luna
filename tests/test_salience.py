@@ -66,6 +66,34 @@ class ScoreTests(unittest.TestCase):
         self.assertLess(plain, 1.0)
         self.assertEqual(score_salience("no, always use foot"), 1.0)
 
+    def test_bare_actually_and_wrong_are_not_corrections(self):
+        # The two false positives an audit found against the real database:
+        # bare `\bactually\b` and `\b(wrong|incorrect)\b` pinned any memory
+        # containing either word at salience 1.0 forever, with no decay,
+        # whether or not the sentence had anything to do with Luna being
+        # wrong about something. Neither of these is aimed at her at all.
+        for text in [
+            "actually I like this",
+            "my code is wrong",
+            "actually, I think we should ship this on Friday",
+            "actually, that reminds me, I need more coffee",
+            "I think my approach here is wrong somewhere but I can't find it",
+        ]:
+            with self.subTest(text=text):
+                self.assertLess(score_salience(text), config.CORRECTION_SALIENCE)
+
+    def test_second_person_actually_and_wrong_still_pin_to_one(self):
+        # Tightening the patterns must not lose the real corrections they
+        # were written to catch -- just the ones aimed at nothing.
+        for text in [
+            "actually you're wrong about that",
+            "you got that wrong",
+            "your answer was incorrect",
+            "no actually, you misread the config",
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(score_salience(text), config.CORRECTION_SALIENCE)
+
     def test_correction_is_detected_on_the_user_side_only(self):
         # Luna saying "that's wrong" about her own output is not a correction
         # *from the user*, and must not pin the memory forever.

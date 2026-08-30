@@ -315,17 +315,42 @@ class Tier1File:
 # Salience — ARCHITECTURE.md section 4, "Salience and decay"
 # =========================================================================
 
+# A second-person reference ("you", "your", "you're"/"youre"), used below to
+# require that "actually" and "wrong"/"incorrect" be aimed *at Luna* rather
+# than merely present in the message.
+_YOU = r"(?:you'?re|your|you)"
+# A bare "not" reads as a correction's contrastive shape ("it's X, not Y") --
+# the other cue that pairs with "actually" below, alongside second person, to
+# keep "actually it's foot, not alacritty" a correction without a "you" in it
+# anywhere.
+_YOU_OR_CONTRAST = rf"(?:{_YOU}|not)"
+# Same clause, not a later one: no sentence terminator or newline between the
+# two words. "Actually I like this. You should check the logs." must not
+# match just because both words appear somewhere in a longer message.
+_SAME_CLAUSE = r"[^.!?\n]*"
+
 # An explicit correction from the user. Kept tight on purpose: a false
 # positive here pins a memory at 1.0 forever, which is expensive to undo.
+#
+# "actually" and "wrong"/"incorrect" used to be bare word-boundary patterns,
+# so "actually I like this" and "my code is wrong" -- containing neither a
+# correction nor any reference to Luna at all -- pinned an unrelated memory
+# permanently. Both are now anchored to a second-person reference (or, for
+# "actually", the contrastive "X, not Y" shape a correction often takes even
+# without addressing Luna directly) in the same clause: a correction is
+# something aimed at what Luna said or did, not any sentence that happens to
+# contain the word.
 _CORRECTION_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
         r"^\s*no[,.\s]",
         r"\bthat'?s (wrong|not right|incorrect|not what)\b",
-        r"\bactually\b",
+        rf"\bactually\b{_SAME_CLAUSE}\b{_YOU_OR_CONTRAST}\b",
+        rf"\b{_YOU_OR_CONTRAST}\b{_SAME_CLAUSE}\bactually\b",
         r"\bi (said|meant|told you)\b",
         r"\bnot what i\b",
-        r"\b(wrong|incorrect)\b",
+        rf"\b{_YOU}\b{_SAME_CLAUSE}\b(wrong|incorrect)\b",
+        rf"\b(wrong|incorrect)\b{_SAME_CLAUSE}\b{_YOU}\b",
         r"\bcorrection\b",
         r"\binstead of\b",
         r"\bstop (doing|saying|calling)\b",
