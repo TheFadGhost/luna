@@ -185,6 +185,21 @@ class NeverSpeaksCase(AmbientCase):
         with self.assertRaises(ambient.AmbientChannelError):
             ambient._assert_mute(_WithSpeaker(amb))
 
+    def test_assigning_a_talking_watcher_afterwards_is_refused_too(self) -> None:
+        # A rule that holds only until somebody assigns past it is not a rule.
+        # `__init__` cannot see `daemon.ambient.watchers = (...)`, so the
+        # setter runs the same check.
+        amb = self.build()
+
+        class Chatty(ambient.Watcher):
+            name = "crash"
+
+            def say(self, text: str) -> None:  # pragma: no cover
+                raise AssertionError("ambient spoke")
+
+        with self.assertRaises(ambient.AmbientChannelError):
+            amb.watchers = (Chatty({}),)
+
     def test_no_speaker_is_reachable_from_a_real_daemon_s_ambient(self) -> None:
         """The walk. This is the test that fails if someone wires one up.
 

@@ -908,7 +908,8 @@ class Ambient:
         # inside the constructor of the thing that was meant to survive it.
         self._complained = False
         self.state: dict[str, Any] = self._load()
-        self.watchers: tuple[Watcher, ...] = watchers or (
+        self._watchers: tuple[Watcher, ...] = ()
+        self.watchers = watchers or (
             CrashWatcher(self.state.setdefault(CRASH, {})),
             BatteryWatcher(self.state.setdefault(BATTERY, {})),
             UpdateWatcher(self.state.setdefault(UPDATE, {})),
@@ -921,6 +922,27 @@ class Ambient:
         self.delivered = 0
         # Layer 3. Nothing hung off this object may be able to talk.
         _assert_mute(self)
+
+    # -- the hooks -------------------------------------------------------
+
+    @property
+    def watchers(self) -> tuple[Watcher, ...]:
+        return self._watchers
+
+    @watchers.setter
+    def watchers(self, value: Any) -> None:
+        """Assignment is gated, not just construction.
+
+        `_assert_mute` in `__init__` covers the watchers this object builds
+        for itself, which is what production uses. It does not cover
+        `daemon.ambient.watchers = (...)` afterwards -- and a rule that holds
+        only until somebody assigns past it is not a rule. So the setter runs
+        the same check, and the tuple is frozen on the way in so a caller
+        cannot append to it later either.
+        """
+        frozen = tuple(value)
+        _check_mute("watchers", frozen, 0)
+        self._watchers = frozen
 
     # -- settings --------------------------------------------------------
 
