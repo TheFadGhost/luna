@@ -14,7 +14,7 @@ in place and the correction is marked **CORRECTED**.
 
 | Constraint | Consequence |
 |---|---|
-| Ryzen 5 4500U, 7.1 GB RAM, no GPU/NPU | No local LLM as the brain. Cloud agent does the thinking. Only small models run locally (STT ~200 MB, TTS ~60 MB, embeddings ~90 MB). |
+| Ryzen 5 4500U, 7.1 GB RAM, no GPU/NPU | No local LLM as the brain. Cloud agent does the thinking. Only small models run locally (STT ~200 MB, TTS ~60 MB, embeddings ~90 MB — all *file* sizes; resident cost is 2-4× that, which is why each is unloaded when idle). |
 | ~3-4 GB RAM free in practice | Every resident process is budgeted. Total Luna footprint target: < 400 MB. |
 | Other Claude sessions run concurrently | Luna must never restart omarchy-shell, never kill agent processes she didn't spawn. |
 | `omarchy update` clobbers /usr/share/omarchy | Everything Luna owns lives under ~/.config, ~/.local, ~/Work/luna. |
@@ -60,7 +60,7 @@ allowlist. Nothing else in the package may deliver a signal (section 7).
 |---|---|---|---|
 | `lunad` | Python, systemd user unit | ~40 MB | Supervisor. Owns socket, queue, memory, state. Never calls an LLM directly for long jobs. |
 | piper worker | venv python, lazy + idle-unload | ~330 MB while loaded, 0 when idle | Spawned by `lunad`, so `lunad`'s cgroup reads ~470 MB while speaking and ~13 MB otherwise. Estimate of ~60 MB was WRONG. |
-| embeddings | sentence-transformers / ONNX | ~90 MB | Loaded lazily, unloaded after 5 min idle. |
+| embeddings | all-MiniLM-L6-v2 / onnxruntime | 86 MB file, 181 MB resident | Loaded lazily, unloaded after 5 min idle. Absent by default; see §4. |
 | voxtype | already running | ~208 MB | Untouched. We only add a post_process hook. |
 | agent session | foot + claude or codex | ~150-300 MB | Transient, only while working. Which CLI comes from `defaults/agent`; the runner script is written by that agent's adapter (section 6a). |
 
@@ -126,18 +126,179 @@ rather than truncate**. Overflow forces consolidation instead of letting the
 file rot into an unreadable log. Injected once, frozen at session start, so the
 KV-cache prefix stays valid for the whole session.
 
-### Tier 2 — episodic (searched on demand)
+### Tier 2 — episodic (searched on demand) — BUILT
 `~/.local/share/luna/memory/episodes.db` — SQLite.
 - `episodes` table: every exchange, with timestamp, surface, salience score.
 - FTS5 index for keyword recall ("what did we decide about the bar widget").
+- `episode_vectors` table: one 384-float BLOB per episode, for paraphrase
+  recall ("how much charge is left" against an episode that says "battery").
 - a `meta` side table, holding the consolidation watermark and nothing else.
-- `sqlite-vec` + a local 90 MB embedding model for semantic recall. **Still
-  Phase 3** — tier 2 is FTS5 keyword search only today.
 
 **This is our addition, not Hermes'.** Hermes has no native semantic retrieval;
 it outsources that to Honcho (Postgres + pgvector + a second LLM + a paid
 service). That is not viable here, and a local embedding index is strictly
 better than nothing.
+
+#### Why both halves exist
+
+FTS5 alone has a precision problem and a recall problem, and they were fixed
+in that order because the second fix is only safe once the first is in place.
+
+*Precision, fixed first.* A pure-OR query over every non-stopword token let
+the filler sentence "so anyway do you think I should do something about this"
+match **14 of 19** episodes in the real database, six of them on a single
+incidental word. `_content_tokens` now drops a large closed-class stopword
+list and refuses a query with no reasonably rare survivor at all; `search`
+requires every token in the same row (AND) before it will widen to OR; and
+`recall_block` refuses any hit whose **coverage** — the fraction of the
+query's content tokens actually present — is below 0.5. That query now
+matches **0 of 19**.
+
+*Recall, fixed second, and FTS5 structurally cannot do it.* "how much charge
+is left" retrieved **0 of 19** episodes while two of them were about the
+battery. "charge" and "battery" share no token and no stemmer relates them.
+Dictated and spoken input paraphrases constantly, so this is the common case,
+not an edge one.
+
+#### The embedding index
+
+`sentence-transformers/all-MiniLM-L6-v2` — Apache-2.0, compatible with this
+project's MIT licence and credited in the README — 384 dimensions, mean
+pooling, 86 MB of fp32 ONNX, run under **`onnxruntime` alone**: not
+sentence-transformers, not VoiceMem, and **not `sqlite-vec`**. With episodes
+in the hundreds-to-thousands a brute-force cosine over one float32 matrix is
+microseconds, so a native SQLite extension would be a build dependency, a
+packaging problem and an `omarchy update` hazard bought for nothing
+measurable. Vectors are BLOBs in the database that already exists.
+
+No new pip dependency either. The WordPiece tokenizer is ~100 deterministic
+lines of standard library over the model's own `vocab.txt` — `BertTokenizer`
+with the settings `tokenizer_config.json` actually declares — verified against
+published sentence-transformers reference pairs ("a man is eating food" /
+"a man is eating a piece of bread" = 0.755, "that is a happy person" / "today
+is a sunny day" = 0.257). The `tokenizers` package is a Rust wheel and is not
+installed.
+
+Same two-role shape as piper (§5), for the same reason: onnxruntime and numpy
+live only in `~/Work/luna/.venv` and lunad is stock system python. So
+`lunad/embed.py` is *imported* by the daemon as a stdlib subprocess manager
+and *executed as a script* by `config.VENV_PYTHON` as the worker that holds
+the model. Its package imports are guarded so the script half runs without
+them.
+
+#### How a paraphrase gets past the coverage floor without lowering it
+
+The floor stays at 0.5 and means the same thing on both sides: how much of
+what was asked about is actually in this episode. The lexical half measures it
+as a token ratio; the semantic half maps cosine onto the same line through two
+measured anchor points, and each episode keeps the **better** of its two
+readings.
+
+| cosine | coverage | why that anchor |
+|---|---|---|
+| ≤ 0.15 | 0.0 | not a neighbour; contributes nothing at all |
+| 0.29 | 0.5 | exactly the floor — see below |
+| ≥ 0.70 | 1.0 | saturated |
+
+0.29 sits in a gap that was measured rather than chosen. Over 13 labelled
+queries against the real 19-episode database — 8 with known-relevant
+episodes, 5 contentful-but-unrelated controls — the lowest true positive
+scored **0.311** and the highest false positive **0.269**, that FP being
+"what is on my screen right now?" answering "what terminal do I use", which is
+a near-miss rather than nonsense. The gap is narrow because the corpus is
+small; re-measure once tier 2 holds thousands of episodes.
+
+Only the **user's turn** is embedded, not the whole exchange. Measured both
+ways: including Luna's reply recovers exactly one case out of thirteen and
+costs a false positive of the same magnitude, because her replies share a
+great deal of boilerplate with each other. It is also the wrong division of
+labour — FTS5 already indexes both sides, so making the vector cover the
+asker's phrasing gives the union two halves that fail differently.
+
+`search()` sorts in three tiers: coverage, then a hit that contains the words
+ahead of one that merely means the same, then the old `bm25` lifted by decayed
+salience. The middle tier is not a nicety: BM25's IDF collapses toward zero on
+a small corpus, so comparing it directly against a cosine would let a
+paraphrase outrank a literal keyword hit purely because the two numbers are on
+incomparable scales.
+
+#### Nothing may slow down an answer
+
+Recall happens on the ask path, so the discipline is `presence.py`'s.
+
+- **The first question after a restart never waits for the model.** A cold
+  `search` kicks an asynchronous warm-up and returns "no opinion" immediately;
+  the ask is answered on FTS5 alone. Cold start is 0.4 s and is never paid by
+  a question.
+- Once warm, every request carries a hard 250 ms timeout. Measured warm search
+  is **5.8 ms median, 6.8 ms p95** over the real database, including SQLite.
+- Nothing raises. A missing model, a broken venv, a wedged worker or a
+  malformed reply all come back as `{}`, and a failed spawn is *latched* so a
+  hopeless fork is not attempted once per question for the life of the daemon.
+- A content-free query searches neither index. The filler gate runs before
+  both, so the precision fix above cannot be undone by the semantic path, and
+  no model is ever asked about "so anyway do you think I should…".
+
+#### Cost, measured on this machine
+
+| | |
+|---|---|
+| model on disk | 86 MB (+ 226 KB of vocab) |
+| worker resident while loaded | **181 MB** steady, 198–296 MB peak during a backfill |
+| daemon-side cost | nil — the parent is stdlib and a pipe |
+| cold start to first query | 0.40 s, off the ask path |
+| warm query | 5.8 ms median, 6.8 ms p95, 250 ms hard ceiling |
+| per-episode indexing | 28 ms of one core (real corpus), 102 ms worst case |
+| per-episode storage | 1.5 KB |
+
+181 MB is more than the "~90 MB" this document budgeted, and the 90 MB was
+always the *file*, not the process — exactly as with piper, whose 61 MB voice
+costs 331 MB resident. onnxruntime and numpy are 48 MB before a model is
+loaded. Two things keep it honest: the CPU arena allocator is **disabled**
+(left on it never returns memory and a batched backfill permanently set the
+worker at 486 MB), and the worker is **unloaded after 5 minutes idle**, same
+policy as speech.
+
+#### Backfill
+
+Existing episodes have no vectors, and embedding them must never block an
+answer. A background thread, started lazily by the first semantic query, warms
+the worker, hands it the vectors it lacks, and then embeds what is missing in
+batches of four.
+
+- **Resumable by construction.** "What still needs embedding" is an anti-join
+  against `episode_vectors`, and each batch is committed before the next
+  starts. A kill at any point costs at most one batch; there is no cursor to
+  keep consistent and nothing to reset.
+- **Batches are small on purpose.** Batching buys nothing here — 102 ms per
+  episode at batch 1 against 126 ms at batch 32 — and costs memory linearly,
+  198 MB peak against 573 MB, because attention scales with batch × sequence².
+- **Power-aware.** Above 64 outstanding episodes it waits for mains: a
+  first-ever index over thousands is minutes of sustained full-core work for a
+  result nobody is waiting on. Catching up the handful recorded since the last
+  session runs anywhere, and a machine that reports no battery counts as
+  mains. `python3 -m lunad.embed backfill --force` overrides it.
+- The thread exits when it is done rather than looping, so it cannot hold the
+  model against the idle unload it is meant to respect.
+
+#### A fresh clone has no model
+
+Nothing downloads itself behind a question. `Embedder.available()` is false,
+semantic recall is silently off, FTS5 answers alone, and every test in the
+suite is in exactly that state — `tests/_support` points `config.VENV_PYTHON`
+at a path that cannot resolve and `Embedder.python()` reads it late, so the
+suite can neither fork a worker nor load onnxruntime.
+
+```
+python3 -m lunad.embed status      # is it there, is it on, is it warm
+python3 -m lunad.embed fetch       # ~86 MB, sha256-pinned, into ~/.local/share/luna/models/
+python3 -m lunad.embed backfill    # index old episodes now instead of in the background
+```
+
+`fetch` pins the sha256 of both files and only renames a download into place
+once it matches: a silently different model is a silently different index, and
+that would look like recall slowly getting worse rather than like anything
+breaking.
 
 ### Tier 3 — derived profile — BUILT
 `~/.local/share/luna/memory/profile.json` — regenerated from tier 2, never
@@ -800,6 +961,6 @@ reports whether a key exists and where it came from, never the key.
 | P2 | **DONE.** Workspace dispatch + Sol + audit log + PID firewall. | `luna dispatch "..."` runs in the `luna` special workspace and reports back; `luna spawned --check <foreign pid>` refuses. |
 | P2b | **DONE.** Jarvis: config file + hot reload, OpenRouter TTS with piper fallback, confirmation policy, name as a setting. | Edit `~/.config/jarvis/config.toml`, do not restart, hear the change. |
 | P2d | **DONE.** Tier 3 (the derived profile) and the tier-1 consolidation pass, wiring `[memory] consolidate_every_turns`. | `luna memory profile --rebuild` prints facts drawn from real episodes; a pass shows in `luna status` with what it cost. `luna memory consolidate [--dry-run]` runs one on demand, or shows what one would do without doing it. |
-| P3 | Bar widget, ambient hooks (crash/battery/update), semantic recall. | Crash a process, she explains it unprompted. |
+| P3 | Bar widget, ambient hooks (crash/battery/update), ~~semantic recall~~ (done, §4). | Crash a process, she explains it unprompted. |
 
 Each phase is independently useful and independently revertible.
