@@ -13,13 +13,19 @@ failure mode, and it is not "did not consolidate".
 
 from __future__ import annotations
 
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
 import json
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from lunad import agent, config, consolidate
-from lunad.memory import CONSOLIDATED_THROUGH, MemoryCapExceeded
+from lunad.memory import (CONSOLIDATED_THROUGH, EpisodeStore,
+                          MemoryCapExceeded, Tier1File)
 
 from ._support import TempMemoryCase
 
@@ -65,6 +71,35 @@ def proposal(luna_add: list[str] | None = None,
                                    "remove": luna_remove or []},
                        "USER.md": {"add": user_add or [], "remove": []},
                        "note": note})
+
+
+_CLI: Any = None
+
+
+def _cli() -> Any:
+    """``bin/luna`` loaded as a module, once, for the report it prints.
+
+    It is a script rather than a package, so there is no import for it — and
+    the report is the whole of this feature from the user's side, which is a
+    contract with nothing under it unless something loads the file. Importing
+    it runs only the module body: it connects to no socket and reads no
+    config. The escapes are blanked afterwards because they are chosen at
+    import from ``sys.stdout.isatty()``, and assertions that pass only when
+    the suite is piped are worse than none.
+    """
+    global _CLI
+    if _CLI is None:
+        path = Path(__file__).resolve().parent.parent / "bin" / "luna"
+        # Named loader rather than `spec_from_file_location` alone: the file
+        # has no `.py` on it, so there is no extension for importlib to pick a
+        # loader from and it returns None without saying why.
+        loader = importlib.machinery.SourceFileLoader("luna_cli", str(path))
+        spec = importlib.util.spec_from_loader("luna_cli", loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        module.BOLD = module.DIM = module.RESET = ""
+        _CLI = module
+    return _CLI
 
 
 class ConsolidatorCase(TempMemoryCase):
@@ -441,6 +476,301 @@ class ProposalParsingTests(TempMemoryCase):
 
 
 # =========================================================================
+# Running one by hand
+# =========================================================================
+
+
+class ManualPassTests(ConsolidatorCase):
+    """`luna memory consolidate`. Which guards a person may override, and
+    which of them still say no when it is a person asking."""
+
+    def test_a_pass_asked_for_by_hand_runs_now_and_applies_its_proposal(self) -> None:
+        con = self.build(proposal(luna_add=["The bar is omarchy-shell."]))
+        self.seed()
+        result = con.run_manual()
+        self.assertTrue(result["ran"])
+        self.assertTrue(result["manual"])
+        self.assertFalse(result["dry_run"])
+        self.assertEqual(self.memory_obj.luna.entries(),
+                         ["The bar is omarchy-shell."])
+
+    def test_the_interval_floor_does_not_hold_against_a_person(self) -> None:
+        # The floor exists to stop a *timer* running away. There is no timer
+        # here, only someone who typed the command and can see the bill.
+        con = self.build(proposal(luna_add=["a fact"]), min_interval_s=600.0)
+        self.seed()
+        con.run_once()
+        self.memory_obj.episodes.record("something later", "ok", ts=2000.0)
+        result = con.run_manual()
+        self.assertTrue(result["ran"])
+        self.assertGreater(result["floor_left_s"], 0.0)
+
+    def test_the_turn_counter_is_neither_read_nor_reset(self) -> None:
+        # A manual pass that zeroed the counter would silently postpone the
+        # automatic one, and a user who ran one out of curiosity would have
+        # changed a schedule they were only looking at.
+        con = self.build(proposal(luna_add=["a fact"]))
+        self.settings.set("memory.consolidate_every_turns", 4)
+        self.seed()
+        self.assertEqual([con.turn() for _ in range(2)], [False, False])
+        con.run_manual()
+        self.assertEqual(con.turns, 2)
+        self.assertEqual(con.snapshot()["turns_since"], 2)
+
+    def test_the_off_switch_is_not_overridable_by_hand(self) -> None:
+        # `0` promises that nothing is counted and nothing is spent. A command
+        # that spent money anyway would make the promise a lie.
+        con = self.build(proposal(luna_add=["should never be written"]))
+        self.seed()
+        self.settings.set("memory.consolidate_every_turns", 0)
+        for dry in (False, True):
+            result = con.run_manual(dry_run=dry)
+            self.assertFalse(result["ran"])
+            self.assertEqual(result["reason"], "disabled")
+        self.assertEqual(self.adapter.calls, [])
+        self.assertEqual(self.memory_obj.luna.entries(), [])
+
+    def test_nothing_new_is_a_reason_and_not_a_model_call(self) -> None:
+        con = self.build(proposal(luna_add=["should never be written"]))
+        result = con.run_manual()
+        self.assertFalse(result["ran"])
+        self.assertEqual(result["reason"], "no new episodes")
+        self.assertEqual(self.adapter.calls, [])
+
+    def test_one_asked_for_while_a_pass_is_in_flight_refuses(self) -> None:
+        release = threading.Event()
+        started = threading.Event()
+        con = self.build(proposal(luna_add=["a fact"]))
+        self.settings.set("memory.consolidate_every_turns", 1)
+
+        def slow(why: str = "", manual: bool = False) -> None:
+            started.set()
+            release.wait(5.0)
+
+        con.run_once = slow                      # type: ignore[assignment]
+        self.assertTrue(con.turn())
+        self.assertTrue(started.wait(5.0))
+        result = con.run_manual()
+        self.assertFalse(result["ran"])
+        self.assertEqual(result["reason"], "already running")
+        release.set()
+        con.close()
+
+    def test_a_turn_landing_mid_pass_does_not_start_a_second_one(self) -> None:
+        # The same guard from the other side. The daemon answers each
+        # connection on its own thread, so an ask can genuinely complete while
+        # a manual pass is still waiting on the model.
+        con = self.build(proposal())
+        self.seed()
+        self.settings.set("memory.consolidate_every_turns", 1)
+        scripted, turned = self.adapter, []
+
+        class _Reentrant(agent.BaseAdapter):
+            name = "reentrant"
+
+            def available(self) -> tuple[bool, str]:
+                return True, "reentrant adapter"
+
+            def ask(self, *a: Any, **kw: Any) -> agent.AgentReply:
+                turned.append(con.turn())
+                return scripted.ask(*a, **kw)
+
+        self.adapter = _Reentrant()
+        con.run_manual()
+        self.assertEqual(turned, [False])
+        self.assertEqual(con.snapshot()["skipped"], 1)
+        self.assertEqual(len(scripted.calls), 1)
+
+    def test_the_cost_goes_through_the_same_spender(self) -> None:
+        spent: list[float | None] = []
+        con = self.build(proposal(), on_spend=spent.append)
+        self.seed()
+        con.run_manual()
+        self.assertEqual(spent, [0.0004])
+
+    def test_the_audit_entry_says_a_person_asked_for_it(self) -> None:
+        con = self.build(proposal(luna_add=["a fact"]))
+        self.seed()
+        con.run_manual()
+        entry = self.audit.read(action="memory.consolidate")[0]
+        self.assertTrue(entry["manual"])
+        self.assertNotIn("dry_run", entry)
+
+    def test_an_automatic_pass_still_says_it_was_not_asked_for(self) -> None:
+        con = self.build(proposal(luna_add=["a fact"]))
+        self.seed()
+        con.run_once()
+        self.assertFalse(self.audit.read(action="memory.consolidate")[0]["manual"])
+
+
+# =========================================================================
+# The dry run, which is the one that has to be provably unable to write
+# =========================================================================
+
+
+class DryRunTests(ConsolidatorCase):
+    def through(self) -> str:
+        return self.memory_obj.episodes.get_meta(CONSOLIDATED_THROUGH)
+
+    def test_the_whole_proposal_is_reported_and_none_of_it_applied(self) -> None:
+        con = self.build(proposal(luna_add=["The bar is omarchy-shell."],
+                                  user_add=["Writes in British English."]))
+        self.seed()
+        result = con.run_manual(dry_run=True)
+        self.assertTrue(result["ran"])
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(result["added"], 2)
+        self.assertEqual(result["files"]["LUNA.md"]["added"],
+                         ["The bar is omarchy-shell."])
+        self.assertEqual(self.memory_obj.luna.entries(), [])
+        self.assertEqual(self.memory_obj.user.entries(), [])
+
+    def test_it_does_not_reach_a_write_even_when_a_write_would_fail_loudly(self) -> None:
+        # The claim is structural, so it is tested structurally: the two calls
+        # that change state — the tier-1 write and the watermark — are
+        # replaced with something that raises, and the dry run does not
+        # notice. This is the test that fails the day somebody implements a
+        # preview as "apply it and put it back".
+        con = self.build(proposal(luna_add=["a fact"], luna_remove=[0]))
+        self.memory_obj.luna.replace(["the entry it wants to drop"])
+        self.seed()
+
+        def boom(*a: Any, **kw: Any) -> Any:
+            raise AssertionError("a dry run reached a write")
+
+        write, watermark = Tier1File.replace, EpisodeStore.set_meta
+        Tier1File.replace = boom                 # type: ignore[assignment]
+        EpisodeStore.set_meta = boom             # type: ignore[assignment]
+        try:
+            result = con.run_manual(dry_run=True)
+        finally:
+            Tier1File.replace = write            # type: ignore[assignment]
+            EpisodeStore.set_meta = watermark    # type: ignore[assignment]
+        self.assertTrue(result["ran"])
+        self.assertEqual(result["files"]["LUNA.md"]["added"], ["a fact"])
+        self.assertEqual(self.memory_obj.luna.entries(),
+                         ["the entry it wants to drop"])
+
+    def test_the_watermark_stays_put_so_the_next_pass_sees_the_same_batch(self) -> None:
+        # Moved by a preview, the episodes you looked at would be skipped by
+        # the pass you were deciding whether to allow.
+        con = self.build(proposal(luna_add=["a fact"]))
+        self.seed(3)
+        con.run_manual(dry_run=True)
+        self.assertEqual(self.through(), "")
+        result = con.run_manual()
+        self.assertEqual(result["episodes"], 3)
+        self.assertEqual(self.through(), "3")
+
+    def test_tier_three_is_in_the_prompt_and_not_on_the_disk(self) -> None:
+        con = self.build(proposal())
+        self.memory_obj.episodes.record("I use quickshell.", "ok", ts=1.0,
+                                        salience=0.4)
+        self.memory_obj.episodes.record("I use quickshell.", "ok", ts=2.0,
+                                        salience=0.4)
+        con.run_manual(dry_run=True)
+        self.assertIn("quickshell (x2)", self.adapter.calls[0]["prompt"])
+        self.assertFalse(self.memory_obj.profile.status()["exists"])
+
+    def test_the_prompt_is_the_one_the_real_pass_would_have_sent(self) -> None:
+        # A preview built from a different prompt is a preview of something
+        # else, and the difference would not show in the output.
+        con = self.build(proposal())
+        self.seed(2)
+        con.run_manual(dry_run=True)
+        con.run_manual()
+        previewed, applied = self.adapter.calls
+        self.assertEqual(previewed["prompt"], applied["prompt"])
+        self.assertEqual(previewed["system_prompt"], applied["system_prompt"])
+
+    def test_a_removal_is_shown_with_its_index_and_its_text(self) -> None:
+        con = self.build(proposal(luna_remove=[1]))
+        self.memory_obj.luna.replace(["keep this", "this one is wrong",
+                                      "keep this too"])
+        self.seed()
+        record = con.run_manual(dry_run=True)["files"]["LUNA.md"]
+        self.assertEqual(record["removed"], ["this one is wrong"])
+        self.assertEqual(record["removed_index"], [1])
+        self.assertEqual(self.memory_obj.luna.entries(),
+                         ["keep this", "this one is wrong", "keep this too"])
+
+    def test_a_proposal_that_would_not_fit_is_previewed_as_refused(self) -> None:
+        self.settings.set("memory.luna_cap_chars", 200)
+        con = self.build(proposal(luna_add=["y" * 400]))
+        self.seed()
+        record = con.run_manual(dry_run=True)["files"]["LUNA.md"]
+        self.assertEqual(record["added"], [])
+        self.assertEqual(record["over_cap"]["cap"], 200)
+        self.assertGreater(record["over_cap"]["overflow"], 0)
+        self.assertEqual(record["refused"]["added"],
+                         ["y" * config.CONSOLIDATE_ENTRY_CHARS])
+
+    def test_it_costs_what_the_pass_it_previews_costs(self) -> None:
+        spent: list[float | None] = []
+        con = self.build(proposal(), on_spend=spent.append)
+        self.seed()
+        con.run_manual(dry_run=True)
+        self.assertEqual(spent, [0.0004])
+        snapshot = con.snapshot()
+        self.assertEqual(snapshot["previews"], 1)
+        self.assertEqual(snapshot["passes"], 0)
+        self.assertAlmostEqual(snapshot["cost_usd"], 0.0004)
+
+    def test_an_unreadable_reply_is_a_failure_and_still_writes_nothing(self) -> None:
+        con = self.build("I had a look and there's nothing worth keeping!")
+        self.seed(2)
+        result = con.run_manual(dry_run=True)
+        self.assertTrue(result["ran"])
+        self.assertFalse(result["parsed"])
+        self.assertEqual(self.through(), "")
+        self.assertEqual(con.snapshot()["failures"], 1)
+
+    def test_an_agent_that_cannot_be_reached_spends_nothing(self) -> None:
+        con = self.build(adapter=ScriptedAdapter(
+            raises=agent.AgentUnavailable("no claude on this machine")))
+        self.seed(2)
+        result = con.run_manual(dry_run=True)
+        self.assertFalse(result["ran"])
+        self.assertEqual(result["reason"], "agent unavailable")
+        self.assertEqual(self.through(), "")
+
+    def test_the_audit_entry_cannot_be_mistaken_for_a_write(self) -> None:
+        # Somebody grepping the log for what was removed from LUNA.md must not
+        # find this entry and believe it.
+        con = self.build(proposal(luna_add=["a fact"], luna_remove=[0]))
+        self.memory_obj.luna.replace(["an entry"])
+        self.seed()
+        con.run_manual(dry_run=True)
+        entry = self.audit.read(action="memory.consolidate")[0]
+        self.assertTrue(entry["dry_run"])
+        self.assertTrue(entry["manual"])
+        self.assertEqual(entry["would_add"], 1)
+        self.assertEqual(entry["would_remove"], 1)
+        self.assertNotIn("added", entry)
+        self.assertNotIn("removed", entry)
+
+
+class PreviewEditTests(TempMemoryCase):
+    """The pure half of the dry run: lists and an integer, no file anywhere."""
+
+    def test_it_reports_the_file_the_pass_would_have_left(self) -> None:
+        record = consolidate.preview_edit(
+            "LUNA.md", ["keep this", "drop this"], 3000, ["and add this"], [1])
+        self.assertEqual(record["added"], ["and add this"])
+        self.assertEqual(record["removed"], ["drop this"])
+        self.assertEqual(record["removed_index"], [1])
+        self.assertEqual(record["usage"]["entries"], 2)
+        self.assertIsNone(record["over_cap"])
+
+    def test_the_cap_arithmetic_is_the_one_the_write_would_have_done(self) -> None:
+        record = consolidate.preview_edit("LUNA.md", ["a"], 20, ["y" * 100], [])
+        self.assertEqual(record["added"], [])
+        self.assertEqual(record["over_cap"]["error"], "MemoryCapExceeded")
+        self.assertEqual(record["over_cap"]["cap"], 20)
+        self.assertEqual(record["refused"]["added"], ["y" * 100])
+
+
+# =========================================================================
 # Through the daemon
 # =========================================================================
 
@@ -521,3 +851,140 @@ class DaemonWiringTests(TempMemoryCase):
         self.assertTrue(entries[0]["ok"])
         self.assertEqual(entries[0]["added"], 1)
         self.assertNotIn("undo", entries[0])
+
+    def test_the_consolidate_op_runs_one_on_the_spot(self) -> None:
+        d = self.daemon(proposal(luna_add=["The bar is omarchy-shell."]))
+        d.memory.episodes.record("the bar is omarchy-shell", "noted", ts=1.0)
+        resp = d.dispatch({"op": "memory.consolidate"})
+        self.assertTrue(resp["ok"])
+        self.assertTrue(resp["ran"])
+        self.assertTrue(resp["manual"])
+        self.assertFalse(resp["dry_run"])
+        self.assertEqual(d.memory.luna.entries(), ["The bar is omarchy-shell."])
+        # Through the daemon's own money counter, like every other spend.
+        self.assertAlmostEqual(d.cost_usd, 0.0004)
+
+    def test_the_consolidate_op_dry_runs_without_touching_anything(self) -> None:
+        d = self.daemon(proposal(luna_add=["The bar is omarchy-shell."]))
+        d.memory.episodes.record("the bar is omarchy-shell", "noted", ts=1.0)
+        resp = d.dispatch({"op": "memory.consolidate", "dry_run": True})
+        self.assertTrue(resp["dry_run"])
+        self.assertEqual(resp["files"]["LUNA.md"]["added"],
+                         ["The bar is omarchy-shell."])
+        self.assertEqual(d.memory.luna.entries(), [])
+        self.assertEqual(d.memory.episodes.get_meta(CONSOLIDATED_THROUGH), "")
+
+    def test_status_counts_a_dry_run_apart_from_a_pass(self) -> None:
+        d = self.daemon()
+        d.memory.episodes.record("something to think about", "ok", ts=1.0)
+        d.dispatch({"op": "memory.consolidate", "dry_run": True})
+        block = d.dispatch({"op": "status"})["consolidation"]
+        self.assertEqual(block["previews"], 1)
+        self.assertEqual(block["passes"], 0)
+        self.assertFalse(block["running"])
+
+
+# =========================================================================
+# What it prints, which is the whole of the feature from the outside
+# =========================================================================
+
+
+class ReportTests(TempMemoryCase):
+    """`bin/luna`'s consolidation report.
+
+    The daemon can be right and the command still useless: a pass that did
+    nothing and said nothing about why is the one answer a person cannot act
+    on. So each outcome is asserted to name its own cause.
+    """
+
+    def printed(self, resp: dict[str, Any]) -> tuple[int, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = _cli()._print_consolidation(resp)
+        return code, out.getvalue() + err.getvalue()
+
+    def test_every_way_of_doing_nothing_says_which_guard_said_no(self) -> None:
+        for reason, expected in (
+                ("no new episodes", "no exchanges recorded since"),
+                ("already running", "a pass is already running"),
+                ("disabled", "consolidate_every_turns = 0"),
+        ):
+            code, text = self.printed({"ran": False, "reason": reason,
+                                       "after_id": 4})
+            self.assertEqual(code, 0, reason)
+            self.assertIn(expected, text)
+
+    def test_the_off_switch_is_printed_with_the_way_to_turn_it_on(self) -> None:
+        _, text = self.printed({"ran": False, "reason": "disabled"})
+        self.assertIn("luna settings set memory.consolidate_every_turns 12",
+                      text)
+
+    def test_an_unreachable_agent_is_a_failure_and_says_nothing_was_spent(self) -> None:
+        code, text = self.printed({"ran": False, "reason": "agent unavailable",
+                                   "detail": "no claude on this machine"})
+        self.assertEqual(code, 1)
+        self.assertIn("nothing was spent", text)
+        self.assertIn("no claude on this machine", text)
+
+    def test_a_dry_run_leads_with_the_fact_that_it_wrote_nothing(self) -> None:
+        code, text = self.printed(self.report(dry_run=True))
+        self.assertEqual(code, 0)
+        self.assertTrue(text.startswith("dry run — nothing was written."))
+        self.assertIn("would consolidate 3 episode(s)", text)
+        self.assertIn("+ The bar is omarchy-shell.", text)
+        self.assertIn("- [2] Uses waybar.", text)
+        self.assertIn("the watermark did not move", text)
+        self.assertIn("luna memory consolidate", text)
+
+    def test_an_applied_pass_prints_what_went_in_and_what_came_out(self) -> None:
+        code, text = self.printed(self.report())
+        self.assertEqual(code, 0)
+        self.assertIn("consolidated 3 episode(s)", text)
+        self.assertNotIn("would consolidate", text)
+        self.assertIn("+ The bar is omarchy-shell.", text)
+        self.assertIn("$0.0004", text)
+        self.assertIn("note: promoted one standing fact", text)
+        # The file the pass had nothing to do to is named as untouched rather
+        # than measured, because this pass is not why it is the size it is.
+        self.assertIn("USER.md unchanged", text)
+
+    def test_an_overridden_floor_is_reported_rather_than_hidden(self) -> None:
+        _, text = self.printed({**self.report(), "floor_left_s": 212.0})
+        self.assertIn("212s of the interval floor", text)
+
+    def test_a_reply_that_could_not_be_read_is_a_failure(self) -> None:
+        code, text = self.printed({**self.report(), "parsed": False,
+                                   "files": {}, "note": ""})
+        self.assertEqual(code, 1)
+        self.assertIn("could not be read as a proposal", text)
+
+    def test_an_overflow_names_the_entry_that_would_not_fit(self) -> None:
+        report = self.report()
+        report["files"]["LUNA.md"] = {
+            "added": [], "removed": [], "removed_index": [],
+            "over_cap": {"cap": 3000, "overflow": 42, "proposed_chars": 3042},
+            "refused": {"added": ["The bar is omarchy-shell."], "removed": []},
+            "usage": {"file": "LUNA.md", "chars": 3042, "cap": 3000,
+                      "pct": 101.4, "entries": 12},
+        }
+        _, text = self.printed(report)
+        self.assertIn("rejected whole", text)
+        self.assertIn("over cap by 42 chars", text)
+        self.assertIn("would not have fitted: The bar is omarchy-shell.", text)
+
+    def report(self, dry_run: bool = False) -> dict[str, Any]:
+        """One pass as the daemon reports it, applied or previewed."""
+        return {
+            "ok": True, "ran": True, "manual": True, "dry_run": dry_run,
+            "parsed": True, "episodes": 3, "through_id": 7,
+            "cost_usd": 0.0004, "wall_ms": 1200,
+            "note": "promoted one standing fact", "floor_left_s": 0.0,
+            "files": {
+                "LUNA.md": {"added": ["The bar is omarchy-shell."],
+                            "removed": ["Uses waybar."], "removed_index": [2],
+                            "over_cap": None,
+                            "usage": {"file": "LUNA.md", "chars": 120,
+                                      "cap": 3000, "pct": 4.0, "entries": 3}},
+                "USER.md": {"added": [], "removed": [], "over_cap": None},
+            },
+        }

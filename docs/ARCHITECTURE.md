@@ -73,10 +73,11 @@ is the only thing that touches memory or spawns agents. This is what stops the
 system becoming four half-integrations that each grew their own state.
 
 Requests, as built: `ping`, `ask`, `say`, `speak.cancel`, `session.reset`,
-`status`, `memory.{read,write,search,profile}`, `dispatch`, `jobs`, `peek`,
-`audit`, `spawned`, `cancel`, `shutdown`. `memory.read`/`memory.write` take an
-optional `namespace` (`luna` or `sol`); `memory.profile` is Luna's only —
-Sol's namespace is a working set for one job, not a model of a person.
+`status`, `memory.{read,write,search,profile,consolidate}`, `dispatch`,
+`jobs`, `peek`, `audit`, `spawned`, `cancel`, `shutdown`.
+`memory.read`/`memory.write` take an optional `namespace` (`luna` or `sol`);
+`memory.profile` and `memory.consolidate` are Luna's only — Sol's namespace is
+a working set for one job, not a model of a person.
 `subscribe` (for the bar widget's live state) was dropped in favour of a state
 file — see below. `listen_start` was dropped too: the keybind talks to voxtype
 directly, so the daemon never needs to start a recording.
@@ -239,6 +240,36 @@ that would be the silent rot the cap exists to prevent, arriving through the
 back door of the feature meant to relieve it. The model is shown the cap, the
 usage and the numbered entries and can propose removals instead.
 
+**One can be asked for, and looked at first.** `luna memory consolidate`
+runs a pass now, synchronously, on the daemon's request thread, and prints what
+it changed; `--dry-run` makes the same model call on the same episodes and
+applies none of it. Waiting twelve turns to find out what a feature does to a
+curated file is the wrong shape for something that spends real money, and a
+write that has no undo needs a way to be read before it happens.
+
+A manual run is past exactly two guards, and they are the two the person typing
+the command is overriding on purpose: the turn counter, and the interval floor.
+Everything else holds. Single flight matters most — the daemon answers each
+connection on its own thread, so two of these in two terminals are genuinely
+simultaneous — and `consolidate_every_turns = 0` still refuses, because that
+setting's promise is that no tokens are spent and a command that spent them
+anyway would make it a lie. A manual pass does not touch the turn counter, and
+lands in `on_spend`, the log and the audit log exactly like an automatic one,
+with `manual: true` on the entry.
+
+The dry run is a second path through `consolidate.py` rather than the first one
+with a flag on it, and deliberately not "apply, then put it back": `replace`
+has no inverse, so there would be nothing to put it back with. The two calls
+that change anything — `Tier1File.replace` and the watermark's `set_meta` —
+appear nowhere in `Consolidator.preview`. What it calls instead is
+`preview_edit`, a function over a list of entries and an integer cap that has
+never been handed a file, and tier 3 is rebuilt with `persist=False`. **The
+watermark does not move**, which is the part that would be cruel to get wrong:
+advanced by a preview, the episodes you had just looked at would be skipped by
+the pass you were deciding whether to allow. Its audit entry says `dry_run:
+true` and counts `would_add`/`would_remove`, so nobody reading the log for what
+was removed from `LUNA.md` can find a preview and believe it.
+
 **It is safe to interrupt.** Tier-1 writes go through the same
 temp-file-then-rename path as any other write, so a daemon killed mid-pass
 leaves either the old file or the new one. The watermark — the id of the last
@@ -257,7 +288,9 @@ second time either, and paying twice for the same unusable answer is exactly
 the runaway worth avoiding. The cost lands in `luna status`, in a `consolidated`
 log line shaped like the ordinary `reply` line, and in one `luna audit` entry
 per pass carrying the text of anything removed. No undo is claimed: `replace`
-has no inverse, and a fabricated undo command is worse than none.
+has no inverse, and a fabricated undo command is worse than none. What is
+offered instead is the look before the leap — `luna memory consolidate
+--dry-run`, above.
 
 ## 5. Voice
 
@@ -766,7 +799,7 @@ reports whether a key exists and where it came from, never the key.
 | P1 | **DONE.** piper TTS out, voxtype routing in, session reuse, cost fix. | F10, speak, she answers aloud. Plain dictation (F9) still types — regression-tested. |
 | P2 | **DONE.** Workspace dispatch + Sol + audit log + PID firewall. | `luna dispatch "..."` runs in the `luna` special workspace and reports back; `luna spawned --check <foreign pid>` refuses. |
 | P2b | **DONE.** Jarvis: config file + hot reload, OpenRouter TTS with piper fallback, confirmation policy, name as a setting. | Edit `~/.config/jarvis/config.toml`, do not restart, hear the change. |
-| P2d | **DONE.** Tier 3 (the derived profile) and the tier-1 consolidation pass, wiring `[memory] consolidate_every_turns`. | `luna memory profile --rebuild` prints facts drawn from real episodes; a pass shows in `luna status` with what it cost. |
+| P2d | **DONE.** Tier 3 (the derived profile) and the tier-1 consolidation pass, wiring `[memory] consolidate_every_turns`. | `luna memory profile --rebuild` prints facts drawn from real episodes; a pass shows in `luna status` with what it cost. `luna memory consolidate [--dry-run]` runs one on demand, or shows what one would do without doing it. |
 | P3 | Bar widget, ambient hooks (crash/battery/update), semantic recall. | Crash a process, she explains it unprompted. |
 
 Each phase is independently useful and independently revertible.

@@ -527,11 +527,13 @@ is not under `$HOME` instead.
   That is the correct answer most of the time and it still costs one call.
   `[memory] consolidate_every_turns = 0` is the off switch and it is honoured
   completely — nothing is counted and no call is made.
-- **A consolidation write has no undo.** It goes through `replace`, which
-  discards text nothing else keeps, and this project does not claim inverses it
-  does not have. The audit entry carries the verbatim text of everything a pass
-  removed, so a deletion is recoverable by reading the log; that is the most
-  that can honestly be offered.
+- **A consolidation write still has no undo, but it can now be read first.**
+  It goes through `replace`, which discards text nothing else keeps, and this
+  project does not claim inverses it does not have. Two things stand in for
+  one: `luna memory consolidate --dry-run` shows the whole proposal before
+  anything is applied, and the audit entry of a pass that did run carries the
+  verbatim text of everything it removed, so a deletion is recoverable by
+  reading the log.
 - **`fallback_on_empty` cannot be disabled.** Every Luna recording leaves the
   raw transcript on the clipboard. Harmless, but it does clobber the clipboard
   on every voice turn. If that becomes annoying the only fix is upstream.
@@ -743,3 +745,63 @@ now does — is **write them through** to the file that owns them.
   from 59. Verified against the live machine read-only: drift reported none,
   `stale()` reported false, and the real voxtype was neither written to nor
   restarted.
+
+### Consolidation you can ask for, and look at first (2026-08-30)
+
+The pass that landed this morning was correct and unusable: to see one happen
+you had to talk to Luna twelve times, and there was no way at all to find out
+what it would do to `LUNA.md` before it did it. That is the wrong shape for
+code that spends real money and rewrites a file the user curates by hand.
+
+- **`luna memory consolidate`** runs one pass now, synchronously, and prints
+  what it added, what it removed verbatim, what it cost, and — when it did
+  nothing — which guard said no and what to do about it. Every "did nothing"
+  is a sentence with a remedy in it, because a blank line and an exit code is
+  the one answer a person cannot act on.
+- **`luna memory consolidate --dry-run`** makes the same model call on the same
+  episodes with the same prompt, prints the proposal in full, and applies none
+  of it. This is the one that matters: it is how you decide whether to trust
+  the pass before letting it near tier 1.
+- **The dry run is structurally unable to write, and that is testable.** It is
+  a second path through `consolidate.py`, not the first one with a flag on it,
+  and emphatically not "apply and then put it back" — `replace` has no inverse,
+  so there would be nothing to put it back with. `Tier1File.replace` and the
+  watermark's `set_meta` appear nowhere in `Consolidator.preview`; the
+  proposal is rendered by `preview_edit`, a function over a list of strings and
+  an integer cap that has never been handed a file; tier 3 is rebuilt with the
+  new `persist=False`. The test replaces both of those calls with something
+  that raises and the dry run does not notice.
+- **The watermark is the thing it would have been cruel to get wrong.** A
+  preview that advanced it would cause the next real pass to skip precisely the
+  episodes you had just been shown and approved. It is read and left alone, and
+  there is a test that previews, then runs for real, and asserts the same three
+  episodes arrive both times.
+- **Two guards are overridden and the rest are not.** The turn counter and the
+  five-minute floor, because asking for a pass by hand *is* that override —
+  and the floor's remaining seconds are printed rather than silently ignored,
+  so the command does not look like it behaves differently from the docs.
+  Single flight holds in both directions: the daemon answers each connection on
+  its own thread, so two of these in two terminals are simultaneous, and a turn
+  landing mid-pass no longer starts a second one. `_busy` replaced "is my
+  thread alive" for exactly that reason — a manual pass runs on the caller's
+  thread and there is no thread of ours to ask about.
+- **`= 0` refuses a manual run too.** It would have been easy to treat the CLI
+  as an override of everything, and wrong: `0` is what a user sets when a pass
+  has surprised them on their bill, and its promise is that no tokens are
+  spent. The refusal names the setting and prints the command that turns it
+  back on.
+- **The audit trail distinguishes all three.** Every consolidation entry now
+  carries `manual`, and a dry run carries `dry_run: true` and counts
+  `would_add`/`would_remove` rather than `added`/`removed` — so somebody
+  grepping the log for what was removed from `LUNA.md` cannot find a preview
+  and believe it.
+- **The report reuses `luna status`'s occupancy meter** rather than drawing a
+  second one from the same number, which is a difference waiting to happen.
+  `bin/luna` gained its first test as well: it is a script and not a package,
+  so the tests load it through `SourceFileLoader` (there is no extension for
+  `spec_from_file_location` to infer a loader from, and it returns `None`
+  without saying why) and blank the escapes, which are chosen at import from
+  `isatty` and would otherwise make the assertions depend on whether the suite
+  was piped.
+- 649 tests pass in the root suite, up from 615; 98 in `jarvis-settings`,
+  unchanged.

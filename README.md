@@ -31,6 +31,8 @@ bin/luna hush                     # stop speaking now
 bin/luna memory show
 bin/luna memory search "bar widget"
 bin/luna memory profile --rebuild # the derived profile (tier 3)
+bin/luna memory consolidate       # one pass now, not on the 12th turn
+bin/luna memory consolidate --dry-run   # ...and what it would write, first
 
 bin/luna dispatch "go and work this out"   # a worker, in the luna workspace
 bin/luna dispatch --to sol "..."           # the specialist
@@ -149,7 +151,10 @@ library.
 Every N turns a background pass reads the new episodes, rebuilds tier 3, and
 proposes edits to tier 1 through the model — under exactly the same cap rules
 as any other write, so a proposal that does not fit is rejected whole rather
-than truncated. `[memory] consolidate_every_turns = 0` turns it off completely.
+than truncated. `[memory] consolidate_every_turns = 0` turns it off completely,
+by hand as well as on the counter. `luna memory consolidate` runs a pass now
+instead of waiting for the count, and `--dry-run` shows you what one would
+write without writing any of it.
 
 Two deliberate departures from Hermes. It outsources semantic retrieval to a
 paid cloud service (Postgres + pgvector + a second LLM), which is not viable on

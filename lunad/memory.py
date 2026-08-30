@@ -1072,7 +1072,8 @@ class Profile:
     # -- writing ---------------------------------------------------------
 
     def rebuild(self, store: EpisodeStore, limit: int | None = None,
-                now: float | None = None) -> dict[str, Any]:
+                now: float | None = None,
+                persist: bool = True) -> dict[str, Any]:
         """Regenerate the whole profile from tier 2 and write it atomically.
 
         Bounded by ``[PROFILE_WINDOW]`` episodes, newest kept, for two
@@ -1080,6 +1081,13 @@ class Profile:
         milliseconds. And truth — a profile built from every exchange since
         the daemon was installed describes a person who no longer exists, and
         the user's habits from six months ago are not evidence about today.
+
+        ``persist=False`` returns the same payload and writes nothing. It has
+        exactly one caller — the consolidation dry run, which has to build its
+        prompt from the same tier 3 a real pass would read, and which claims
+        to leave no trace on disk. Without it the claim would be false by one
+        file: ``profile.json`` is derived and reproducible, but a dry run that
+        rewrites it is still a dry run that wrote something.
         """
         window = config.PROFILE_WINDOW if limit is None else limit
         stamp = time.time() if now is None else now
@@ -1098,7 +1106,8 @@ class Profile:
             "facts": extract_facts(episodes),
             "persona": accumulate_persona(episodes),
         }
-        self.write(payload)
+        if persist:
+            self.write(payload)
         return payload
 
     def write(self, payload: dict[str, Any]) -> Path:
