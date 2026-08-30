@@ -24,12 +24,12 @@ import shutil
 import unittest
 from pathlib import Path
 
-from ._support import (FORBIDDEN_APLAY, FORBIDDEN_HYPRCTL,
+from ._support import (FORBIDDEN_APLAY, FORBIDDEN_GRIM, FORBIDDEN_HYPRCTL,
                        FORBIDDEN_JOBS_DIR, FORBIDDEN_NOTIFIER,
                        FORBIDDEN_PYTHON, FORBIDDEN_STATE_FILE,
                        FORBIDDEN_TERMINAL, FakeHyprland, TempMemoryCase)
 
-from lunad import config, confirm, dispatch, presence, speech
+from lunad import config, confirm, context, dispatch, presence, speech
 
 #: Every ``config`` name that reaches the outside world, and what it would do
 #: to the machine running the suite if it were the real thing.
@@ -39,6 +39,7 @@ DISARMED = {
     "APLAY_BIN": (FORBIDDEN_APLAY, "plays audio out of the user's speakers"),
     "HYPRCTL_BIN": (FORBIDDEN_HYPRCTL, "moves the user's workspaces"),
     "VENV_PYTHON": (FORBIDDEN_PYTHON, "forks a real 331 MB piper worker"),
+    "GRIM_BIN": (FORBIDDEN_GRIM, "photographs the user's screen"),
 }
 
 
@@ -138,6 +139,34 @@ class ConstructionCase(TempMemoryCase):
                                 notify_bin="/bin/true")
         self.assertEqual(d.terminal, "/bin/bash")
         self.assertEqual(d.notify_bin, "/bin/true")
+
+
+class SightCase(unittest.TestCase):
+    """Nothing in the suite may look at the machine it is running on.
+
+    Worse than the terminal and the notifier, because grim *is* installed here:
+    an unstubbed default would not fail, it would succeed, and the evidence
+    would be a PNG of whatever the person running the suite had open.
+    """
+
+    def test_a_look_cannot_photograph_the_users_screen(self) -> None:
+        with self.assertRaises(context.LookUnavailable) as caught:
+            with context.look("screen"):
+                self.fail("a screenshot was actually taken")
+        self.assertIn(FORBIDDEN_GRIM, str(caught.exception))
+
+    def test_the_compositor_is_not_queried_either(self) -> None:
+        # config.HYPRCTL_BIN is already a sentinel; this is the assertion that
+        # context.py reads it late rather than binding it, and that a
+        # compositor it cannot reach is "no context line" and never an
+        # exception on the ask path.
+        self.assertIsNone(context.focused_window())
+        self.assertEqual(context.context_line(), "")
+
+    def test_vision_reports_itself_unavailable(self) -> None:
+        ok, detail = context.available()
+        self.assertFalse(ok)
+        self.assertIn(FORBIDDEN_GRIM, detail)
 
 
 class PresenceFileCase(unittest.TestCase):

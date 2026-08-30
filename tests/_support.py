@@ -76,14 +76,25 @@ config.TERMINAL_BIN = FORBIDDEN_TERMINAL
 #:   NOTIFY_BIN   - puts a real toast on the user's desktop
 #:   APLAY_BIN    - plays audio out of the user's speakers
 #:   HYPRCTL_BIN  - installs window rules and moves the user's workspaces
+#:   GRIM_BIN     - takes a real screenshot of the user's screen
 #:   VENV_PYTHON  - forks a real 331 MB piper worker
 #:   JOBS_DIR     - lets the job collector delete the user's own job records
 #:                  (see FORBIDDEN_JOBS_DIR below; that one has to resolve)
+#: ``GRIM_BIN`` is the sharpest of these and the newest. It is the one name in
+#: this list that, left alone, does not merely open a window or make a noise:
+#: it photographs whatever the person running the suite has on screen. grim is
+#: genuinely installed here, so an unstubbed default would *work* — a test
+#: asserting that a look produces a PNG would produce a real picture of the
+#: user's desktop, and then hand the path to whatever the test did next.
+#: Replaced process-wide with a name `shutil.which` cannot resolve, which is
+#: what `context.capture` turns into a `LookUnavailable` naming the fix.
+FORBIDDEN_GRIM = "luna-tests-must-pass-grim=/bin/true"
 FORBIDDEN_NOTIFIER = "luna-tests-must-pass-notify_bin=/bin/true"
 FORBIDDEN_APLAY = "luna-tests-must-pass-aplay=/bin/true"
 FORBIDDEN_HYPRCTL = "luna-tests-must-pass-hypr=FakeHyprland"
 FORBIDDEN_PYTHON = Path("/nonexistent/luna-tests-must-pass-python")
 
+config.GRIM_BIN = FORBIDDEN_GRIM
 config.NOTIFY_BIN = FORBIDDEN_NOTIFIER
 config.APLAY_BIN = FORBIDDEN_APLAY
 config.HYPRCTL_BIN = FORBIDDEN_HYPRCTL

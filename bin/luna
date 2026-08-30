@@ -127,6 +127,45 @@ def cmd_ask(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_look(args: argparse.Namespace) -> int:
+    """Show Luna the screen and ask her about it.
+
+    An ask with a picture attached, not a separate mode: same conversation,
+    same memory, same episode written afterwards. The screenshot is taken by
+    the daemon at the moment of the call and deleted when it returns — there is
+    no ambient capture and no file left behind.
+    """
+    question = " ".join(args.question).strip()
+    with Client(timeout=args.timeout + 30) as client:
+        request_id = uuid.uuid4().hex[:12]
+        try:
+            payload = {"scope": args.scope, "timeout": args.timeout,
+                       "id": request_id, "surface": args.surface,
+                       "remember": not args.no_remember,
+                       "conversation": args.conversation}
+            if question:
+                payload["prompt"] = question
+            if args.speak:
+                payload["speak"] = True
+            resp = client.call("look", **payload)
+        except KeyboardInterrupt:
+            with Client(timeout=10) as c2:
+                c2.call("cancel", target=request_id)
+            sys.stderr.write("\nluna: cancelled\n")
+            return 130
+    if args.json:
+        print(json.dumps(resp, indent=2))
+        return 0 if resp.get("ok") else 1
+    if not resp.get("ok"):
+        return fail(resp)
+    print(resp["reply"])
+    if args.verbose:
+        sys.stderr.write(f"{DIM}[{resp.get('model') or resp.get('agent')} · "
+                         f"{args.scope} · "
+                         f"{resp.get('wall_ms', 0) / 1000:.1f}s]{RESET}\n")
+    return 0
+
+
 def cmd_say(args: argparse.Namespace) -> int:
     text = " ".join(args.text).strip() or sys.stdin.read().strip()
     if not text:
@@ -209,6 +248,18 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"  socket   {d['socket']}")
     print(f"  agent    {a['name']} "
           f"({'ready' if a['available'] else 'UNAVAILABLE'}) — {a['detail']}")
+    # What she can do this session. `tools` is the line worth reading: it is
+    # what her operating notes were written against, and an assistant whose
+    # prompt says she has a shell when this says no is the failure this whole
+    # change exists to remove.
+    brain = [str(a.get("model") or "agent default"),
+             "tools" if a.get("tools") else f"{BOLD}no tools{RESET}"]
+    if a.get("sandbox"):
+        brain.append(f"sandbox {a['sandbox']}")
+    vis = resp.get("vision") or {}
+    brain.append("can see" if vis.get("available")
+                 else f"cannot see ({vis.get('detail', 'unknown')})")
+    print(f"           {DIM}{' · '.join(brain)}{RESET}")
     for name, u in m["tier1"].items():
         print(f"  {name:<8} [{_meter(u['pct'])}] "
               f"{u['chars']}/{u['cap']} chars "
@@ -836,6 +887,20 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("-v", "--verbose", action="store_true",
                      help="print model, latency and cost to stderr")
     ask.set_defaults(func=cmd_ask)
+
+    lk = sub.add_parser("look", help="show her the screen and ask about it")
+    lk.add_argument("question", nargs="*",
+                    help="what to ask about it; omit for a description")
+    lk.add_argument("--scope", default="window", choices=["window", "screen"],
+                    help="the focused window (default) or the whole screen")
+    lk.add_argument("--speak", action="store_true")
+    lk.add_argument("--surface", default="cli")
+    lk.add_argument("--conversation", default="default")
+    lk.add_argument("--no-remember", action="store_true")
+    lk.add_argument("--timeout", type=float, default=180.0)
+    lk.add_argument("--json", action="store_true")
+    lk.add_argument("-v", "--verbose", action="store_true")
+    lk.set_defaults(func=cmd_look)
 
     st = sub.add_parser("status", help="daemon and memory state")
     st.set_defaults(func=cmd_status)

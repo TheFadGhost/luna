@@ -24,9 +24,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import (__version__, agent, audit as audit_mod, config, confirm,
-               consolidate, dispatch, log as luna_log, persona,
-               presence as presence_mod, protocol, safety,
-               session as sessions, settings as settings_mod, speech)
+               consolidate, context as context_mod, dispatch,
+               log as luna_log, persona, presence as presence_mod, protocol,
+               safety, session as sessions, settings as settings_mod, speech)
 from .memory import (Memory, MemoryCapExceeded, MemoryError as LunaMemoryError,
                      SolMemory)
 
@@ -36,6 +36,47 @@ log = logging.getLogger("lunad.server")
 # =========================================================================
 # Daemon state
 # =========================================================================
+
+
+class ReportingDispatcher(dispatch.Dispatcher):
+    """A dispatcher that closes the loop back to Luna.
+
+    The user's requirement, in their words: "it will go do that, and then it
+    will report back to me whenever everything is done, and then update memory
+    accordingly." The first half already existed — a finished job puts a toast
+    on the desktop. The second did not: the job's output lived in
+    ``jobs/<id>/output.txt`` and nowhere Luna would ever read it, so every
+    delegated piece of work was forgotten the moment it succeeded and she
+    could be told the same finding twice in a week.
+
+    So a finished job is written into tier 2 as an episode, in the same place
+    and the same shape as an exchange the user had with her directly. It is
+    then searchable by the ordinary recall path, which means the next question
+    on the subject retrieves what Sol found without anyone naming a job id.
+
+    Implemented as a subclass rather than a change to ``dispatch.py`` because
+    the dispatcher has no business knowing what memory is: it owns terminals,
+    pids and exit codes. ``notify_finished`` is the one hook it already calls
+    exactly once per job, at the point the outcome is known and written.
+    """
+
+    def __init__(self, *args: Any, on_finished: Any = None, **kw: Any) -> None:
+        super().__init__(*args, **kw)
+        self.on_finished = on_finished
+
+    def notify_finished(self, job: dispatch.Job) -> bool:
+        # The toast first and unconditionally. Recording is the part that can
+        # be got wrong; telling the user is the part that must not be lost to
+        # it, and `[ui] notify_on_finish` is the only thing allowed to
+        # suppress it.
+        notified = super().notify_finished(job)
+        if self.on_finished is not None:
+            try:
+                self.on_finished(job)
+            except Exception:  # noqa: BLE001 - a memory fault is not a failed job
+                log.exception("could not record a finished job",
+                              extra={"job_id": job.id})
+        return notified
 
 
 class Daemon:
@@ -67,9 +108,27 @@ class Daemon:
         safety.set_audit_hook(self.audit.hook)
         self.confirm = confirm.ConfirmBroker(settings=self.settings,
                                              audit=self.audit)
+        # Before the dispatcher, because the dispatcher needs it. `--agent`
+        # beats the config, the config beats Omarchy's default. The CLI flag is
+        # an operator override for one run and must not be silently replaced by
+        # a file the operator did not look at; the Omarchy file is the fallback
+        # and not the source of truth, because it is the *desktop's* default
+        # agent and other things read it.
+        self.agent_name = (agent_name
+                           or str(self.settings.get("assistant.agent") or "")
+                           or agent.read_default_agent()).lower()
+        self.adapter = agent.get_adapter(self.agent_name)
+        # `agent_name=` is not optional here even though it looks it. Without
+        # it Dispatcher falls back to `read_default_agent()` — the Omarchy
+        # file, which says "claude" on this machine — and every job Luna
+        # delegated would have been written in the wrong CLI's flags while she
+        # herself ran on codex. Nothing would have crashed; the jobs would just
+        # all have failed.
         self.dispatcher = (dispatcher if dispatcher is not None
-                           else dispatch.Dispatcher(audit=self.audit,
-                                                    confirm=self.confirm))
+                           else ReportingDispatcher(
+                               audit=self.audit, confirm=self.confirm,
+                               agent_name=self.agent_name,
+                               on_finished=self._job_finished))
         # Exactly one broker in the process, whoever built the dispatcher. Two
         # would mean a question raised by a dispatch could not be answered
         # through `luna confirm`, because the pending map it looks in would be
@@ -80,13 +139,6 @@ class Daemon:
         # for it to answer a question about the weather.
         self.dispatcher.start_gc()
         self.runs = agent.RunRegistry()
-        # `--agent` beats the config, the config beats Omarchy's default. The
-        # CLI flag is an operator override for one run and must not be silently
-        # replaced by a file the operator did not look at.
-        self.agent_name = (agent_name
-                           or str(self.settings.get("assistant.agent") or "")
-                           or agent.read_default_agent()).lower()
-        self.adapter = agent.get_adapter(self.agent_name)
         self.persona_spec = persona.load_spec()
         self.counters: dict[str, int] = {"ask": 0, "errors": 0, "cancelled": 0,
                                          "said": 0}
@@ -201,6 +253,7 @@ class Daemon:
 
     def op_status(self, req: dict[str, Any]) -> dict[str, Any]:
         available, detail = self.adapter.available()
+        can_see, see_detail = context_mod.available()
         with self._lock:
             counters = dict(self.counters)
             cost = round(self.cost_usd, 6)
@@ -222,7 +275,18 @@ class Daemon:
                 "available": available,
                 "detail": detail,
                 "timeout_s": config.AGENT_TIMEOUT_S,
+                # What she can do this session, not what she could in theory.
+                # `tools` is what her operating notes were written against, so
+                # a status that disagreed with it would be the harder of the
+                # two bugs to find.
+                "model": str(self.settings.get("assistant.model") or "")
+                         or getattr(self.adapter, "model", None),
+                "tools": bool(self.adapter.ask_has_tools),
+                "sandbox": (config.CODEX_ASK_SANDBOX
+                            if self.agent_name == "codex" else None),
             },
+            vision={"available": can_see, "detail": see_detail,
+                    "scopes": list(context_mod.SCOPES)},
             memory=self.memory.usage(),
             consolidation=self.consolidator.snapshot(),
             activity={
@@ -306,9 +370,19 @@ class Daemon:
         # unchanged from turn to turn and the prompt cache is read rather than
         # rewritten. Recall belongs to this turn, so it goes in the message.
         who = settings_mod.assistant_name()
-        system_prompt = persona.build_system_prompt(tier1, self.persona_spec,
-                                                    name=who)
-        message = persona.build_user_message(prompt, recall, surface)
+        # `tools` is a reading of the adapter, not a constant: her operating
+        # notes must describe the agent actually answering. It is stable for
+        # the life of a session, so it does not disturb the prefix.
+        system_prompt = persona.build_system_prompt(
+            tier1, self.persona_spec, name=who,
+            tools=bool(self.adapter.ask_has_tools))
+        # The focused window, in the *user* message. Always on, by the user's
+        # explicit request, and bounded hard: one hyprctl query with a one
+        # second ceiling, and any failure at all means the ask goes out without
+        # it. A context line is worth twenty tokens; it is not worth a question
+        # that does not get answered.
+        message = persona.build_user_message(
+            prompt, recall, surface, context_line=context_mod.context_line())
         # Her name is in the prefix, so it is in the fingerprint: renaming her
         # must retire the warm sessions rather than resume one whose cached
         # prefix still introduces her by the old name.
@@ -327,9 +401,19 @@ class Daemon:
                                "recalled": bool(recall),
                                "conversation": conversation,
                                "resuming": bool(args.get("resume"))})
+        scope = req.get("look")
         try:
-            reply = self._ask_agent(req, message, system_prompt, args, run,
-                                    sess, conversation, prefix, request_id)
+            if scope:
+                # The screenshot exists only inside this block. `look()` deletes
+                # it in a `finally`, so an agent call that raised leaves no
+                # picture of the user's screen behind on disk.
+                with context_mod.look(str(scope)) as shot:
+                    reply = self._ask_agent(req, message, system_prompt, args,
+                                            run, sess, conversation, prefix,
+                                            request_id, images=(str(shot),))
+            else:
+                reply = self._ask_agent(req, message, system_prompt, args, run,
+                                        sess, conversation, prefix, request_id)
         finally:
             self.runs.done(run)
             self._publish_state()
@@ -373,6 +457,38 @@ class Daemon:
         payload["consolidating"] = self.consolidator.turn()
         return protocol.ok(request_id, **payload)
 
+    def _job_finished(self, job: dispatch.Job) -> None:
+        """Write a finished job into tier 2, so delegation compounds.
+
+        Recorded as an exchange, because that is what it is: the "user" side is
+        the task Luna sent out and the "assistant" side is what came back. It
+        lands in her own namespace rather than Sol's — Sol keeps his working
+        notes in `memory/sol/SOL.md`, but the *finding* belongs to the person
+        who asked for it, and Luna is the one who will be asked about it again.
+
+        `surface="dispatch"` distinguishes it from something the user said out
+        loud. Nothing filters on it today; it is there so that a later reader
+        of the episode store can tell a delegated result from a conversation,
+        which is a distinction that cannot be recovered afterwards.
+        """
+        output = (job.read_output(limit=config.CONSOLIDATE_EPISODE_CHARS * 8)
+                  or "").strip()
+        if job.state != "finished":
+            outcome = f"[{job.state}"
+            if job.exit_code is not None:
+                outcome += f", exit {job.exit_code}"
+            outcome += "] " + (output or "no output")
+        else:
+            outcome = output or "finished with no output"
+        who = (settings_mod.specialist_name() if job.to == "sol"
+               else "a worker")
+        episode = self.memory.episodes.record(
+            f"[delegated to {who} — job {job.id}] {job.task.strip()}",
+            outcome, surface="dispatch")
+        log.info("recorded a finished job in tier 2",
+                 extra={"job_id": job.id, "episode": episode.id,
+                        "state": job.state})
+
     def _spend(self, cost_usd: float | None) -> None:
         """Add a metered cost to the session total, from any thread.
 
@@ -390,7 +506,8 @@ class Daemon:
     def _ask_agent(self, req: dict[str, Any], message: str, system_prompt: str,
                    args: dict[str, Any], run: agent.AgentRun,
                    sess: sessions.Session | None, conversation: str,
-                   prefix: str, request_id: str) -> agent.AgentReply:
+                   prefix: str, request_id: str,
+                   images: tuple[str, ...] = ()) -> agent.AgentReply:
         """One agent call, with a single retry if a resume is refused.
 
         A resumable session id can go stale under the daemon — the agent's own
@@ -409,7 +526,7 @@ class Daemon:
                                     model=model,
                                     session_id=args.get("session_id"),
                                     resume=args.get("resume"),
-                                    timeout=timeout, run=run)
+                                    timeout=timeout, run=run, images=images)
         except agent.AgentFailed as exc:
             if not args.get("resume") or sess is None:
                 raise
@@ -422,7 +539,7 @@ class Daemon:
             return self.adapter.ask(message, system_prompt,
                                     model=model,
                                     session_id=fresh.session_id, resume=None,
-                                    timeout=timeout, run=run)
+                                    timeout=timeout, run=run, images=images)
 
     def _speak_safely(self, text: str) -> str | None:
         """Speak, but never let a mute speaker turn into a failed ask."""
@@ -435,6 +552,40 @@ class Daemon:
         with self._lock:
             self.counters["said"] += 1
         return result.get("spoken") or None
+
+    def op_look(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Ask about what is on the screen, with a screenshot attached.
+
+        An ask with a picture, and nothing more than that: the same session,
+        the same memory, the same recall, the same episode written afterwards.
+        Luna does not have a separate "vision mode" because the model does not
+        — `gpt-5.6-luna` sees natively and `codex exec -i` attaches the file to
+        the turn. There is no second model here and no HTTP call of any kind.
+
+        The capture happens inside `_ask`, so it is bounded by the same request
+        and deleted by the same `finally`. Nothing is captured unless this op
+        was called: the daemon never photographs the screen on its own.
+        """
+        scope = str(req.get("scope") or "window").strip().lower()
+        if scope not in context_mod.SCOPES:
+            raise protocol.ProtocolError(
+                f"unknown look scope {scope!r}; expected one of "
+                + ", ".join(context_mod.SCOPES))
+        if not self.adapter.accepts_images:
+            # Said plainly rather than answered from the window title, which is
+            # what a silently-dropped image would produce: a confident
+            # description of a screen nobody looked at.
+            return protocol.err(
+                req.get("id"), "LookUnavailable",
+                f"the {self.agent_name} adapter cannot be shown an image. "
+                "Luna sees through codex + gpt-5.6-luna: set "
+                "`[assistant] agent = \"codex\"`.")
+        prompt = req.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            prompt = ("What is on the screen right now? Describe what matters, "
+                      "briefly.")
+        return self.op_ask({**req, "op": "ask", "prompt": prompt,
+                            "look": scope})
 
     def op_say(self, req: dict[str, Any]) -> dict[str, Any]:
         text = req.get("text")
@@ -882,6 +1033,7 @@ class Daemon:
             "ping": self.op_ping,
             "status": self.op_status,
             "ask": self.op_ask,
+            "look": self.op_look,
             "say": self.op_say,
             "speak.cancel": self.op_speak_cancel,
             "session.reset": self.op_session_reset,
@@ -923,6 +1075,13 @@ class Daemon:
             with self._lock:
                 self.counters["errors"] += 1
             log.warning("agent error", extra={"op": op, "detail": str(exc)})
+            return protocol.err(req.get("id"), **_strip(exc.to_dict()))
+        except context_mod.LookUnavailable as exc:
+            # A desktop that cannot be photographed — no grim, no compositor —
+            # is a fact about the machine and belongs in the reply, not in the
+            # error counter and not in a traceback.
+            log.warning("could not take a look", extra={"op": op,
+                                                        "detail": str(exc)})
             return protocol.err(req.get("id"), **_strip(exc.to_dict()))
         except dispatch.DispatchError as exc:
             with self._lock:
