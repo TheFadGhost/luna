@@ -8,6 +8,8 @@ import unittest
 
 from lunad import config
 from lunad.memory import (
+    EPISODE_TEXT_CHARS,
+    SIMILARITY_QUERY_CHARS,
     FTS5Unavailable,
     MemoryError as LunaMemoryError,
     assert_fts5,
@@ -136,6 +138,36 @@ class EpisodeStoreTests(TempMemoryCase):
             store.record("please fix the flickering bar", "still looking")
         last = store.record("please fix the flickering bar", "fixed")
         self.assertGreater(last.salience, first.salience)
+
+    def test_count_similar_caps_the_query_to_a_prefix_of_a_long_message(self):
+        # count_similar used to build_fts_query() the entire, uncapped
+        # message on every write -- a long dictated transcript made that
+        # OR-query (proportional to token count) expensive every turn. The
+        # same word, same message, is seen when it falls inside the cap and
+        # invisible past it: that difference is the cap, and nothing else
+        # ("xylophone" never appears in the stored episode at all).
+        store = self.episodes()
+        store.record("please remember the special unicorn codeword", "ok")
+        padding = "xylophone " * ((SIMILARITY_QUERY_CHARS // 10) + 5)
+        self.assertGreater(len(padding), SIMILARITY_QUERY_CHARS)
+        self.assertEqual(store.count_similar(padding + "unicorn"), 0)
+        self.assertEqual(store.count_similar("unicorn " + padding), 1)
+
+    def test_record_clips_pathologically_long_text(self):
+        store = self.episodes()
+        ep = store.record("a" * (EPISODE_TEXT_CHARS + 5000),
+                          "b" * (EPISODE_TEXT_CHARS + 5000))
+        self.assertEqual(len(ep.user_text), EPISODE_TEXT_CHARS)
+        self.assertEqual(len(ep.luna_text), EPISODE_TEXT_CHARS)
+        [stored] = store.recent()
+        self.assertEqual(len(stored.user_text), EPISODE_TEXT_CHARS)
+        self.assertEqual(len(stored.luna_text), EPISODE_TEXT_CHARS)
+
+    def test_ordinary_length_text_is_unaffected_by_the_cap(self):
+        store = self.episodes()
+        ep = store.record("a normal message", "a normal reply")
+        self.assertEqual(ep.user_text, "a normal message")
+        self.assertEqual(ep.luna_text, "a normal reply")
 
     def test_decay_is_applied_at_read_time_and_rows_are_untouched(self):
         store = self.episodes()

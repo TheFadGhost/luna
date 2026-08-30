@@ -532,6 +532,26 @@ CREATE TABLE IF NOT EXISTS meta (
 #: system that loses things quietly is the failure worth designing against.
 CONSOLIDATED_THROUGH = "consolidated_through_id"
 
+#: Longest prefix of a message ``count_similar`` will build its FTS query
+#: from. The query is an OR (or AND, then OR) over every surviving token, so
+#: its cost tracks the message length; a long dictated transcript recorded on
+#: every turn would make that expensive on every write for no benefit --
+#: whatever makes a message "look like" a prior episode is set well before
+#: two thousand characters in.
+SIMILARITY_QUERY_CHARS = 2000
+
+#: Longest text ``EpisodeStore.record`` stores per side of an exchange.
+#: Generous on purpose -- this is not one of tier 1's tight curated caps, it
+#: exists only to put a ceiling under a single pathological write (a
+#: dictation session that never found a pause). Tier 2 is meant to hold real
+#: exchanges verbatim; this only bites the tail nobody would read back anyway.
+EPISODE_TEXT_CHARS = 20_000
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit]
+
+
 _FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 
 # Deliberately large. The old ~30-word list let filler survive: "so anyway do
@@ -726,8 +746,12 @@ class EpisodeStore:
     # -- writing ---------------------------------------------------------
 
     def count_similar(self, user_text: str) -> int:
-        """How many prior episodes look like this one (for the repetition term)."""
-        query = build_fts_query(user_text)
+        """How many prior episodes look like this one (for the repetition term).
+
+        Queried from at most :data:`SIMILARITY_QUERY_CHARS` of ``user_text``,
+        not the whole thing -- see that constant.
+        """
+        query = build_fts_query(_clip(user_text, SIMILARITY_QUERY_CHARS))
         if not query:
             return 0
         try:
@@ -749,6 +773,12 @@ class EpisodeStore:
         ts: float | None = None,
         salience: float | None = None,
     ) -> Episode:
+        # See EPISODE_TEXT_CHARS: a ceiling under one pathological write, not
+        # a curated-tier cap. Clipped before scoring too, so a long
+        # transcript's salience is computed from the same text that gets
+        # stored and searched, not from an uncapped string that never lands.
+        user_text = _clip(user_text, EPISODE_TEXT_CHARS)
+        luna_text = _clip(luna_text, EPISODE_TEXT_CHARS)
         ts = time.time() if ts is None else ts
         if salience is None:
             salience = score_salience(
