@@ -40,7 +40,7 @@ system.
 | 1 | Assistant | `[assistant]` — name, specialist, agent, model |
 | 2 | Voice | `[voice]` — provider, TTS model, both voice pickers with per-voice preview, fallback, speed, spoken-length cap |
 | 3 | Listening | `[listen]` — provider, STT model and language, **written through to `~/.config/voxtype/config.toml`**; the on/off switch, which is the router's; and the keybind, **displayed, not editable** (it lives in `~/.config/hypr/bindings.lua`) |
-| 4 | Confirmations | `[confirm]` + `[confirm.prompt]` — a three-way **Never ask / Ask first / Never allow** per action class, plus the four immovable denies |
+| 4 | Confirmations | `[confirm]` + `[confirm.prompt]` — a three-way **Allow / Ask first / Refuse** per action class, each row saying in words what its answer does, plus the four immovable denies |
 | 5 | Memory | `[memory]` caps and decay, live usage bars read from `~/.local/share/luna/memory/`, and a read-only **View memories** window |
 | 6 | Jobs | `[dispatch]` plus the recent job list read from `~/.local/share/luna/jobs/` |
 | 7 | About | daemon status, version, whether an API key exists (never the key), links to the audit and daemon logs, and any config keys Jarvis does not recognise |
@@ -160,7 +160,7 @@ jarvis-settings/
   jarvis/
     app.py               # Gtk.Application, window chrome, sidebar, --pane
     panes.py             # the seven panes + the Binder that types every control
-    widgets.py           # section header, separator, card, row, button, TriToggle
+    widgets.py           # section header, separator, group, row, button, TriToggle
     theme.py             # palette -> GTK4 CSS, design tokens, ThemeWatch
     editor.py            # validate -> coalesce -> apply live -> persist
     config.py            # load / validate / atomic 0600 save
