@@ -907,7 +907,16 @@ class Ambient:
         # very first read must produce a warning, not an AttributeError
         # inside the constructor of the thing that was meant to survive it.
         self._complained = False
+        #: The payload last written (or read). `_save` compares against it and
+        #: skips a write that would change nothing -- including the very first
+        #: one after a restart that found the machine exactly as it left it.
+        self._saved: str | None = None
         self.state: dict[str, Any] = self._load()
+        try:
+            self._saved = json.dumps(self.state, ensure_ascii=False,
+                                     sort_keys=True)
+        except (TypeError, ValueError):
+            self._saved = None
         self._watchers: tuple[Watcher, ...] = ()
         self.watchers = watchers or (
             CrashWatcher(self.state.setdefault(CRASH, {})),
@@ -1087,21 +1096,36 @@ class Ambient:
         return data if isinstance(data, dict) else {}
 
     def _save(self) -> None:
-        """Best-effort, atomic. Nothing here may fail an event.
+        """Best-effort, atomic, and a no-op when nothing actually moved.
 
-        Same contract as ``presence.py``: this is called from a background
-        thread on a machine whose disk may be full, and a state file that
-        cannot be written costs one repeated notification after a restart, not
-        a daemon.
+        The skip is not an optimisation, it is the polling discipline. Every
+        tick ends here, and an unconditional write would put 1440 rewrites a
+        day on the SSD of a laptop where the watchers found nothing at all --
+        which is most days. Serialising to compare costs a few hundred
+        microseconds on a state of this size and saves the write entirely.
+
+        Otherwise the same contract as ``presence.py``: this is called from a
+        background thread on a machine whose disk may be full, and a state
+        file that cannot be written costs one repeated notification after a
+        restart, not a daemon.
         """
+        try:
+            payload = json.dumps(self.state, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            self._complain("ambient state will not serialise", exc)
+            return
+        if payload == self._saved:
+            return
         tmp = self._state_path.with_name(self._state_path.name + ".tmp")
         try:
             config.ensure_parent(self._state_path, existed=self._dir_existed)
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(self.state, fh, ensure_ascii=False)
+                fh.write(payload)
             os.replace(tmp, self._state_path)
         except OSError as exc:
             self._complain("could not write the ambient state", exc)
+            return
+        self._saved = payload
 
     def _complain(self, what: str, exc: BaseException) -> None:
         if self._complained:

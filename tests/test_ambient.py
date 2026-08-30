@@ -792,6 +792,37 @@ class StateCase(AmbientCase):
         (self.root / "nope").write_text("a file, not a directory")
         self.assertEqual(amb.tick(now=0.0), 0)
 
+    def test_an_idle_tick_does_not_rewrite_the_state_file(self) -> None:
+        """The polling discipline reaches the disk, not just the CPU.
+
+        Every tick ends in `_save`. Unconditional, that is 1440 rewrites a day
+        on a laptop SSD for a machine where the watchers found nothing -- which
+        is most days.
+        """
+        self.dump("foot", 5, 1_787_717_400_000_000)
+        amb = self.build()
+        amb.tick(now=0.0)
+        path = self.root / "ambient.json"
+        stamp = path.stat().st_mtime_ns
+        for n in range(1, 6):
+            amb.tick(now=n * 1000.0)
+        self.assertEqual(path.stat().st_mtime_ns, stamp,
+                         "an idle tick rewrote the state file")
+        # And a tick that finds something still writes.
+        self.dump("foot", 6, 1_787_717_500_000_000)
+        amb.tick(now=9000.0)
+        self.assertNotEqual(path.stat().st_mtime_ns, stamp)
+
+    def test_a_restart_that_changes_nothing_does_not_rewrite_either(self) -> None:
+        self.dump("foot", 5, 1_787_717_400_000_000)
+        first = self.build()
+        first.tick(now=0.0)
+        first.close()
+        stamp = (self.root / "ambient.json").stat().st_mtime_ns
+        second = self.build()
+        second.tick(now=0.0)
+        self.assertEqual((self.root / "ambient.json").stat().st_mtime_ns, stamp)
+
     def test_the_recent_list_is_capped(self) -> None:
         for n in range(config.AMBIENT_RECENT_DUMPS + 20):
             self.dump("foot", 1000 + n, 1_787_717_400_000_000 + n)
