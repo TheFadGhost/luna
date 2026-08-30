@@ -24,8 +24,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import (__version__, agent, audit as audit_mod, config, confirm,
-               consolidate, dispatch, log as luna_log, persona, protocol,
-               safety, session as sessions, settings as settings_mod, speech)
+               consolidate, dispatch, log as luna_log, persona,
+               presence as presence_mod, protocol, safety,
+               session as sessions, settings as settings_mod, speech)
 from .memory import (Memory, MemoryCapExceeded, MemoryError as LunaMemoryError,
                      SolMemory)
 
@@ -95,7 +96,13 @@ class Daemon:
         # only starts on the first `say`, and dies again after five idle
         # minutes. Constructing it here means `status` can report why TTS is
         # unavailable without anyone having tried to speak first.
-        self.speech = speech.Speech(settings=self.settings)
+        #
+        # Presence comes first because Speech reports its own transitions into
+        # it: it publishes `idle`/`thinking`/`speaking` to the file the bar
+        # widget watches.
+        self.presence = presence_mod.Presence()
+        self.speech = speech.Speech(settings=self.settings,
+                                    on_activity=self._publish_state)
         # The consolidation pass. `adapter` is a callable and not the adapter
         # itself, because `_settings_changed` rebinds `self.adapter` when the
         # user switches agent, and a background thread holding the old object
@@ -109,12 +116,32 @@ class Daemon:
             "daemon initialised",
             extra={"agent": self.agent_name, "version": __version__},
         )
+        self._publish_state()
         self.audit.append("daemon.started", ok=True, agent=self.agent_name,
                           version=__version__,
                           why="lunad came up",
                           assistant=settings_mod.assistant_name(),
                           config=str(self.settings.path),
                           tracked_pids=len(safety.ledger()))
+
+    # -- presence --------------------------------------------------------
+
+    def _publish_state(self) -> None:
+        """Recompute the one word the desktop reads, and publish it.
+
+        Derived rather than assigned, so the callers do not have to agree on
+        an order: speech finishing while an ask is still running leaves
+        `thinking`, and an ask finishing while she is mid-sentence leaves
+        `speaking`. Speaking wins over thinking because it is the state you
+        can act on — it is what `luna hush` interrupts.
+        """
+        if self.speech.speaking:
+            state = presence_mod.SPEAKING
+        elif len(self.runs):
+            state = presence_mod.THINKING
+        else:
+            state = presence_mod.IDLE
+        self.presence.set(state)
 
     # -- hot reload ------------------------------------------------------
 
@@ -170,6 +197,7 @@ class Daemon:
                 "pid": os.getpid(),
                 "uptime_s": round(time.time() - self.started, 1),
                 "socket": str(config.SOCKET_PATH),
+                "state_file": str(config.STATE_FILE),
                 "state_dir": str(config.STATE_DIR),
                 "log": str(config.LOG_PATH),
                 "threads": threading.active_count(),
@@ -277,6 +305,7 @@ class Daemon:
                 if explicit else self.sessions.args_for(sess))
 
         run = self.runs.new(prompt, surface, request_id)
+        self._publish_state()
         log.info("ask", extra={"req_id": request_id, "surface": surface,
                                "prompt_chars": len(prompt),
                                "system_chars": len(system_prompt),
@@ -288,6 +317,7 @@ class Daemon:
                                     sess, conversation, prefix, request_id)
         finally:
             self.runs.done(run)
+            self._publish_state()
 
         if sess is not None:
             self.sessions.succeeded(sess, reply.cost_usd, reply.session_id)
@@ -879,6 +909,9 @@ class Daemon:
                                 f"{type(exc).__name__}: {exc}")
 
     def close(self) -> None:
+        # First, so the bar stops claiming she is here while the rest of the
+        # shutdown (cancelling runs, draining speech) takes its time.
+        self.presence.clear()
         self.settings.stop_watching()
         # Before the memory it writes into is closed, and bounded so a wedged
         # agent cannot hold the daemon's shutdown open.
@@ -1005,8 +1038,25 @@ def _clear_stale_socket(path: Path) -> None:
 
 def serve(agent_name: str | None = None) -> int:
     """Run until SIGTERM/SIGINT. Returns a process exit code."""
+    # Before anything is built, not inside LunaServer where it used to happen
+    # alone. A second lunad now finds the live one and gives up while it is
+    # still nothing but a function call -- so it cannot append a
+    # `daemon.started` line the machine never saw, and, since presence became
+    # a file, cannot overwrite the state the running daemon is publishing and
+    # leave the bar describing the wrong process. LunaServer still calls this
+    # for callers that build one directly; on this path it finds nothing to do.
+    _clear_stale_socket(config.SOCKET_PATH)
     daemon = Daemon(agent_name)
-    server = LunaServer(config.SOCKET_PATH, daemon)
+    try:
+        server = LunaServer(config.SOCKET_PATH, daemon)
+    except BaseException:
+        # Constructing the daemon already published `idle` to the desktop and
+        # opened everything else it owns. If the socket cannot be had -- a
+        # runtime path too long for AF_UNIX, a permission fault -- none of that
+        # may be left behind, or the bar spends the rest of the session showing
+        # an assistant that exited during startup.
+        daemon.close()
+        raise
     stopping = threading.Event()
 
     def _stop(signum: int, _frame: Any) -> None:

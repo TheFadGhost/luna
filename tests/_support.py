@@ -24,6 +24,8 @@ being a signature default.
 
 from __future__ import annotations
 
+import atexit
+import shutil
 import sys
 import tempfile
 import unittest
@@ -83,6 +85,19 @@ config.NOTIFY_BIN = FORBIDDEN_NOTIFIER
 config.APLAY_BIN = FORBIDDEN_APLAY
 config.HYPRCTL_BIN = FORBIDDEN_HYPRCTL
 config.VENV_PYTHON = FORBIDDEN_PYTHON
+
+#: The same class of bug, one step further out: not a binary but a *file the
+#: desktop is reading*. ``config.STATE_FILE`` is what the Luna bar widget
+#: watches, so a test that builds a ``Daemon`` -- or a bare ``Presence`` --
+#: against the real path would overwrite the running daemon's published state
+#: and leave the bar showing `thinking` forever, with nothing on screen to say
+#: a test suite did it. Redirected process-wide into a temporary directory,
+#: read late in ``Presence.__init__`` so the redirect actually takes.
+_STATE_DIR = Path(tempfile.mkdtemp(prefix="luna-tests-state-"))
+atexit.register(shutil.rmtree, _STATE_DIR, True)
+FORBIDDEN_STATE_FILE = _STATE_DIR / "state"
+
+config.STATE_FILE = FORBIDDEN_STATE_FILE
 
 
 class FakeHyprland:

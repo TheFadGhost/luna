@@ -25,10 +25,10 @@ import unittest
 from pathlib import Path
 
 from ._support import (FORBIDDEN_APLAY, FORBIDDEN_HYPRCTL, FORBIDDEN_NOTIFIER,
-                       FORBIDDEN_PYTHON, FORBIDDEN_TERMINAL, FakeHyprland,
-                       TempMemoryCase)
+                       FORBIDDEN_PYTHON, FORBIDDEN_STATE_FILE,
+                       FORBIDDEN_TERMINAL, FakeHyprland, TempMemoryCase)
 
-from lunad import config, confirm, dispatch, speech
+from lunad import config, confirm, dispatch, presence, speech
 
 #: Every ``config`` name that reaches the outside world, and what it would do
 #: to the machine running the suite if it were the real thing.
@@ -123,6 +123,28 @@ class ConstructionCase(TempMemoryCase):
                                 notify_bin="/bin/true")
         self.assertEqual(d.terminal, "/bin/bash")
         self.assertEqual(d.notify_bin, "/bin/true")
+
+
+class PresenceFileCase(unittest.TestCase):
+    """The state file the bar watches is not the user's.
+
+    Not a binary, but the same shape of harm: writing the real
+    ``$XDG_RUNTIME_DIR/luna/state`` from a test would overwrite what the live
+    daemon published and leave the bar widget stuck on a state that is not
+    happening, with nothing on screen to explain it.
+    """
+
+    def test_the_state_file_is_redirected(self) -> None:
+        self.assertEqual(config.STATE_FILE, FORBIDDEN_STATE_FILE)
+        self.assertNotIn("/run/user", str(config.STATE_FILE))
+
+    def test_presence_reads_the_path_late(self) -> None:
+        # A default bound in the signature would be fixed at import and the
+        # redirect above could never reach it -- the exact bug this file
+        # exists for, one class of object further along.
+        params = inspect.signature(presence.Presence.__init__).parameters
+        self.assertIsNone(params["path"].default)
+        self.assertEqual(presence.Presence().path, FORBIDDEN_STATE_FILE)
 
 
 class LiveFireCase(TempMemoryCase):

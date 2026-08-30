@@ -17,6 +17,8 @@ from ._support import FakeHyprland, TempMemoryCase
 
 
 class MuteSpeech:
+    speaking = False
+
     def say(self, text: str, wait: bool = False, timeout: float = 0.0):
         return {"spoken": text, "sentences": 1, "id": "fake", "cancelled": False}
 

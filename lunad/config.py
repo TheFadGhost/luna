@@ -47,6 +47,12 @@ SOL_PERSONA_PATH = DATA_DIR / "sol-persona.md"
 RUNTIME_DIR = _xdg("XDG_RUNTIME_DIR", Path(f"/run/user/{os.getuid()}")) / "luna"
 SOCKET_PATH = RUNTIME_DIR / "luna.sock"
 
+# Luna's coarse state, one ASCII word, for anything on the desktop that wants
+# to show what she is doing without holding a connection open. See
+# lunad/presence.py for the contract and for why it is a file and not a
+# subscription. Beside the socket on purpose: same tmpfs, same lifetime.
+STATE_FILE = RUNTIME_DIR / "state"
+
 OMARCHY_DEFAULT_AGENT = HOME / ".config" / "omarchy" / "defaults" / "agent"
 
 # --- Jarvis: the app's own configuration home ------------------------------
