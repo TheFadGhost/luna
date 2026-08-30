@@ -470,6 +470,11 @@ class Settings:
         self._listeners: list[Callable[[list[dict[str, Any]]], None]] = []
         self._watcher: threading.Thread | None = None
         self._stop = threading.Event()
+        #: Whether the config directory was already there when this object was
+        #: built. On a first run it is not, and `write` is expected to create
+        #: it. Once it exists, its disappearance means something removed the
+        #: tree underneath a live Settings -- see `write`.
+        self._dir_existed = self.path.parent.is_dir()
         if create and not self.path.exists():
             self.write(self._data, why="no config file yet")
         self.reload(initial=True)
@@ -523,6 +528,23 @@ class Settings:
         """Write the file atomically, 0600, in the schema's own order."""
         payload = self.data if data is None else data
         text = dumps(payload)
+        # A first run has no `~/.config/jarvis`, and creating it is this
+        # method's job. Recreating one that existed when this object was built
+        # is a different act entirely: it means the directory was removed
+        # underneath a live Settings, and the only thing that does that is a
+        # test tearing its tree down while a thread it did not join is still
+        # writing. Rebuilding it there resurrects the tree, which is the stray
+        # `/tmp/luna-test-*` CI fails on -- twice on the 3.13 runner and
+        # nowhere else, since it turns on thread scheduling.
+        #
+        # Refusing is right in both worlds. In production the directory does
+        # not vanish, so this cannot fire; if it ever did, silently rebuilding
+        # a config directory someone had just deleted would be the wrong
+        # answer anyway.
+        if self._dir_existed and not self.path.parent.is_dir():
+            raise SettingsError(
+                f"{self.path.parent} has gone since this config was opened; "
+                f"refusing to recreate it")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
             self.path.parent.chmod(config.CONFIG_DIR_MODE)
