@@ -84,7 +84,16 @@ class ModelPick(Text):
 
 # "never" (just do it) | "ask" (confirm first) | "deny" (refuse outright)
 TRI = ("never", "ask", "deny")
-TRI_LABELS = {"never": "Never ask", "ask": "Ask first", "deny": "Never allow"}
+# Display labels only — the stored values are the three keys above and are
+# part of the config contract. The labels are not: they used to read "Never
+# ask" and "Never allow", a permissive answer and a restrictive one that
+# differed by one word in the middle of a row of identical buttons. Three
+# words now, no shared prefix, different lengths and different initials.
+TRI_LABELS = {"never": "Allow", "ask": "Ask first", "deny": "Refuse"}
+# What each answer actually does, said in the row's trailing column. "ask" is
+# the safe default and says nothing; the two that change what the machine
+# will do on its own announce themselves in opposite plain words.
+TRI_NOTES = {"never": "runs unattended", "ask": "", "deny": "never runs"}
 
 
 @dataclass(frozen=True)

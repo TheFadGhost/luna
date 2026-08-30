@@ -17,10 +17,10 @@ gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 
 from . import async_util, client, config, models, schema, state, voices, voxtype
-from .theme import SPACE
-from .widgets import (TriToggle, act, banner, card, column, label,
-                      locked_entry, row, rowbox, scroller, section_header,
-                      separator)
+from .theme import COLUMN, RHYTHM, SPACE
+from .widgets import (TriToggle, act, clear, column, group, head, label,
+                      locked_entry, row, rowbox, scroller, separator,
+                      state_note)
 
 
 class Binder:
@@ -31,7 +31,7 @@ class Binder:
         self._refresh = {}          # dotted -> fn(value)
 
     # ------------------------------------------------------------ dispatch
-    def control_for(self, dotted, width=200):
+    def control_for(self, dotted, width=COLUMN["control"]):
         found = schema.field_for(dotted)
         if found is None:
             return label(f"unknown setting {dotted}", css=("rowdoc",))
@@ -61,7 +61,15 @@ class Binder:
             return self._entry(dotted, fld, value, width)
         return label(str(value), css=("value",))
 
-    def bound_row(self, dotted, width=200, extra=(), ctl=None):
+    def bound_row(self, dotted, width=COLUMN["control"], extra=(),
+                  ctl=None, trail=None):
+        """One grid row for one setting.
+
+        `extra` is a per-row action (a preview button); it goes in the
+        trailing column rather than beside the control, so adding one to a
+        row cannot push that row's control out of the column every other
+        row shares.
+        """
         found = schema.field_for(dotted)
         if found is None:
             return label(f"missing {dotted}", css=("rowdoc",))
@@ -72,8 +80,12 @@ class Binder:
         parts = [ctl]
         if unit and not isinstance(fld, schema.Real):
             parts.append(label(unit, css=("rowdoc",)))
-        parts.extend(extra)
-        return row(fld.label, fld.doc, *parts, control_width=width + 40)
+        if trail is None and extra:
+            trail = extra[0] if len(extra) == 1 else rowbox(SPACE["md"])
+            if len(extra) > 1:
+                for e in extra:
+                    trail.append(e)
+        return row(fld.label, fld.doc, *parts, trail=trail)
 
     def refresh(self, keys=None):
         for dotted, fn in self._refresh.items():
@@ -84,7 +96,7 @@ class Binder:
     def _switch(self, dotted, value):
         sw = Gtk.Switch()
         sw.set_active(bool(value))
-        sw.set_halign(Gtk.Align.END)
+        sw.set_halign(Gtk.Align.START)
         sw.set_valign(Gtk.Align.CENTER)
         guard = {"muted": False}
 
@@ -187,11 +199,14 @@ class Binder:
             w.remove_css_class("bad")
             self.editor.set(dotted, w.get_text())
 
-        def left(_ctl):
-            if "bad" in e.get_css_classes():
+        def left(ctl):
+            # get_widget(), never a captured `e`: a controller closure that
+            # holds its own widget makes a cycle Python's GC cannot see.
+            w = ctl.get_widget()
+            if "bad" in w.get_css_classes():
                 guard["muted"] = True
-                e.set_text(str(self.editor.get(dotted) or ""))
-                e.remove_css_class("bad")
+                w.set_text(str(self.editor.get(dotted) or ""))
+                w.remove_css_class("bad")
                 guard["muted"] = False
 
         e.connect("changed", changed)
@@ -300,27 +315,14 @@ class Binder:
 
 # ------------------------------------------------------------------ helpers
 
-def head(title, desc=""):
-    box = column(SPACE["labelGap"])
-    box.append(label(title, css=("panehead",)))
-    if desc:
-        box.append(label(desc, css=("panedesc",), wrap=True))
-    return box
-
-
-def group(title, *rows, flat=False):
-    c = card(flat=flat)
-    if title:
-        c.append(section_header(title))
-    for i, r in enumerate(rows):
-        if i or title:
-            c.append(separator())
-        c.append(r)
-    return c
-
-
 def pane(*children):
-    body = column()
+    """A pane is one column of type on the window background.
+
+    Spacing is zero here on purpose: each group brings its own top margin,
+    so the rhythm between sections is stated once in RHYTHM rather than
+    once per pane.
+    """
+    body = column(0)
     body.add_css_class("pane")
     for ch in children:
         body.append(ch)
@@ -349,7 +351,7 @@ def assistant_pane(b):
     keys = ("assistant.name", "assistant.specialist", "assistant.agent",
             "assistant.model")
     agent_ctl = b.control_for(keys[2])
-    model_ctl = b.control_for(keys[3], width=240)
+    model_ctl = b.control_for(keys[3])
 
     def on_agent_changed(w, _p):
         opts = getattr(w, "jarvis_options", None) or ()
@@ -370,7 +372,7 @@ def assistant_pane(b):
         group("Identity", b.bound_row(keys[0]), b.bound_row(keys[1])),
         group("Brain",
               b.bound_row(keys[2], ctl=agent_ctl),
-              b.bound_row(keys[3], width=240, ctl=model_ctl)),
+              b.bound_row(keys[3], ctl=model_ctl)),
     )
 
 
@@ -384,10 +386,15 @@ def _busy_click(btn, working_label, work, on_done):
         return                      # already working; a second click is a no-op
     orig = btn.get_label()
     btn.set_sensitive(False)
+    # Disabled so it cannot be fired twice, but the working label is the only
+    # feedback the click gets, so it keeps full contrast instead of the
+    # ordinary disabled grey.
+    btn.add_css_class("busy")
     btn.set_label(working_label)
 
     def done(result, error):
         btn.set_label(orig)
+        btn.remove_css_class("busy")
         btn.set_sensitive(True)
         on_done(result, error)
         return False
@@ -412,9 +419,9 @@ def voice_pane(b, player, on_status):
             _busy_click(btn, "Playing…", work, done)
         return clicked
 
-    prev_a = act("▶ Preview")
+    prev_a = act("Play sample")
     prev_a.connect("clicked", preview("voice.voice"))
-    prev_b = act("▶ Preview")
+    prev_b = act("Play sample")
     prev_b.connect("clicked", preview("voice.voice_male"))
 
     live = act("Test the live pipeline")
@@ -435,28 +442,54 @@ def voice_pane(b, player, on_status):
 
     live.connect("clicked", test)
 
+    # Everything on this pane except the switch itself only means anything
+    # while speech is on. Left live it read as editable and did nothing; the
+    # rows now go inert with the switch, and say so in a sentence rather than
+    # leaving the reader to infer it from grey text.
+    enabled_ctl = b.control_for("voice.enabled")
+    off_note = label(
+        "Speech is off, so nothing below is used. The settings are still "
+        "saved, and take effect again the moment it is switched back on.",
+        css=("rowdoc",), wrap=True, measure=COLUMN["note"])
+
+    gated = []
+
+    def gate(sw, _p=None):
+        on = sw.get_active()
+        off_note.set_visible(not on)
+        for w in gated:
+            w.set_sensitive(on)
+
     n = len(voices.available())
+    output = group("Output",
+                   b.bound_row("voice.enabled", ctl=enabled_ctl),
+                   off_note,
+                   b.bound_row("voice.provider"),
+                   b.bound_row("voice.model"))
+    picks = group(f"Voice — {n} samples in ~/Music/luna-voices",
+                  b.bound_row("voice.voice", extra=(prev_a,)),
+                  b.bound_row("voice.voice_male", extra=(prev_b,)),
+                  row("Live check",
+                      "Speaks one sentence through lunad's say op.", live))
+    delivery = group("Fallback and delivery",
+                     b.bound_row("voice.fallback"),
+                     b.bound_row("voice.piper_voice"),
+                     b.bound_row("voice.speed", width=COLUMN["narrow"]),
+                     b.bound_row("voice.max_spoken_chars",
+                                 width=COLUMN["narrow"]))
+    # Every row of the pane except the enabled switch's own row.
+    gated.extend([output.get_last_child(),
+                  output.get_last_child().get_prev_sibling(),
+                  picks, delivery])
+    enabled_ctl.connect("notify::active", gate)
+    gate(enabled_ctl)
+
     return pane(
         head("Voice out",
-             "How she sounds. Preview plays the local sample for the picked "
-             "voice; the live test speaks through the daemon with whatever "
-             "is currently saved."),
-        group("Output",
-              b.bound_row("voice.enabled"),
-              b.bound_row("voice.provider"),
-              b.bound_row("voice.model", width=240)),
-        group(f"Voice — {n} samples in ~/Music/luna-voices",
-              b.bound_row("voice.voice", width=220, extra=(prev_a,)),
-              b.bound_row("voice.voice_male", width=220, extra=(prev_b,)),
-              row("Live check",
-                  "Speaks one sentence through lunad's say op.", live,
-                  control_width=260)),
-        group("Fallback and delivery",
-              b.bound_row("voice.fallback"),
-              b.bound_row("voice.piper_voice", width=240),
-              b.bound_row("voice.speed", width=140),
-              b.bound_row("voice.max_spoken_chars", width=140)),
-    )
+             "How she sounds. Play sample plays the local file for the "
+             "picked voice; the live check speaks through the daemon with "
+             "whatever is currently saved."),
+        output, picks, delivery)
 
 
 def _voxtype_report(values):
@@ -502,8 +535,8 @@ def listen_pane(b, on_status):
         f"{kb} runs `voxtype record toggle --profile luna`. The binding lives "
         "in ~/.config/hypr/bindings.lua and is edited there — changing it here "
         "would put Jarvis and Hyprland out of step.",
-        css=("rowdoc",), wrap=True)
-    mapping = label(
+        css=("rowdoc",), wrap=True, measure=COLUMN["note"])
+    mapping = (
         "Provider, model and language are written through to "
         f"{voxtype.CONFIG_PATH} — provider becomes [whisper] mode, model "
         "becomes [whisper] model (and remote_model with it, in remote mode), "
@@ -511,20 +544,16 @@ def listen_pane(b, on_status):
         "because it reads its config only at start-up. A save is refused "
         "outright while a recording is in flight. Listening on/off is Luna's "
         "own and needs no restart: with it off, F10 still records and the "
-        "transcript goes to the clipboard instead of to her.",
-        css=("rowdoc",), wrap=True)
+        "transcript goes to the clipboard instead of to her.")
 
     lines = column(SPACE["labelGap"])
     restart = act("Restart voxtype")
 
     def rebuild():
-        child = lines.get_first_child()
-        while child is not None:
-            nxt = child.get_next_sibling()
-            lines.remove(child)
-            child = nxt
+        clear(lines)
         for text, css in _voxtype_report(b.editor.values):
-            lines.append(label(text, css=css, wrap=True))
+            lines.append(label(text, css=css, wrap=True,
+                               measure=COLUMN["note"]))
         restart.set_sensitive(voxtype.activity() not in voxtype.BUSY)
 
     def do_restart(btn):
@@ -555,59 +584,92 @@ def listen_pane(b, on_status):
         group("Input",
               b.bound_row("listen.enabled"),
               b.bound_row("listen.provider"),
-              b.bound_row("listen.model", width=240),
-              b.bound_row("listen.language", width=120)),
-        group("Push-to-talk", b.bound_row("listen.keybind", width=200), note),
-        group("voxtype", mapping, lines,
+              b.bound_row("listen.model"),
+              b.bound_row("listen.language", width=COLUMN["narrow"])),
+        group("Push-to-talk", b.bound_row("listen.keybind"), note),
+        group("voxtype", lines,
               row("voxtype's own config",
-                  "It reads the file once, at start-up.", restart,
-                  control_width=200)),
+                  "It reads the file once, at start-up.", restart),
+              note=mapping),
     )
     p.jarvis_refresh = rebuild
     return p
 
 
 def confirm_pane(b):
-    tri_rows, other_rows = [], []
-    for s in schema.sections_for("confirm"):
-        for fld in s.fields:
-            tri = isinstance(fld, schema.Tri)
-            r = b.bound_row(f"{s.key}.{fld.key}", width=300 if tri else 150)
-            (tri_rows if tri else other_rows).append(r)
+    """The safety surface.
 
-    locked = card()
-    locked.add_css_class("lockedcard")
-    locked.append(section_header("Always denied · not editable"))
-    lockdoc = label(
-        "Not settings: no key in config.toml, no widget, no code path that "
-        "writes them. They protect other running sessions and the machine's "
-        "own record of itself.", css=("rowdoc",), wrap=True)
-    lockdoc.set_max_width_chars(110)
-    locked.append(lockdoc)
-    for name, why in schema.HARD_DENIES:
-        locked.append(separator())
-        locked.append(locked_entry(name, why))
+    "Never ask" and "Never allow" used to sit one word apart in a row of
+    three identical buttons: a permissive answer and a restrictive one drawn
+    as the same object. They are three different words now — Allow, Ask
+    first, Refuse — the one in force carries the weight and the rule beneath
+    it, and every row states in plain language, in a column of its own, what
+    the setting will actually do. The two answers that change what the
+    machine does on its own say opposite things there; the safe default says
+    nothing at all.
+    """
+    tri_rows, other_rows = [], []
+    answers = {}
+
+    summary = label("", css=("rowdoc",), wrap=True, measure=COLUMN["note"])
+
+    def restate():
+        loose = sorted(k for k, v in answers.items() if v == "never")
+        total = len(answers)
+        if not loose:
+            summary.set_text(
+                f"All {total} action classes stop and ask. Nothing here runs "
+                "unattended.")
+        else:
+            summary.set_text(
+                f"{len(loose)} of {total} action classes run unattended — "
+                "she does those without asking first.")
+
+    for sec in schema.sections_for("confirm"):
+        for fld in sec.fields:
+            dotted = f"{sec.key}.{fld.key}"
+            if not isinstance(fld, schema.Tri):
+                other_rows.append(b.bound_row(dotted, width=COLUMN["narrow"]))
+                continue
+            ctl = b.control_for(dotted)
+            note = state_note("")
+
+            def announce(value, _note=note, _key=dotted):
+                text = schema.TRI_NOTES.get(value, "")
+                _note.set_text(text)
+                _note.set_visible(bool(text))
+                if value == "never":
+                    _note.add_css_class("risk")
+                else:
+                    _note.remove_css_class("risk")
+                answers[_key] = value
+                restate()
+
+            ctl.watch(announce)
+            tri_rows.append(row(fld.label, fld.doc, ctl, trail=note))
+    restate()
 
     return pane(
         head("Confirmations",
              "The safety model. These are not hard blocks — she asks first, "
              "then proceeds."),
-        locked,
-        group("Action classes", *tri_rows),
+        group("Action classes", summary, *tri_rows,
+              note="Allow — she does it without asking. Ask first — she stops "
+                   "and waits for a yes. Refuse — she will not do it at all."),
         group("Thresholds and prompting", *other_rows),
+        group("Never permitted",
+              *[locked_entry(name, why) for name, why in schema.HARD_DENIES],
+              note="Not settings: no key in config.toml, no widget, no code "
+                   "path that writes them. They protect other running "
+                   "sessions and the machine's own record of itself."),
     )
 
 
 def memory_pane(b, window):
     bars = column(SPACE["lg"])
-    rows_holder = {}
 
     def rebuild():
-        child = bars.get_first_child()
-        while child is not None:
-            nxt = child.get_next_sibling()
-            bars.remove(child)
-            child = nxt
+        clear(bars)
         for u in state.tier1_usage(b.editor.values):
             item = column(SPACE["labelGap"] // 2)
             top = rowbox()
@@ -633,8 +695,7 @@ def memory_pane(b, window):
         bars.append(label(
             "Episodes: " + (f"{n} rows" if n is not None else "unreadable")
             + f" · {state.human_size(ep['size'])} · {ep['path']}",
-            css=("rowdoc",), wrap=True))
-    rows_holder["rebuild"] = rebuild
+            css=("rowdoc",), wrap=True, measure=COLUMN["note"]))
     rebuild()
 
     refresh = act("Refresh")
@@ -642,26 +703,21 @@ def memory_pane(b, window):
     view = act("View memories", primary=True)
     view.connect("clicked", lambda _b: _memory_window(window))
 
-    usage = card()
-    usage.append(section_header("Live usage"))
-    usage.append(bars)
-    usage.append(separator())
     controls = rowbox()
     controls.set_halign(Gtk.Align.END)
     controls.append(refresh)
     controls.append(view)
-    usage.append(controls)
-
-    caps = group("Caps and decay",
-                 *[b.bound_row(f"memory.{f.key}", width=140)
-                   for f in schema.sections_for("memory")[0].fields])
 
     p = pane(
         head("Memory",
              "Tier 1 is curated identity and is always in the prompt. A write "
              "past the cap is rejected, not truncated — overflow forces "
              "consolidation instead of letting the file rot into a log."),
-        usage, caps)
+        group("Live usage", bars, controls),
+        group("Caps and decay",
+              *[b.bound_row(f"memory.{f.key}", width=COLUMN["narrow"])
+                for f in schema.sections_for("memory")[0].fields]),
+    )
     p.jarvis_refresh = rebuild
     return p
 
@@ -683,34 +739,33 @@ def _memory_window(parent):
     win.add_controller(esc)
     outer = column()
     outer.add_css_class("root")
-    body = column()
+    body = column(0)
     body.add_css_class("pane")
-    body.append(label("Memories", css=("panehead",)))
-    body.append(label(
-        "§-delimited tier-1 entries, exactly as lunad wrote them. Read-only: "
-        "these files have consistency rules inside the daemon and are not "
-        "edited from here.", css=("panedesc",), wrap=True))
+    body.append(head("Memories",
+                     "§-delimited tier-1 entries, exactly as lunad wrote "
+                     "them. Read-only: these files have consistency rules "
+                     "inside the daemon and are not edited from here."))
     for fname, _cap, title in state.TIER1:
         entries, err = state.read_entries(fname)
-        c = card()
-        c.append(section_header(f"{title} · {fname}"))
+        items = []
         if err:
-            c.append(label(err, css=("rowdoc",), wrap=True))
+            items.append(label(err, css=("rowdoc",), wrap=True,
+                               measure=COLUMN["note"]))
         elif not entries:
-            c.append(label("empty", css=("rowdoc",)))
+            items.append(label("empty", css=("rowdoc",)))
         for i, entry in enumerate(entries):
-            if i:
-                c.append(separator())
             r = rowbox(SPACE["md"])
             r.append(label(f"§{i + 1}", css=("rowdoc",)))
-            t = label(entry, css=("mono",), wrap=True, selectable=True)
+            t = label(entry, css=("mono",), wrap=True, selectable=True,
+                      measure=COLUMN["note"])
             t.set_hexpand(True)
             r.append(t)
-            c.append(r)
-        body.append(c)
+            items.append(r)
+        body.append(group(f"{title} · {fname}", *items))
     close = act("Close")
     close.connect("clicked", lambda _b: win.close())
     close.set_halign(Gtk.Align.END)
+    close.set_margin_top(RHYTHM["section"])
     body.append(close)
     outer.append(scroller(body))
     win.set_child(outer)
@@ -722,21 +777,21 @@ def _memory_window(parent):
 
 
 def jobs_pane(b):
-    listing = column(SPACE["md"])
+    listing = column(0)
 
     def rebuild():
-        child = listing.get_first_child()
-        while child is not None:
-            nxt = child.get_next_sibling()
-            listing.remove(child)
-            child = nxt
+        clear(listing)
         rows = state.recent_jobs()
         if not rows:
             listing.append(label(f"No job directories under {state.JOBS_DIR}",
-                                 css=("rowdoc",), wrap=True))
+                                 css=("rowdoc",), wrap=True,
+                                 measure=COLUMN["note"]))
             return
-        for m in rows:
-            r = rowbox(SPACE["lg"])
+        for i, m in enumerate(rows):
+            if i:
+                sep = separator()
+                sep.set_margin_top(RHYTHM["row"])
+                listing.append(sep)
             left = column(SPACE["labelGap"] // 2)
             left.set_hexpand(True)
             task = (m.get("task") or "(no task recorded)").strip()
@@ -749,33 +804,34 @@ def jobs_pane(b):
                 f"{m.get('elapsed_s')}s" if m.get("elapsed_s") else None,
             ) if x)
             left.append(label(meta, css=("rowdoc",)))
-            r.append(left)
             code = m.get("exit_code")
             statetxt = m.get("state") or ("finished" if code is not None
                                           else "unknown")
             if code not in (None, 0):
                 statetxt = f"{statetxt} · exit {code}"
-            r.append(label(statetxt, css=("value",)))
             open_btn = act("Open")
             open_btn.connect("clicked",
                              lambda _b, d=m.get("dir"): open_path(d))
-            r.append(open_btn)
+            # Built from the same three columns as a settings row, so the
+            # job list scans down the same two edges as every other pane.
+            r = rowbox(SPACE["panelPadding"])
+            r.set_margin_top(RHYTHM["row"])
+            r.append(left)
+            holder = rowbox(SPACE["md"])
+            holder.set_valign(Gtk.Align.CENTER)
+            holder.set_size_request(COLUMN["control"], -1)
+            holder.append(label(statetxt, css=("value",)))
+            r.append(holder)
+            tail = rowbox(SPACE["md"])
+            tail.set_valign(Gtk.Align.CENTER)
+            tail.set_size_request(COLUMN["trail"], -1)
+            tail.append(open_btn)
+            r.append(tail)
             listing.append(r)
-            listing.append(separator())
 
     rebuild()
     refresh = act("Refresh")
     refresh.connect("clicked", lambda _b: rebuild())
-
-    recent = card()
-    top = rowbox()
-    h = section_header("Recent jobs")
-    h.set_hexpand(True)
-    top.append(h)
-    top.append(refresh)
-    recent.append(top)
-    recent.append(separator())
-    recent.append(listing)
 
     p = pane(
         head("Jobs",
@@ -783,9 +839,11 @@ def jobs_pane(b):
              "directory per job, so the list survives a daemon restart."),
         group("Dispatch",
               *[b.bound_row(f"dispatch.{f.key}",
-                            width=240 if isinstance(f, schema.Text) else 140)
+                            width=COLUMN["control"]
+                            if isinstance(f, schema.Text)
+                            else COLUMN["narrow"])
                 for f in schema.section_for("dispatch").fields]),
-        recent)
+        group("Recent jobs", listing, action=refresh))
     p.jarvis_refresh = rebuild
     return p
 
@@ -795,21 +853,17 @@ def about_pane(b, on_start):
     fetching = {"busy": False}
 
     def kv(k, v, css=("value",)):
-        r = rowbox()
-        lk = label(k)
-        lk.set_hexpand(True)
-        r.append(lk)
-        r.append(label(v, css=css, wrap=True))
-        return r
+        return row(k, "", label(v, css=css, wrap=True,
+                                measure=COLUMN["value"]))
 
     def render(st, up, unit, error):
-        child = lines.get_first_child()
-        while child is not None:
-            nxt = child.get_next_sibling()
-            lines.remove(child)
-            child = nxt
+        clear(lines)
         d = (st or {}).get("daemon") or {}
-        lines.append(kv("Daemon", "running" if up else "not running"))
+        # The one line on this pane that has to be readable from across the
+        # room, and the reason the Start button below it appears at all.
+        lines.append(kv("Daemon", "running" if up else "not running",
+                        css=("value",) if up else ("locked-value",)))
+        startb.set_visible(not up)
         lines.append(kv("systemd unit", f"lunad · {unit}"))
         if error is not None:
             lines.append(kv("Status check", f"failed — {error}",
@@ -832,9 +886,11 @@ def about_pane(b, on_start):
         present, where = state.key_present()
         lines.append(kv("API key", ("present in " + where) if present
                         else "not found — " + where))
-        lines.append(label(
+        keynote = label(
             "The key itself is never read, never shown and never written to "
-            "config.toml.", css=("rowdoc",), wrap=True))
+            "config.toml.", css=("rowdoc",), wrap=True,
+            measure=COLUMN["note"])
+        lines.append(keynote)
 
     def rebuild():
         if fetching["busy"]:
@@ -842,12 +898,9 @@ def about_pane(b, on_start):
         fetching["busy"] = True
         orig = refresh.get_label()
         refresh.set_sensitive(False)
+        refresh.add_css_class("busy")
         refresh.set_label("Checking…")
-        child = lines.get_first_child()
-        while child is not None:
-            nxt = child.get_next_sibling()
-            lines.remove(child)
-            child = nxt
+        clear(lines)
         lines.append(label("Checking daemon status…", css=("rowdoc",)))
 
         def work():
@@ -862,6 +915,7 @@ def about_pane(b, on_start):
         def done(result, error):
             fetching["busy"] = False
             refresh.set_label(orig)
+            refresh.remove_css_class("busy")
             refresh.set_sensitive(True)
             if error is not None:
                 render(None, False, "unknown", str(error))
@@ -872,63 +926,49 @@ def about_pane(b, on_start):
 
         async_util.run_async(work, done)
 
-    audit = rowbox()
-    al = label(str(state.AUDIT_PATH))
-    al.set_hexpand(True)
-    audit.append(al)
-    ab = act("Open audit log")
+    ab = act("Open")
     ab.connect("clicked", lambda _b: open_path(state.AUDIT_PATH))
-    audit.append(ab)
-    lb = act("Open daemon log")
+    lb = act("Open")
     lb.connect("clicked", lambda _b: open_path(state.LOG_PATH))
-    audit.append(lb)
-
-    cfg = rowbox()
-    cl = label(str(config.CONFIG_PATH))
-    cl.set_hexpand(True)
-    cfg.append(cl)
-    cb = act("Open config.toml")
+    cb = act("Open")
     cb.connect("clicked", lambda _b: open_path(config.CONFIG_PATH))
-    cfg.append(cb)
 
     refresh = act("Refresh")
     refresh.connect("clicked", lambda _b: rebuild())
     startb = act("Start daemon", primary=True)
     startb.connect("clicked", lambda _b: on_start())
-    btns = rowbox()
-    btns.set_halign(Gtk.Align.END)
-    btns.append(startb)
-    btns.append(refresh)
+    # Hidden while lunad is up: a Start button that looks the same running or
+    # stopped tells the reader nothing, and its absence is the clearest way
+    # to say there is nothing to start.
+    startb.set_visible(False)
+    startb.set_halign(Gtk.Align.END)
 
-    statuscard = card()
-    statuscard.append(section_header("Status"))
-    statuscard.append(lines)
-    statuscard.append(separator())
-    statuscard.append(btns)
-
-    unknown = card()
-    unknown.append(section_header("Keys Jarvis does not understand"))
     if b.editor.unknown:
-        unknown.append(label(
+        unknown_children = [label(
             "Preserved verbatim in config.toml and never rewritten:",
-            css=("rowdoc",), wrap=True))
-        for k, v in sorted(b.editor.unknown.items()):
-            unknown.append(label(f"{k} = {v!r}", css=("mono",), wrap=True))
+            css=("rowdoc",), wrap=True, measure=COLUMN["note"])]
+        unknown_children += [
+            label(f"{k} = {v!r}", css=("mono",), wrap=True,
+                  measure=COLUMN["note"])
+            for k, v in sorted(b.editor.unknown.items())]
     else:
-        unknown.append(label("None — every key in the file is in the schema.",
-                             css=("rowdoc",)))
+        unknown_children = [label(
+            "None — every key in the file is in the schema.", css=("rowdoc",))]
 
     p = pane(
         head("About and status", "What is running, and where everything is."),
-        statuscard,
+        group("Status", lines, startb, action=refresh),
         group("Interface",
               *[b.bound_row(f"ui.{f.key}")
                 for f in schema.section_for("ui").fields]),
         group("Audit log",
-              *[b.bound_row(f"audit.{f.key}", width=140)
+              *[b.bound_row(f"audit.{f.key}", width=COLUMN["narrow"])
                 for f in schema.section_for("audit").fields]),
-        group("Files", audit, cfg),
-        unknown)
+        group("Files",
+              row("Audit log", str(state.AUDIT_PATH), ab),
+              row("Daemon log", str(state.LOG_PATH), lb),
+              row("Config file", str(config.CONFIG_PATH), cb)),
+        group("Keys Jarvis does not understand", *unknown_children))
     p.jarvis_refresh = rebuild
     rebuild()          # first fetch, now that `refresh` exists to be labelled
     return p

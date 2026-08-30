@@ -18,13 +18,12 @@ from gi.repository import Gio, GLib, Gtk  # noqa: E402
 
 from . import async_util, client, config, panes, theme, voices
 from .editor import Editor
-from .theme import SPACE
+from .theme import COLUMN, SPACE
 from .widgets import act, banner, column, label, rowbox
 
 APP_ID = "org.omarchy.jarvis"
 WIN_TITLE = "Jarvis"
 WIN_W, WIN_H = 1000, 720
-SIDEBAR_W = 210
 
 PANES = (
     ("assistant", "Assistant"),
@@ -83,6 +82,8 @@ class JarvisApp(Gtk.Application):
         self._status_timer = 0
         self._daemon_banner = None
         self._daemon_label = None
+        self._who_name = None
+        self._who_spec = None
         self._daemon_start = None
         self._pane_widgets = {}
         self._daemon_fetching = False
@@ -175,18 +176,16 @@ class JarvisApp(Gtk.Application):
 
         root.append(self._titlebar())
 
+        # A strip across the window under the header, not a rounded box
+        # floating inside a margin: it is a state of the whole app, so it
+        # spans the whole app.
         self._daemon_banner, self._daemon_label = banner("", "warn")
         self._daemon_start = act("Start daemon", primary=True)
         self._daemon_start.connect("clicked", lambda _b: self.start_daemon())
         self._daemon_banner.append(self._daemon_start)
-        wrap = rowbox()
-        wrap.set_margin_start(SPACE["panelPadding"])
-        wrap.set_margin_end(SPACE["panelPadding"])
-        wrap.set_margin_top(SPACE["md"])
         self._daemon_banner.set_hexpand(True)
-        wrap.append(self._daemon_banner)
-        self._banner_wrap = wrap
-        root.append(wrap)
+        self._banner_wrap = self._daemon_banner
+        root.append(self._daemon_banner)
 
         body = rowbox(0)
         body.set_vexpand(True)
@@ -209,33 +208,50 @@ class JarvisApp(Gtk.Application):
         return root
 
     def _titlebar(self):
-        bar = rowbox(SPACE["controlPaddingX"])
+        """The app's masthead.
+
+        Sentence case at a real size, not letterspaced small-caps: the
+        tracked micro-caps were doing the job a type scale should do, and
+        the app has one now. On the right, the two names the daemon answers
+        to are labelled — "Luna · Sol" on its own told a first-time reader
+        nothing about which was which, or what either one was.
+        """
+        bar = rowbox(SPACE["panelPadding"])
         bar.add_css_class("titlebar")
         left = column(0)
-        left.append(label(WIN_TITLE.upper(), css=("apptitle",)))
-        left.append(label("SETTINGS FOR THE ASSISTANT DAEMON",
+        left.append(label(WIN_TITLE, css=("apptitle",)))
+        left.append(label("Settings for the assistant daemon",
                           css=("appsub",)))
         left.set_hexpand(True)
         bar.append(left)
-        self._who = label("", css=("value",))
-        bar.append(self._who)
+        who = rowbox(SPACE["md"])
+        who.set_valign(Gtk.Align.CENTER)
+        self._who_name = label("", css=("metaval",))
+        self._who_spec = label("", css=("metaval",))
+        who.append(label("assistant", css=("metakey",)))
+        who.append(self._who_name)
+        who.append(label("specialist", css=("metakey",)))
+        who.append(self._who_spec)
+        bar.append(who)
         return bar
 
     def _sidebar(self):
+        """Seven names, and nothing else.
+
+        The row that is selected is the one drawn in full contrast and bold
+        weight — no accent bar, no pill, no fill, no left border. The 1–7
+        that used to sit in front of each name were not accelerators and not
+        tooltips; they were filler shaped like structure, so they are gone.
+        """
         box = column(0)
         box.add_css_class("sidebar")
-        box.set_size_request(SIDEBAR_W, -1)
+        box.set_size_request(COLUMN["sidebar"], -1)
         self.nav = Gtk.ListBox()
         self.nav.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        for i, (key, title) in enumerate(PANES):
+        for key, title in PANES:
             r = Gtk.ListBoxRow()
             r.add_css_class("navrow")
-            inner = rowbox(SPACE["md"])
-            inner.append(label(f"{i + 1}", css=("navnum",)))
-            t = label(title)
-            t.set_hexpand(True)
-            inner.append(t)
-            r.set_child(inner)
+            r.set_child(label(title))
             r.jarvis_key = key
             self.nav.append(r)
         self.nav.connect("row-selected", self._nav)
@@ -244,7 +260,7 @@ class JarvisApp(Gtk.Application):
 
     def _statusbar(self):
         bar = rowbox(SPACE["controlPaddingX"])
-        bar.add_css_class("titlebar")
+        bar.add_css_class("statusbar")
         self.status_label = label("", css=("rowdoc",), wrap=False)
         self.status_label.set_hexpand(True)
         self.status_label.set_ellipsize(3)          # Pango.EllipsizeMode.END
@@ -291,9 +307,7 @@ class JarvisApp(Gtk.Application):
         if self._status_timer:
             GLib.source_remove(self._status_timer)
         self._status_timer = GLib.timeout_add_seconds(12, self._clear_status)
-        self._who.set_text(
-            f"{self.editor.get('assistant.name')} · "
-            f"{self.editor.get('assistant.specialist')}")
+        self._name_daemon()
 
     def _clear_status(self):
         self._status_timer = 0
@@ -368,9 +382,12 @@ class JarvisApp(Gtk.Application):
             self._daemon_label.set_text(
                 "lunad is not running. Settings still save to config.toml and "
                 "apply when it next starts.")
-        self._who.set_text(
-            f"{self.editor.get('assistant.name')} · "
-            f"{self.editor.get('assistant.specialist')}")
+        self._name_daemon()
+
+    def _name_daemon(self):
+        self._who_name.set_text(str(self.editor.get("assistant.name") or ""))
+        self._who_spec.set_text(
+            str(self.editor.get("assistant.specialist") or ""))
 
     def _poll_daemon(self):
         self.refresh_daemon()

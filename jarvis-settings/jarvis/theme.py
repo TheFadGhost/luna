@@ -52,6 +52,34 @@ SPACE = {               # Style.space* / Style.spacing.*
 DIM = {"label": 0.60, "section": 0.55, "hint": 0.45, "faint": 0.30,
        "hairline": 0.14, "wash": 0.06}
 
+# --- the app's own settings grid ------------------------------------------
+# Not from §6d: the shell has no settings-grid analogue, so these are named
+# here rather than inlined at a call site. One label column, one control
+# column and one trailing note column, shared by every pane, so a reader can
+# scan a single x down the whole app for labels, for controls, or for the
+# state notes that say what a setting is currently doing.
+COLUMN = {
+    "sidebar": 180,     # widest nav label ("Confirmations") plus padding
+    "control": 240,     # every bound control starts at this column's left
+    "narrow": 140,      # a number or short code — same left edge, less width
+    "trail": 120,       # state notes and per-row actions
+    "doc": 48,          # chars — helper-text measure inside the label column
+    "value": 36,        # chars — a read-back value inside the control column
+    "state": 16,        # chars — the trailing note, at caption size
+    "lede": 72,         # chars — pane description measure (prose, 65–75ch)
+    "note": 96,         # chars — full-width explanatory paragraphs
+}
+
+# Vertical rhythm. Every value is a multiple of a SPACE token above, so the
+# app breathes on the same grid as the shell's own panels. More space above a
+# heading than below it: the gap belongs to the break, not to the heading.
+RHYTHM = {
+    "row": SPACE["panelGap"],                    # 14 — rows within a group
+    "section": SPACE["panelGap"] * 2,            # 28 — above a group's rule
+    "ruleGap": SPACE["lg"],                      # 8  — rule to its heading
+    "afterHeading": SPACE["controlPaddingY"] * 2,  # 12 — heading to first row
+}
+
 # No-theme fallbacks only — at runtime the colours come from colors.toml.
 FALLBACK = {
     "background": "#0a0a0b",
@@ -121,11 +149,29 @@ def current_font() -> str:
 
 
 def css_for(c: dict) -> str:
+    """The whole stylesheet.
+
+    The rule the app is typeset by: hierarchy comes from size, weight and
+    colour value, never from a box. There are no cards, no pills, no accent
+    bars and no fills marking selection — a hairline rule appears only where
+    a break has to be marked, and the one selection state in the app (the
+    sidebar) is expressed on the row's own text.
+
+    Colour is stated on label nodes explicitly rather than left to inherit:
+    the `*` rule below sets a colour on every node, so a container's colour
+    would not otherwise reach the label inside it.
+    """
     fg = c["foreground"]
     bg = c["background"]
     accent = c.get("accent", FALLBACK["accent"])
     muted = c.get("muted", FALLBACK["muted"])
     sel = c.get("selection", FALLBACK["selection"])
+    # The second neutral layer. With the cards gone, the only thing left
+    # separating chrome from content is the surface it sits on, so the
+    # header, the sidebar and the footer share one wash and the panes have
+    # none. `muted` rather than the foreground because a palette states its
+    # own second neutral and it is not always a tint of the text colour.
+    chrome = f"alpha({muted}, 0.16)"
     border = c.get("_border") or f"alpha({fg}, 0.80)"
     font = current_font()
     f, s, d = FONT, SPACE, DIM
@@ -142,61 +188,61 @@ def css_for(c: dict) -> str:
         border-radius: {RADIUS}px;
     }}
 
-    /* ---- title bar ---- */
+    /* ---- header and footer strips ---- */
     .titlebar {{
-        padding: {s['controlPaddingY']}px {s['panelPadding']}px;
+        background: {chrome};
+        padding: {s['panelPadding']}px;
         border-bottom: 1px solid alpha({fg}, {d['hairline']});
     }}
-    .apptitle {{ font-size: {f['title']}px; font-weight: bold;
-                 letter-spacing: 2px; }}
-    .appsub {{ font-size: {f['caption']}px; color: alpha({fg}, {d['hint']});
-               letter-spacing: 1.2px; }}
+    .apptitle {{ font-size: {f['heading']}px; font-weight: bold; }}
+    .appsub {{ font-size: {f['bodySmall']}px;
+               color: alpha({fg}, {d['label']}); }}
+    /* The identity pair in the header: each value is labelled, so "Luna ·
+       Sol" is not two proper nouns a first-time reader has to guess at. */
+    .metakey {{ font-size: {f['bodySmall']}px;
+                color: alpha({fg}, {d['label']}); }}
+    .metaval {{ font-size: {f['bodySmall']}px; font-weight: bold;
+                color: {fg}; }}
 
-    /* ---- sidebar ---- */
+    .statusbar {{
+        background: {chrome};
+        padding: {s['controlPaddingY']}px {s['panelPadding']}px;
+        border-top: 1px solid alpha({fg}, {d['hairline']});
+    }}
+
+    /* ---- sidebar: selection is weight and contrast on the row itself ---- */
     .sidebar {{
-        background: alpha({fg}, {d['wash']});
+        background: {chrome};
         border-right: 1px solid alpha({fg}, {d['hairline']});
-        padding: {s['lg']}px {s['md']}px;
+        padding: {s['panelPadding']}px;
     }}
     .sidebar list, .sidebar row {{ background: transparent; }}
     .navrow {{
-        border-radius: {RADIUS_SM}px;
-        padding: {s['controlPaddingY']}px {s['controlPaddingX']}px;
+        background: transparent;
+        border: none;
+        border-radius: 0;
+        padding: {s['controlPaddingY']}px 0;
         margin-bottom: {s['labelGap']}px;
-        color: alpha({fg}, {d['label']});
+        outline-offset: {s['labelGap']}px;
     }}
-    .navrow:hover {{ background: alpha({fg}, 0.08); color: {fg}; }}
-    .navrow:selected {{
-        background: {sel};
-        color: {fg};
-        font-weight: bold;
-        box-shadow: inset {BORDER}px 0 0 0 {accent};
+    .navrow:hover, .navrow:selected {{ background: transparent; }}
+    .navrow label {{ font-size: {f['body']}px;
+                     color: alpha({fg}, 0.52); }}
+    .navrow:hover label {{ color: alpha({fg}, 0.82); }}
+    .navrow:selected label {{ color: {fg}; font-weight: bold; }}
+    .navrow:focus-visible {{
+        outline-style: solid;
+        outline-width: 1px;
+        outline-color: alpha({fg}, {d['faint']});
     }}
-    .navrow label {{ font-size: {f['body']}px; }}
-    .navnum {{ font-size: {f['caption']}px; color: alpha({fg}, {d['faint']}); }}
 
-    /* ---- panes ---- */
+    /* ---- panes: typeset, not boxed ---- */
     .pane {{ padding: {s['panelPadding']}px; }}
-    .panehead {{ font-size: {f['heading']}px; font-weight: bold; }}
-    .panedesc {{ font-size: {f['bodySmall']}px;
+    .panehead {{ font-size: {f['display']}px; font-weight: bold; }}
+    .panedesc {{ font-size: {f['body']}px;
                  color: alpha({fg}, {d['label']}); }}
-
-    /* ---- BorderSurface analogue: the card every group of rows sits in */
-    .card {{
-        background: alpha({fg}, {d['wash']});
-        border: 1px solid alpha({fg}, {d['hairline']});
-        border-radius: {RADIUS_SM}px;
-        padding: {s['popupPadding']}px;
-    }}
-    .card.flat {{ background: transparent; }}
-
-    /* ---- PanelSectionHeader analogue ---- */
-    .sectionhead {{
-        font-size: {f['caption']}px;
-        font-weight: bold;
-        letter-spacing: 1.2px;
-        color: alpha({fg}, {d['section']});
-    }}
+    .sectionhead {{ font-size: {f['title']}px; font-weight: bold;
+                    color: {fg}; }}
     .sep {{ background: alpha({fg}, {d['hairline']}); min-height: 1px; }}
 
     /* Text selection. Without this a selectable label paints the stock
@@ -206,14 +252,24 @@ def css_for(c: dict) -> str:
     label selection {{ background-color: alpha({fg}, 0.22); color: {fg}; }}
     entry selection {{ background-color: alpha({fg}, 0.22); color: {fg}; }}
 
-    /* ---- rows ---- */
+    /* ---- rows ----
+       Every readable string sits at {d['label']} or above against the
+       background; {d['hint']} and below are for rules, marks and the
+       deliberately-unreadable disabled state only. */
     .rowlabel {{ font-size: {f['body']}px; }}
-    .rowdoc {{ font-size: {f['caption']}px; color: alpha({fg}, {d['hint']}); }}
+    .rowdoc {{ font-size: {f['bodySmall']}px;
+               color: alpha({fg}, {d['label']}); }}
     .value  {{ font-size: {f['bodySmall']}px;
                color: alpha({fg}, {d['label']}); }}
     .mono   {{ font-size: {f['bodySmall']}px; }}
+    /* What a setting is currently doing, in the trailing column. `.risk`
+       is the one that has to be seen from across the pane. */
+    .statenote {{ font-size: {f['caption']}px;
+                  color: alpha({fg}, {d['label']}); }}
+    .statenote.risk {{ color: {fg}; font-weight: bold; }}
     .locked-value {{ font-size: {f['bodySmall']}px; color: {accent};
-                     font-weight: bold; letter-spacing: 1.2px; }}
+                     font-weight: bold; }}
+    label:disabled {{ color: alpha({fg}, {d['faint']}); }}
 
     /* ---- controls ---- */
     entry {{
@@ -225,10 +281,12 @@ def css_for(c: dict) -> str:
         caret-color: {fg};
         font-size: {f['bodySmall']}px;
     }}
-    entry:focus {{ border-color: {accent}; }}
+    entry:focus {{ border-color: alpha({fg}, 0.75); }}
     entry.bad {{ border-color: {accent}; background: alpha({accent}, 0.18); }}
     entry:disabled {{ color: alpha({fg}, {d['faint']});
-                      background: transparent; }}
+                      background: transparent;
+                      border-color: alpha({fg}, {d['hairline']}); }}
+    entry > text > placeholder {{ color: alpha({fg}, {d['label']}); }}
 
     spinbutton {{
         background: alpha({fg}, 0.07);
@@ -240,8 +298,12 @@ def css_for(c: dict) -> str:
     spinbutton entry {{ background: transparent; border: none;
                         min-height: {s['controlHeight']}px; }}
     spinbutton button {{ background: transparent; border: none;
-                         color: alpha({fg}, {d['label']}); min-width: 20px; }}
-    spinbutton button:hover {{ color: {fg}; background: alpha({fg}, 0.10); }}
+                         min-width: 20px; }}
+    spinbutton button label {{ color: alpha({fg}, {d['label']}); }}
+    spinbutton button:hover {{ background: alpha({fg}, 0.10); }}
+    spinbutton button:hover label {{ color: {fg}; }}
+    spinbutton:disabled {{ border-color: alpha({fg}, {d['hairline']});
+                           background: transparent; }}
 
     dropdown > button {{
         background: alpha({fg}, 0.07);
@@ -253,6 +315,8 @@ def css_for(c: dict) -> str:
         color: {fg};
     }}
     dropdown > button:hover {{ border-color: alpha({fg}, 0.55); }}
+    dropdown:disabled > button {{ border-color: alpha({fg}, {d['hairline']});
+                                  background: transparent; }}
     popover contents {{
         background: {bg};
         border: 1px solid {border};
@@ -271,8 +335,11 @@ def css_for(c: dict) -> str:
     }}
     switch:checked {{ background: alpha({accent}, 0.55);
                       border-color: {accent}; }}
+    switch:disabled {{ background: transparent;
+                       border-color: alpha({fg}, {d['hairline']}); }}
     switch > slider {{ background: {fg}; border-radius: {RADIUS}px;
                        min-width: 16px; min-height: 16px; }}
+    switch:disabled > slider {{ background: alpha({fg}, {d['faint']}); }}
 
     scale trough {{ background: alpha({fg}, 0.12);
                     border-radius: {RADIUS}px; min-height: 4px; }}
@@ -283,57 +350,56 @@ def css_for(c: dict) -> str:
     /* ---- Ui/Button analogue ---- */
     .act {{
         background: transparent;
-        color: alpha({fg}, 0.85);
         border: 1px solid alpha({fg}, 0.22);
-        border-radius: {RADIUS_SM}px;
+        border-radius: {RADIUS_XS}px;
         padding: {s['labelGap']}px {s['controlPaddingX']}px;
-        font-size: {f['bodySmall']}px;
         min-height: 0;
     }}
-    .act:hover {{ background: alpha({fg}, 0.10); color: {fg}; }}
-    .act:disabled {{ color: alpha({fg}, {d['faint']});
-                     border-color: alpha({fg}, {d['hairline']}); }}
-    .act.primary {{ border-color: {accent}; color: {fg};
-                    background: alpha({accent}, 0.18); }}
-    .act.primary:hover {{ background: alpha({accent}, 0.32); }}
+    .act label {{ font-size: {f['bodySmall']}px;
+                  color: alpha({fg}, 0.85); }}
+    .act:hover {{ background: alpha({fg}, 0.10); }}
+    .act:hover label {{ color: {fg}; }}
+    .act:disabled {{ border-color: alpha({fg}, {d['hairline']});
+                     background: transparent; }}
+    .act:disabled label {{ color: alpha({fg}, {d['faint']}); }}
+    .act.primary {{ border-color: alpha({fg}, 0.50); }}
+    .act.primary label {{ color: {fg}; font-weight: bold; }}
+    .act.primary:hover {{ background: alpha({fg}, 0.14); }}
+    /* A button mid-async is disabled so it cannot be double-fired, but its
+       working label is the only feedback the click gets: it must stay
+       readable, which the ordinary disabled treatment is not. */
+    .act.busy:disabled {{ border-color: alpha({fg}, 0.22); }}
+    .act.busy:disabled label {{ color: alpha({fg}, 0.85);
+                                font-weight: bold; }}
 
-    /* ---- three-way confirmation control ---- */
+    /* ---- the confirmation control: three words, one underlined ----
+       Not three chips. Boxed options made a permissive answer and a
+       restrictive one look like the same object; here the answer in force
+       is the one carrying weight, full contrast and the rule beneath it. */
     .seg {{
         background: transparent;
-        color: alpha({fg}, {d['label']});
-        border: 1px solid alpha({fg}, 0.20);
-        border-radius: {RADIUS_XS}px;
+        border: none;
+        border-radius: 0;
         padding: {s['labelGap']}px {s['md']}px;
-        font-size: {f['caption']}px;
-        letter-spacing: 0.6px;
         min-height: 0;
+        box-shadow: inset 0 -1px 0 0 alpha({fg}, {d['hairline']});
     }}
-    .seg:hover {{ color: {fg}; background: alpha({fg}, 0.08); }}
-    .seg:checked {{ color: {fg}; font-weight: bold;
-                    background: {sel}; border-color: {accent}; }}
+    .seg label {{ font-size: {f['bodySmall']}px;
+                  color: alpha({fg}, {d['label']}); }}
+    .seg:hover {{ background: transparent;
+                  box-shadow: inset 0 -1px 0 0 alpha({fg}, {d['faint']}); }}
+    .seg:hover label {{ color: {fg}; }}
+    .seg:checked {{ box-shadow: inset 0 -{BORDER}px 0 0 alpha({fg}, 0.85); }}
+    .seg:checked label {{ color: {fg}; font-weight: bold; }}
+    .seg:disabled {{ box-shadow: none; }}
 
-    /* ---- the four immovable denies: text, not widgets ---- */
-    .lockedcard {{
-        border: 1px dashed alpha({accent}, 0.65);
-        border-radius: {RADIUS_SM}px;
-        padding: {s['popupPadding']}px;
-        background: alpha({muted}, 0.10);
-    }}
-    .lockedname {{ font-size: {f['body']}px; font-weight: bold; }}
-    .lockedwhy  {{ font-size: {f['caption']}px;
-                   color: alpha({fg}, {d['label']}); }}
-    .lockmark {{ font-size: {f['bodySmall']}px; color: {accent}; }}
-
-    /* ---- banners ---- */
+    /* ---- banners: a strip across the window, not a floating box ---- */
     .banner {{
-        border: 1px solid alpha({fg}, 0.35);
-        border-radius: {RADIUS_SM}px;
-        padding: {s['controlPaddingY']}px {s['controlPaddingX']}px;
-        font-size: {f['bodySmall']}px;
+        background: alpha({muted}, 0.30);
+        border-bottom: 1px solid alpha({fg}, {d['hairline']});
+        padding: {s['controlPaddingY']}px {s['panelPadding']}px;
     }}
-    .banner.warn {{ border-color: {accent};
-                    background: alpha({accent}, 0.14); }}
-    .banner.ok {{ border-color: alpha({fg}, {d['faint']}); }}
+    .banner.warn {{ border-bottom-color: alpha({accent}, 0.55); }}
 
     /* ---- usage meters ----
        Selectors are qualified with `trough` so they out-specify the stock
