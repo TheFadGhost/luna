@@ -72,6 +72,16 @@ class VoicePick(Field):
     default: str = ""
 
 
+@dataclass(frozen=True)
+class ModelPick(Text):
+    """A model slug for `assistant.model`. Free text, exactly like Text —
+    a slug for a model released after this file was last touched must not
+    be rejected — but marked as its own kind so the GUI can offer
+    per-agent suggestions (jarvis.models) and an inline "not a known slug
+    for this agent" hint instead of treating it as an ordinary string
+    field with no guidance at all."""
+
+
 # "never" (just do it) | "ask" (confirm first) | "deny" (refuse outright)
 TRI = ("never", "ask", "deny")
 TRI_LABELS = {"never": "Never ask", "ask": "Ask first", "deny": "Never allow"}
@@ -108,9 +118,9 @@ SPEC: tuple[Section, ...] = (
             Choice("agent", "Agent",
                    "Headless CLI that does the thinking. Falls back to "
                    "~/.config/omarchy/defaults/agent.",
-                   default="claude", options=("claude", "codex")),
-            Text("model", "Model", "Empty means the agent's own default.",
-                 default="", placeholder="agent default"),
+                   default="codex", options=("claude", "codex")),
+            ModelPick("model", "Model", "Empty means the agent's own default.",
+                      default="", placeholder="agent default"),
         ),
     ),
     Section(

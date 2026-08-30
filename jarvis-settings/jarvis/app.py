@@ -16,7 +16,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gio, GLib, Gtk  # noqa: E402
 
-from . import client, config, panes, theme, voices
+from . import async_util, client, config, panes, theme, voices
 from .editor import Editor
 from .theme import SPACE
 from .widgets import act, banner, column, label, rowbox
@@ -85,6 +85,7 @@ class JarvisApp(Gtk.Application):
         self._daemon_label = None
         self._daemon_start = None
         self._pane_widgets = {}
+        self._daemon_fetching = False
 
     # ------------------------------------------------------------ lifecycle
     def do_command_line(self, cmdline):
@@ -338,19 +339,38 @@ class JarvisApp(Gtk.Application):
         GLib.timeout_add_seconds(1, lambda: (self.refresh_daemon(), False)[1])
 
     def refresh_daemon(self):
-        up = client.alive(timeout=0.6)
+        """Kick off a background daemon-liveness check; the banner and the
+        "who" line update when it lands. Safe to call again while one is
+        already in flight — the call is simply skipped, so a slow or
+        hanging daemon does not pile up overlapping probes on the 5s timer
+        (each one blocked the GTK main loop for up to ~7s before this).
+        """
+        if self._daemon_fetching:
+            return
+        self._daemon_fetching = True
+
+        def work():
+            up = client.alive(timeout=0.6)
+            if up and self.editor.settings.supported is None:
+                self.editor.settings.get()      # one cheap capability probe
+            return up
+
+        def done(up, error):
+            self._daemon_fetching = False
+            self._apply_daemon_state(bool(up) and error is None)
+            return False
+
+        async_util.run_async(work, done)
+
+    def _apply_daemon_state(self, up):
         self._banner_wrap.set_visible(not up)
         if not up:
             self._daemon_label.set_text(
                 "lunad is not running. Settings still save to config.toml and "
                 "apply when it next starts.")
-        else:
-            if self.editor.settings.supported is None:
-                self.editor.settings.get()      # one cheap capability probe
         self._who.set_text(
             f"{self.editor.get('assistant.name')} · "
             f"{self.editor.get('assistant.specialist')}")
-        return up
 
     def _poll_daemon(self):
         self.refresh_daemon()

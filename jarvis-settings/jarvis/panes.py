@@ -16,7 +16,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 
-from . import client, config, schema, state, voices, voxtype
+from . import async_util, client, config, models, schema, state, voices, voxtype
 from .theme import SPACE
 from .widgets import (TriToggle, act, banner, card, column, label,
                       locked_entry, row, rowbox, scroller, section_header,
@@ -55,16 +55,19 @@ class Binder:
         if isinstance(fld, schema.Real):
             return self._spin(dotted, fld.min, fld.max, fld.step, fld.digits,
                               value, width)
+        if isinstance(fld, schema.ModelPick):
+            return self._model_entry(dotted, fld, value, width)
         if isinstance(fld, schema.Text):
             return self._entry(dotted, fld, value, width)
         return label(str(value), css=("value",))
 
-    def bound_row(self, dotted, width=200, extra=()):
+    def bound_row(self, dotted, width=200, extra=(), ctl=None):
         found = schema.field_for(dotted)
         if found is None:
             return label(f"missing {dotted}", css=("rowdoc",))
         _sec, fld = found
-        ctl = self.control_for(dotted, width)
+        if ctl is None:
+            ctl = self.control_for(dotted, width)
         unit = getattr(fld, "unit", "")
         parts = [ctl]
         if unit and not isinstance(fld, schema.Real):
@@ -205,6 +208,95 @@ class Binder:
         self._refresh[dotted] = put
         return e
 
+    def _model_entry(self, dotted, fld, value, width):
+        """`assistant.model`: free text (any slug is accepted — see
+        schema.ModelPick) with per-agent suggestions and a non-blocking
+        "not a known slug" hint below the field. The current agent is
+        pushed in from outside via the box's `jarvis_set_agent(agent)`,
+        wired up in assistant_pane once both controls exist.
+
+        Presentation is deliberately plain (existing "rowdoc" hint style,
+        no new CSS) — a design pass owns how this looks; this is the logic
+        that pass will hang its presentation off.
+        """
+        outer = column(SPACE["labelGap"] // 2)
+        e = Gtk.Entry()
+        e.set_text(str(value or ""))
+        e.set_size_request(width, -1)
+        completion = Gtk.EntryCompletion()
+        store = Gtk.ListStore(str)
+        completion.set_model(store)
+        completion.set_text_column(0)
+        completion.set_inline_completion(False)
+        completion.set_popup_completion(True)
+        e.set_completion(completion)
+        hint = label("", css=("rowdoc",), wrap=True)
+        outer.append(e)
+        outer.append(hint)
+
+        agent_state = {"agent": ""}
+
+        def refresh_hint(entry):
+            text = entry.get_text().strip()
+            opts = models.suggestions_for(agent_state["agent"])
+            if not text or text in opts:
+                hint.set_text("")
+                return
+            agent = agent_state["agent"] or "this agent"
+            hint.set_text(f"not a known {agent} slug — saved as typed")
+
+        def set_agent(agent):
+            agent_state["agent"] = agent
+            store.clear()
+            opts = models.suggestions_for(agent)
+            for s in opts:
+                store.append([s])
+            e.set_placeholder_text(
+                f"agent default, e.g. {opts[0]}" if opts else "agent default")
+            refresh_hint(e)
+
+        set_agent(agent_state["agent"])
+
+        guard = {"muted": False}
+
+        def changed(w):
+            if guard["muted"]:
+                return
+            try:
+                config.coerce(dotted, w.get_text())
+            except config.ValidationError:
+                w.add_css_class("bad")
+                return
+            w.remove_css_class("bad")
+            self.editor.set(dotted, w.get_text())
+            refresh_hint(w)
+
+        e.connect("changed", changed)
+        focus = Gtk.EventControllerFocus()
+
+        def left(ctl):
+            w = ctl.get_widget()
+            if "bad" in w.get_css_classes():
+                guard["muted"] = True
+                w.set_text(str(self.editor.get(dotted) or ""))
+                w.remove_css_class("bad")
+                guard["muted"] = False
+                refresh_hint(w)
+
+        focus.connect("leave", left)
+        e.add_controller(focus)
+
+        def put(v):
+            guard["muted"] = True
+            e.set_text(str(v or ""))
+            e.remove_css_class("bad")
+            guard["muted"] = False
+            refresh_hint(e)
+
+        self._refresh[dotted] = put
+        outer.jarvis_set_agent = set_agent
+        return outer
+
 
 # ------------------------------------------------------------------ helpers
 
@@ -256,21 +348,68 @@ def open_path(path):
 def assistant_pane(b):
     keys = ("assistant.name", "assistant.specialist", "assistant.agent",
             "assistant.model")
+    agent_ctl = b.control_for(keys[2])
+    model_ctl = b.control_for(keys[3], width=240)
+
+    def on_agent_changed(w, _p):
+        opts = getattr(w, "jarvis_options", None) or ()
+        i = w.get_selected()
+        set_agent = getattr(model_ctl, "jarvis_set_agent", None)
+        if set_agent is not None and 0 <= i < len(opts):
+            set_agent(opts[i])
+
+    agent_ctl.connect("notify::selected", on_agent_changed)
+    # Prime the model hint/suggestions from whatever the agent dropdown
+    # already shows, rather than waiting for the first change.
+    on_agent_changed(agent_ctl, None)
+
     return pane(
         head("Assistant",
              "Who she is. The name is a setting, so every prompt, greeting "
              "and log label follows it."),
         group("Identity", b.bound_row(keys[0]), b.bound_row(keys[1])),
-        group("Brain", b.bound_row(keys[2]), b.bound_row(keys[3])),
+        group("Brain",
+              b.bound_row(keys[2], ctl=agent_ctl),
+              b.bound_row(keys[3], width=240, ctl=model_ctl)),
     )
+
+
+def _busy_click(btn, working_label, work, on_done):
+    """Disable `btn` and swap its label for the duration of `work` (run off
+    the GTK thread), so it cannot be clicked twice while a preview/say/
+    restart is in flight, and so it visibly shows it is doing something.
+    `on_done(result, error)` runs back on the GTK thread with the button
+    already restored to normal."""
+    if not btn.get_sensitive():
+        return                      # already working; a second click is a no-op
+    orig = btn.get_label()
+    btn.set_sensitive(False)
+    btn.set_label(working_label)
+
+    def done(result, error):
+        btn.set_label(orig)
+        btn.set_sensitive(True)
+        on_done(result, error)
+        return False
+
+    async_util.run_async(work, done)
 
 
 def voice_pane(b, player, on_status):
     def preview(dotted):
-        def clicked(_btn):
-            ok, path = player.preview(b.editor.get(dotted))
-            on_status(("Preview: " if ok else "Preview failed: ") + path,
-                      "ok" if ok else "error")
+        def clicked(btn):
+            def work():
+                return player.preview(b.editor.get(dotted))
+
+            def done(result, error):
+                if error is not None:
+                    on_status(f"Preview failed: {error}", "error")
+                    return
+                ok, path = result
+                on_status(("Preview: " if ok else "Preview failed: ") + path,
+                          "ok" if ok else "error")
+
+            _busy_click(btn, "Playing…", work, done)
         return clicked
 
     prev_a = act("▶ Preview")
@@ -280,10 +419,19 @@ def voice_pane(b, player, on_status):
 
     live = act("Test the live pipeline")
 
-    def test(_btn):
-        ok, detail = player.speak_via_daemon()
-        on_status(("Spoke via " if ok else "Could not speak: ") + detail,
-                  "ok" if ok else "error")
+    def test(btn):
+        def work():
+            return player.speak_via_daemon()
+
+        def done(result, error):
+            if error is not None:
+                on_status(f"Could not speak: {error}", "error")
+                return
+            ok, detail = result
+            on_status(("Spoke via " if ok else "Could not speak: ") + detail,
+                      "ok" if ok else "error")
+
+        _busy_click(btn, "Testing…", work, done)
 
     live.connect("clicked", test)
 
@@ -379,17 +527,24 @@ def listen_pane(b, on_status):
             lines.append(label(text, css=css, wrap=True))
         restart.set_sensitive(voxtype.activity() not in voxtype.BUSY)
 
-    def do_restart(_btn):
-        state = voxtype.activity()
+    def do_restart(btn):
+        state = voxtype.activity()          # a small local file; not a block
         if state in voxtype.BUSY:
             on_status(f"voxtype is {state} — not restarting mid-recording",
                       "error")
             return
-        ok, detail = voxtype.restart()
-        on_status(("Restarted voxtype · " if ok else
-                   "Could not restart voxtype · ") + detail,
-                  "ok" if ok else "error")
-        rebuild()
+
+        def done(result, error):
+            if error is not None:
+                on_status(f"Could not restart voxtype · {error}", "error")
+            else:
+                ok, detail = result
+                on_status(("Restarted voxtype · " if ok else
+                           "Could not restart voxtype · ") + detail,
+                          "ok" if ok else "error")
+            rebuild()          # the authority on restart's sensitivity, last
+
+        _busy_click(btn, "Restarting…", voxtype.restart, done)
 
     restart.connect("clicked", do_restart)
     rebuild()
@@ -637,6 +792,7 @@ def jobs_pane(b):
 
 def about_pane(b, on_start):
     lines = column(SPACE["md"])
+    fetching = {"busy": False}
 
     def kv(k, v, css=("value",)):
         r = rowbox()
@@ -646,20 +802,18 @@ def about_pane(b, on_start):
         r.append(label(v, css=css, wrap=True))
         return r
 
-    def rebuild():
+    def render(st, up, unit, error):
         child = lines.get_first_child()
         while child is not None:
             nxt = child.get_next_sibling()
             lines.remove(child)
             child = nxt
-        try:
-            st = client.status(timeout=2.0)
-            up = True
-        except (client.DaemonDown, client.OpFailed):
-            st, up = {}, False
-        d = st.get("daemon") or {}
+        d = (st or {}).get("daemon") or {}
         lines.append(kv("Daemon", "running" if up else "not running"))
-        lines.append(kv("systemd unit", f"lunad · {client.unit_state()}"))
+        lines.append(kv("systemd unit", f"lunad · {unit}"))
+        if error is not None:
+            lines.append(kv("Status check", f"failed — {error}",
+                            css=("locked-value",)))
         if up:
             lines.append(kv("Version", str(d.get("version") or "?")))
             lines.append(kv("Protocol", str(d.get("protocol") or "?")))
@@ -682,7 +836,41 @@ def about_pane(b, on_start):
             "The key itself is never read, never shown and never written to "
             "config.toml.", css=("rowdoc",), wrap=True))
 
-    rebuild()
+    def rebuild():
+        if fetching["busy"]:
+            return
+        fetching["busy"] = True
+        orig = refresh.get_label()
+        refresh.set_sensitive(False)
+        refresh.set_label("Checking…")
+        child = lines.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            lines.remove(child)
+            child = nxt
+        lines.append(label("Checking daemon status…", css=("rowdoc",)))
+
+        def work():
+            try:
+                st = client.status(timeout=2.0)
+                up = True
+            except (client.DaemonDown, client.OpFailed):
+                st, up = {}, False
+            unit = client.unit_state()
+            return st, up, unit
+
+        def done(result, error):
+            fetching["busy"] = False
+            refresh.set_label(orig)
+            refresh.set_sensitive(True)
+            if error is not None:
+                render(None, False, "unknown", str(error))
+            else:
+                st, up, unit = result
+                render(st, up, unit, None)
+            return False
+
+        async_util.run_async(work, done)
 
     audit = rowbox()
     al = label(str(state.AUDIT_PATH))
@@ -742,4 +930,5 @@ def about_pane(b, on_start):
         group("Files", audit, cfg),
         unknown)
     p.jarvis_refresh = rebuild
+    rebuild()          # first fetch, now that `refresh` exists to be labelled
     return p
