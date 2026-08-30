@@ -1164,13 +1164,25 @@ class _Handler(socketserver.StreamRequestHandler):
         peer = "unix"
         while True:
             try:
-                line = self.rfile.readline()
+                line = protocol.read_line(self.rfile)
             except (TimeoutError, socket.timeout):
                 log.info("client idle timeout", extra={"peer": peer})
                 return
             except OSError as exc:
                 if exc.errno not in (errno.ECONNRESET, errno.EPIPE):
                     log.warning("read error", extra={"detail": str(exc)})
+                return
+            except protocol.ProtocolError as exc:
+                # An oversized line is refused *while* it is being read, so the
+                # rest of it is still unread in the socket buffer. Resyncing
+                # mid-garbage is not worth attempting: answer once, then close.
+                try:
+                    self.wfile.write(
+                        protocol.encode(
+                            protocol.err(None, "ProtocolError", str(exc))))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
                 return
             if not line:
                 return
