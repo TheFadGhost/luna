@@ -29,6 +29,14 @@ point of paranoia:
     clipboard, which is recoverable, rather than being typed somewhere it
     cannot be taken back.
 
+`[listen] enabled` is honoured here, and this is the only place it could be.
+voxtype owns the microphone and knows nothing about Luna, so "listening off"
+cannot mean "do not record" — F10 still records. It means the transcript is not
+handed to her, and voxtype's own `fallback_on_empty` then delivers it to the
+clipboard, which is the same containment the rest of this file relies on.
+Unlike the other three `[listen]` keys it needs no voxtype restart, because
+nothing on voxtype's side of the boundary has changed.
+
 Diagnostics go to a small rotating file, never to stdout and never to stderr —
 voxtype logs our stderr, and a chatty hook makes its logs useless.
 """
@@ -72,6 +80,32 @@ def read_transcript() -> str:
         return ""
 
 
+def listening_enabled() -> bool:
+    """``[listen] enabled``, read fresh for every transcript.
+
+    Fails **open**. Every other failure path in this file ends with the
+    transcript on the clipboard, which is recoverable; this one decides whether
+    Luna is spoken to at all, and a config file that cannot be read is not a
+    reason to stop answering her. So anything that goes wrong here means yes.
+    """
+    try:
+        import logging
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from lunad import settings  # noqa: PLC0415
+
+        # lunad's settings logger warns when the config file is missing or
+        # unparseable, and with no handler installed Python's last-resort
+        # handler puts that on stderr — which voxtype captures into its own
+        # journal. A hook that adds a line to the daemon's log every time
+        # somebody speaks is a hook whose logs stop being worth reading.
+        logging.getLogger("lunad").addHandler(logging.NullHandler())
+        return bool(settings.Settings(create=False).get("listen.enabled", True))
+    except Exception:  # noqa: BLE001 - deliberately total
+        return True
+
+
 def dispatch(transcript: str) -> str:
     """Hand the transcript to lunad. Returns a short outcome for the log."""
     import json
@@ -89,6 +123,12 @@ def dispatch(transcript: str) -> str:
                    if ch == "\n" or ch == "\t" or ord(ch) >= 0x20).strip()
     if not text:
         return "empty transcript, nothing sent"
+    if not listening_enabled():
+        # Nothing is printed and nothing is sent, so voxtype takes its own
+        # fallback path and delivers the original transcript through the
+        # profile's output_mode = "clipboard". Turning listening off therefore
+        # does not lose what was said; it stops it reaching Luna.
+        return "listening is off ([listen] enabled = false); nothing sent"
     if len(text) > config.ROUTER_MAX_TRANSCRIPT_CHARS:
         # Not a refusal: a minute of speech is a legitimate long transcript.
         # The cap exists so a runaway STT cannot post a megabyte to the socket.

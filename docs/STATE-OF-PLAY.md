@@ -380,8 +380,10 @@ with `max_spoken_chars` was only its fallback constant, not its wiring.
 `[dispatch] job_retention_days`, and the whole of `[listen]`. Each needs a
 subsystem that does not exist, or belongs to another process; see
 `docs/CONFIG-SCHEMA.md` §Not wired for what each one actually requires.
-(All four were wired in the end: `consolidate_every_turns` in Phase 2d and the
-two `[dispatch]` keys in Phase 2e, both below. `[listen]` is still voxtype's.)
+(All four were wired in the end: `consolidate_every_turns` in Phase 2d, the
+two `[dispatch]` keys in Phase 2e and `[listen]` in Phase 2f, all below.
+`[listen]` is still voxtype's — it is written *through* to voxtype's own file
+rather than read by `lunad`.)
 
 - 484 tests pass in the root suite, up from 447; 59 in `jarvis-settings`, up
   from 53. Verified on the final run: no window opened, no toast fired
@@ -669,3 +671,75 @@ said `implemented = False`.
   worked since Phase 0), and this file's Phase 3 list said the same.
 - 548 tests pass in the root suite, up from 484; 59 in `jarvis-settings`,
   unchanged.
+
+### Phase 2f — the `[listen]` write-through (2026-08-30)
+
+The last block in the contract that was a lie. Five keys the settings app
+displayed, let you edit, and did nothing with — honestly documented as a
+mirror, which is better than pretending, but a knob that turns and moves
+nothing is still a knob that should not be there.
+
+**The objection to wiring it was real, and it is not the one that got
+answered.** Listening is voxtype's: another process, another config file,
+written in Rust, which has never heard of Luna. `lunad` cannot honour those
+keys and still does not. What it can do — what `jarvis-settings/jarvis/voxtype.py`
+now does — is **write them through** to the file that owns them.
+
+- **`provider` → `[whisper] mode`, `model` → `[whisper] model`, `language` →
+  `[whisper] language`.** Projected from the whole `[listen]` block rather than
+  from the key that changed, because `model` cannot be projected without
+  knowing `provider`: the same string means an OpenRouter model id in remote
+  mode and a whisper model name in local mode, and voxtype reads it out of the
+  same key either way.
+- **The gotcha already in voxtype's own file is now enforced by code.** In
+  `mode = "remote"` voxtype sends `model` to the endpoint and *not*
+  `remote_model`, despite `remote_model` being a real field in its config
+  struct — the symptom is `model=base.en` in the journal and an HTML error
+  page back from OpenRouter. So a remote write sets both, and the file keeps
+  one answer rather than two. Going the other way is guarded too: `provider =
+  local` with a model that is neither a whisper name nor an absolute path to a
+  `.bin` is **refused with the list of names**, because voxtype would treat an
+  OpenRouter id as a path and stop transcribing with the reason only in the
+  journal.
+- **voxtype is restarted, and that is the whole point.** §8a.2 of
+  `CUSTOMISATIONS.md` records what skipping it looks like: the file is right,
+  the app is satisfied, and the daemon carries on with what it loaded at
+  start-up. A write-through without a restart changes nothing and *looks like
+  it worked*, which is worse than not writing at all.
+- **A recording refuses the entire save.** While voxtype's state file says
+  `recording` or `transcribing`, nothing is written — not the file, not a
+  promise to apply it later. A half-applied change is precisely the state the
+  restart exists to avoid, and losing someone's dictation to a settings save is
+  not a trade this app gets to make.
+- **Whether the running daemon has read the file is a separate question from
+  whether the two files agree**, and both are shown. Drift compares
+  `config.toml` against voxtype's file key by key and names the value on each
+  side, resolving nothing; staleness dates the daemon from the mtime of its
+  `/proc` entry — its pid file checked against `/proc/<pid>/comm`, because
+  Linux recycles pids — and says so with the restart offered as a button.
+- **Two of the five did not cross, and were not forced.** `keybind` is
+  Hyprland's and stays displayed-only. `enabled` has no voxtype equivalent at
+  all, so it is honoured in `bin/luna-voice-router` instead — the one place the
+  Luna boundary exists. Off, the router sends nothing and prints nothing, so
+  voxtype's own `fallback_on_empty` delivers the transcript through the
+  profile's `output_mode = "clipboard"`: turning listening off does not lose
+  what was said, it stops it reaching her. It fails **open**, because every
+  other failure path in that script ends with the transcript on the clipboard
+  and this one would end with her never answering.
+- **The settings suite got a guard module it did not have.** `jarvis-settings`
+  had nothing that could reach outside itself, so it had no equivalent of
+  `tests/_support.py`. It does now: a test that forgot to pass a temporary path
+  would rewrite `~/.config/voxtype/config.toml` and bounce the real daemon,
+  losing whatever was being dictated. The config path, the restart command, the
+  state file and the pid file are all replaced process-wide at import, and
+  `test_voxtype.py::GuardTest` asserts it.
+- **Found, not fixed.** The pre-existing router tests redirect only
+  `XDG_RUNTIME_DIR`, so they append to the user's real
+  `~/.local/share/luna/voice-router.log`. It is the router's own log and the
+  damage is a few lines of test noise, but it is the same class of bug the
+  guards exist for. The cases added in this pass redirect all three XDG
+  variables.
+- 615 tests pass in the root suite, up from 610; 98 in `jarvis-settings`, up
+  from 59. Verified against the live machine read-only: drift reported none,
+  `stale()` reported false, and the real voxtype was neither written to nor
+  restarted.

@@ -39,7 +39,7 @@ system.
 |---|---|---|
 | 1 | Assistant | `[assistant]` — name, specialist, agent, model |
 | 2 | Voice | `[voice]` — provider, TTS model, both voice pickers with per-voice preview, fallback, speed, spoken-length cap |
-| 3 | Listening | `[listen]` — provider, STT model, language; the keybind is **displayed, not editable** (it lives in `~/.config/hypr/bindings.lua`) |
+| 3 | Listening | `[listen]` — provider, STT model and language, **written through to `~/.config/voxtype/config.toml`**; the on/off switch, which is the router's; and the keybind, **displayed, not editable** (it lives in `~/.config/hypr/bindings.lua`) |
 | 4 | Confirmations | `[confirm]` + `[confirm.prompt]` — a three-way **Never ask / Ask first / Never allow** per action class, plus the four immovable denies |
 | 5 | Memory | `[memory]` caps and decay, live usage bars read from `~/.local/share/luna/memory/`, and a read-only **View memories** window |
 | 6 | Jobs | `[dispatch]` plus the recent job list read from `~/.local/share/luna/jobs/` |
@@ -56,8 +56,44 @@ system.
    hot-reloads, so the file path works with the socket path or without it.
 
 If the daemon is down, a banner across the top says so and offers
-`systemctl --user start lunad`. That is the only process Jarvis ever starts,
-and it stops or signals nothing at all except its own `aplay` preview child.
+`systemctl --user start lunad`. The only other process Jarvis touches is
+**voxtype**, and only through `systemctl --user restart voxtype` after a
+`[listen]` write-through — see below. It signals nothing at all, and the only
+child it spawns is its own `aplay` preview.
+
+### Step 4, for `[listen]` only: writing through to voxtype
+
+Three of the five `[listen]` keys are not `lunad`'s and never were. Listening
+belongs to **voxtype**, a separate daemon with its own
+`~/.config/voxtype/config.toml`, so for a long time those keys were a mirror
+kept for display: editing one changed nothing. `jarvis/voxtype.py` makes them
+real.
+
+* `provider` becomes `[whisper] mode`, `model` becomes `[whisper] model` and
+  `language` becomes `[whisper] language`. In remote mode `remote_model` is
+  written alongside `model`, because **voxtype sends `model` to the endpoint,
+  not `remote_model`** — a gotcha recorded in a comment in its own file, whose
+  symptom is an HTML error page from OpenRouter and a journal line naming a
+  model the endpoint has never heard of.
+* The edit goes through the same `tomledit` used for `config.toml`, so
+  voxtype's comments, key order and every table Jarvis has never heard of come
+  back untouched. The first write takes a `config.toml.pre-jarvis` snapshot,
+  following the `.pre-luna` / `.pre-openrouter` / `.pre-osd` convention already
+  in that directory, and never overwrites it afterwards.
+* **voxtype is restarted**, because it reads its config once at start-up. A
+  write-through without the restart would leave the file right, the app
+  satisfied and the microphone behaving exactly as before.
+* **A recording refuses the whole save.** While voxtype's state file says
+  `recording` or `transcribing`, nothing is written — not even a promise to
+  finish later.
+* **Drift is shown, not resolved.** If voxtype's file is edited by hand, the
+  Listening pane names each key the two disagree on and the value on each side.
+  Neither file overwrites the other until a listening setting is saved here.
+
+The other two keys stayed honest rather than being forced across:
+`[listen] enabled` is honoured by `bin/luna-voice-router`, the only place the
+Luna boundary exists, and takes effect on the next utterance with no restart of
+anything; `[listen] keybind` is Hyprland's and is displayed, never written.
 
 ### Writing the file
 

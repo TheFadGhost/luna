@@ -16,7 +16,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 
-from . import client, config, schema, state, voices
+from . import client, config, schema, state, voices, voxtype
 from .theme import SPACE
 from .widgets import (TriToggle, act, banner, card, column, label,
                       locked_entry, row, rowbox, scroller, section_header,
@@ -311,14 +311,90 @@ def voice_pane(b, player, on_status):
     )
 
 
-def listen_pane(b):
+def _voxtype_report(values):
+    """Lines for the Listening pane: where the two files disagree, and whether
+    the running daemon has read either of them.
+
+    Both questions have to be asked, because they fail independently. A save
+    that could not restart voxtype leaves the files in step and the *daemon*
+    out of step, which is the §8a.2 gotcha and looks like success from every
+    angle except the microphone.
+    """
+    try:
+        rows = voxtype.drift(values)
+    except voxtype.VoxtypeError as exc:
+        return [(str(exc), ("locked-value",))]
+    out = []
+    if rows:
+        out.append(("Jarvis and voxtype disagree. Neither file is changed to "
+                    "match the other until you save a listening setting here.",
+                    ("locked-value",)))
+        for r in rows:
+            out.append((f"{r['key'].rpartition('.')[2]} · Jarvis has "
+                        f"{r['jarvis']!r}, voxtype's file has {r['voxtype']!r}",
+                        ("rowdoc",)))
+    else:
+        out.append((f"In step with {voxtype.CONFIG_PATH}.", ("rowdoc",)))
+    reading = voxtype.stale()
+    if reading is True:
+        out.append(("voxtype started before that file was last changed, so it "
+                    "is still listening with what it loaded then. It only "
+                    "reads its config at start-up — restart it.",
+                    ("locked-value",)))
+    elif reading is None:
+        out.append(("voxtype is not running. It reads that file when it "
+                    "starts, so the settings are already waiting for it.",
+                    ("rowdoc",)))
+    return out
+
+
+def listen_pane(b, on_status):
     kb = b.editor.get("listen.keybind")
     note = label(
         f"{kb} runs `voxtype record toggle --profile luna`. The binding lives "
         "in ~/.config/hypr/bindings.lua and is edited there — changing it here "
         "would put Jarvis and Hyprland out of step.",
         css=("rowdoc",), wrap=True)
-    return pane(
+    mapping = label(
+        "Provider, model and language are written through to "
+        f"{voxtype.CONFIG_PATH} — provider becomes [whisper] mode, model "
+        "becomes [whisper] model (and remote_model with it, in remote mode), "
+        "language becomes [whisper] language — and voxtype is restarted, "
+        "because it reads its config only at start-up. A save is refused "
+        "outright while a recording is in flight. Listening on/off is Luna's "
+        "own and needs no restart: with it off, F10 still records and the "
+        "transcript goes to the clipboard instead of to her.",
+        css=("rowdoc",), wrap=True)
+
+    lines = column(SPACE["labelGap"])
+    restart = act("Restart voxtype")
+
+    def rebuild():
+        child = lines.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            lines.remove(child)
+            child = nxt
+        for text, css in _voxtype_report(b.editor.values):
+            lines.append(label(text, css=css, wrap=True))
+        restart.set_sensitive(voxtype.activity() not in voxtype.BUSY)
+
+    def do_restart(_btn):
+        state = voxtype.activity()
+        if state in voxtype.BUSY:
+            on_status(f"voxtype is {state} — not restarting mid-recording",
+                      "error")
+            return
+        ok, detail = voxtype.restart()
+        on_status(("Restarted voxtype · " if ok else
+                   "Could not restart voxtype · ") + detail,
+                  "ok" if ok else "error")
+        rebuild()
+
+    restart.connect("clicked", do_restart)
+    rebuild()
+
+    p = pane(
         head("Listening", "How she hears you. Transcription runs through "
                           "voxtype's post-process hook."),
         group("Input",
@@ -327,7 +403,13 @@ def listen_pane(b):
               b.bound_row("listen.model", width=240),
               b.bound_row("listen.language", width=120)),
         group("Push-to-talk", b.bound_row("listen.keybind", width=200), note),
+        group("voxtype", mapping, lines,
+              row("voxtype's own config",
+                  "It reads the file once, at start-up.", restart,
+                  control_width=200)),
     )
+    p.jarvis_refresh = rebuild
+    return p
 
 
 def confirm_pane(b):

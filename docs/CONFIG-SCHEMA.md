@@ -12,8 +12,10 @@ Secrets NEVER live here — see §Secrets.
 the GUI wrote the whole file while the daemon used hard-coded constants for most
 of it, so a setting could be changed, saved, redisplayed and have no effect
 whatsoever. The §Wiring table at the end of this document is the record of what
-reads what; the one table that belongs to another process entirely is named
-there explicitly rather than left to be discovered.
+reads what. Not all of it is `lunad`: `[listen]` belongs to voxtype, in another
+process with another config file, and the settings app writes those keys
+through to it rather than pretending to own them. The table names each reader
+explicitly rather than leaving it to be discovered.
 
 Where a key has a matching constant in `lunad/config.py`, that constant is a
 **fallback only** — what a daemon with no config file at all uses. The setting
@@ -38,12 +40,16 @@ piper_voice  = "en_GB-jenny_dioco-medium"
 speed        = 1.0
 max_spoken_chars = 400       # longer replies are summarised for speech, full text on screen
 
+# Listening is voxtype's, in ~/.config/voxtype/config.toml. The middle three
+# keys are written through to that file and voxtype is restarted, because it
+# reads its config only at start-up. The other two are not voxtype's at all,
+# and say whose they are.
 [listen]
-enabled      = true
-provider     = "openrouter"  # openrouter | local
-model        = "fish-audio/transcribe-1"
-language     = "en"
-keybind      = "F10"
+enabled      = true          # routes speech to her — bin/luna-voice-router, live
+provider     = "openrouter"  # openrouter | local  ->  voxtype [whisper] mode
+model        = "fish-audio/transcribe-1"   # ->  voxtype [whisper] model
+language     = "en"          # ->  voxtype [whisper] language
+keybind      = "F10"         # Hyprland's, in ~/.config/hypr/bindings.lua
 
 [confirm]
 # The safety model. NOT hard blocks — Jarvis asks first, then proceeds.
@@ -97,7 +103,9 @@ notify_on_finish = true
 
 **Live** means the next request already sees the change; the settings watcher
 stats the file every two seconds and the value is read at the point of use.
-Nothing in this table needs a `lunad` restart.
+Nothing in this table needs a `lunad` restart. Three keys need a **voxtype**
+restart, which is a different daemon and a different promise; they are the
+`[listen]` table below and they say so.
 
 ### `[assistant]`
 
@@ -124,12 +132,47 @@ Nothing in this table needs a `lunad` restart.
 
 ### `[listen]`
 
-**Not read by `lunad`, and cannot be.** Listening is voxtype's, in a separate
-process with its own config file, wired to Luna through the
-`bin/luna-voice-router` `post_process` hook and the `[profiles.luna]` block in
-`~/.config/voxtype/config.toml`. These keys are a *mirror* of that
-configuration for display, and editing them here changes nothing until the same
-change is made in voxtype's own file. See §Not wired.
+**Still not read by `lunad`** — listening is voxtype's, in a separate process
+with its own config file, wired to Luna through the `bin/luna-voice-router`
+`post_process` hook and the `[profiles.luna]` block in
+`~/.config/voxtype/config.toml`. What changed is that these keys are no longer
+a *mirror* nobody acts on. Three of them are **written through** to voxtype's
+own file by the Jarvis settings app (`jarvis/voxtype.py`) and voxtype is
+restarted; one is honoured on this side of the boundary by the router; and one
+is Hyprland's and stays read-only, because an honest read-only key is better
+than a fake writable one.
+
+| key | read by | effect |
+|---|---|---|
+| `enabled` | `bin/luna-voice-router` | **Live**, next utterance, no restart of anything. Off, the router sends nothing and prints nothing, so voxtype takes its own `fallback_on_empty` path and the transcript lands on the clipboard through the profile's `output_mode`. It cannot mean "do not record": voxtype owns the microphone and has never heard of Luna, so the keybind still records either way. Turning listening off therefore does not lose what was said — it stops it reaching her. Fails **open**: a config file that cannot be read means yes, because every other failure in that script ends with the transcript on the clipboard and this one would end with her not answering at all. |
+| `provider` | **voxtype**, as `[whisper] mode` | Written through, then `systemctl --user restart voxtype`. `openrouter` becomes `remote`, `local` becomes `local`. |
+| `model` | **voxtype**, as `[whisper] model` | Written through with the same restart, and it writes `remote_model` too when the provider is `openrouter` — **the gotcha that costs the time**: in `mode = "remote"` voxtype sends `model` to the endpoint, *not* `remote_model`, despite `remote_model` being a real field in its config struct. The symptom of getting it wrong is a journal line reading `model=base.en` and an HTML error page back from OpenRouter, which has no model of that name. Jarvis keeps the two in step so the file has one answer rather than two, and the wrong one does not look authoritative because of its name. Going the other way, `provider = local` with a model that is neither a whisper model name nor an absolute path to a `.bin` is **refused with the list of names**, because voxtype would treat an OpenRouter id as a path, fail to load it, and stop transcribing with the reason only in the journal. |
+| `language` | **voxtype**, as `[whisper] language` | Written through, same restart. |
+| `keybind` | **the GUI only** | Displayed, never written. The binding lives in `~/.config/hypr/bindings.lua`; writing it here would put Jarvis and Hyprland out of step, and Hyprland is the one holding the key. |
+
+**The restart is the point.** voxtype reads its config once, at start-up. A
+write-through that skipped the restart would leave the file correct, the GUI
+satisfied and the daemon behaving exactly as before — the failure recorded in
+`~/.config/omarchy/CUSTOMISATIONS.md` §8a.2, whose symptom is the journal
+saying `Profile 'luna' not found in config, using default settings` while the
+transcript is typed into whatever window has focus. So Jarvis restarts it, and
+where it could not — the unit failed, or voxtype started after the file was
+last changed — the Listening pane says so and offers the restart as a button.
+
+**A recording outranks a settings save.** While voxtype's state file says
+`recording` or `transcribing`, the write is refused outright and *nothing* is
+written: not the file, not a promise to finish later. Losing somebody's
+dictation to a settings save is not a trade this app gets to make. Save again
+when the recording has finished.
+
+**Drift is reported, never resolved.** Editing `~/.config/voxtype/config.toml`
+by hand is a perfectly reasonable thing to do, and after it Jarvis's copy is
+stale. Neither file silently wins: the Listening pane names each key the two
+disagree on and shows the value on each side, and the disagreement is resolved
+only by saving a listening setting in Jarvis, which pushes Jarvis's answer
+across. `luna settings set listen.model ...` writes `config.toml` and does
+*not* write through — it is the daemon's op and the daemon has no business
+restarting voxtype — so that route creates drift the pane will then show.
 
 ### `[confirm]`, `[confirm.prompt]`
 
@@ -195,25 +238,34 @@ up in `luna status`, in the `consolidated` line in the log next to the ordinary
 
 ## Not wired — and why
 
-**Nothing in `[assistant]`, `[voice]`, `[confirm]`, `[memory]`, `[dispatch]`,
-`[audit]` or `[ui]` is unwired any more.** Every key in those tables is read by
-something and its effect is in the §Wiring table above. This section is kept
-rather than deleted because the thing it records — that a setting which appears
-to work and does not is worse than one documented as pending — is the rule that
-got them all wired, and because one table is still genuinely not `lunad`'s.
+**This list is now empty.** Every key in every table above is read by
+something, and the §Wiring table says by what. The section is kept rather than
+deleted because the rule it records — that a setting which appears to work and
+does not is worse than one documented as pending — is the rule that got them
+all wired, and because the last entry to leave it is worth keeping the reasoning
+for.
 
-`[listen]` — five keys — is voxtype's configuration, read by a separate
-process from a separate file. `lunad` can display it and cannot honour it.
-Changing `[listen] keybind` here does not move the keybind; changing it in
-`~/.config/voxtype/config.toml` does.
+`[listen]` was that entry, and it sat here longest because the objection to
+wiring it was real: those keys belong to another process, with its own config
+file, which does not re-read that file. The answer was not to make `lunad` read
+them — it still does not — but to **write them through** to the file that owns
+them and restart the daemon that reads it, which is the whole of §Wiring
+`[listen]` above. Two of the five did not survive the crossing as voxtype keys
+and were not forced into being them: `keybind` is Hyprland's and stays
+displayed-only, and `enabled` has no voxtype equivalent at all — voxtype does
+not know Luna exists — so it is honoured by the router instead, at the one
+place in the system where that boundary is. **An honest read-only key is better
+than a fake writable one**, and inventing a voxtype key for either of those two
+would have put this document straight back into the state it was written to get
+out of.
 
 **`[memory] consolidate_every_turns`, `[dispatch] max_parallel` and
-`[dispatch] job_retention_days` were all on that list**, the last two alongside
-a note that the audit log was never rotated. What each of the dispatch pair
-needed turned out to be roughly what this section predicted — an admission gate
-with a pending queue and a state of its own, and a GC pass with a stated
-deletion policy and an audit entry per deletion — but two answers were not
-obvious from the outside and are worth repeating here: a queued job is
+`[dispatch] job_retention_days` were all on this list too**, the last two
+alongside a note that the audit log was never rotated. What each of the
+dispatch pair needed turned out to be roughly what this section predicted — an
+admission gate with a pending queue and a state of its own, and a GC pass with
+a stated deletion policy and an audit entry per deletion — but two answers were
+not obvious from the outside and are worth repeating here: a queued job is
 cancellable and is *dropped* on shutdown rather than left as a promise nobody
 will keep, and `job_retention_days = 0` means never, not everything.
 
