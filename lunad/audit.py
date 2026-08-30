@@ -63,6 +63,7 @@ class AuditLog:
 
     def __init__(self, path: Path = config.AUDIT_PATH) -> None:
         self.path = Path(path)
+        self._dir_existed = self.path.parent.is_dir()
         self._lock = threading.Lock()
         self.written = 0
         self.rotations = 0
@@ -130,7 +131,7 @@ class AuditLog:
         """
         line = json.dumps(entry, ensure_ascii=False, default=str) + "\n"
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            config.ensure_parent(self.path, existed=self._dir_existed)
             with open(self.path, "a", encoding="utf-8") as fh:
                 fh.write(line)
                 fh.flush()

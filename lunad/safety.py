@@ -146,6 +146,7 @@ class SpawnLedger:
     def __init__(self, path: Path = config.SPAWNED_PATH,
                  max_records: int = config.SPAWN_LEDGER_MAX) -> None:
         self.path = Path(path)
+        self._dir_existed = self.path.parent.is_dir()
         self.max_records = max_records
         self._lock = threading.RLock()
         self._records: dict[int, SpawnRecord] = {}
@@ -201,7 +202,7 @@ class SpawnLedger:
             payload = [asdict(r) for r in self._records.values()]
         tmp = self.path.with_name(self.path.name + ".tmp")
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            config.ensure_parent(self.path, existed=self._dir_existed)
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, ensure_ascii=False, indent=1)
                 fh.flush()
