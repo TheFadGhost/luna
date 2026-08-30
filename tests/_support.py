@@ -178,7 +178,7 @@ class TempMemoryCase(unittest.TestCase):
         self.root = Path(self._tmp.name)
         # Registered first, so it runs last: every ``close`` a case registers
         # below drains its own workers before the tree they write into goes.
-        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(self._cleanup_tree)
         # Redirect the globals before anything can touch the real ones.
         self.ledger = safety.SpawnLedger(self.root / "spawned.json")
         self.audit = audit_mod.AuditLog(self.root / "audit.jsonl")
@@ -194,6 +194,33 @@ class TempMemoryCase(unittest.TestCase):
         self.addCleanup(settings_mod.use_settings, old_settings)
         self.addCleanup(self.settings.stop_watching)
         self.addCleanup(safety.set_audit_hook, None)
+
+    def _cleanup_tree(self) -> None:
+        """Delete the tree, then prove nothing rebuilt it.
+
+        CI fails the run if a ``/tmp/luna-test-*`` survives, and it has caught
+        one: a background thread that outlived its own ``close`` and wrote into
+        the tree after ``TemporaryDirectory.cleanup`` had removed it, which
+        recreates the parent on the way in. It is rare and schedule-dependent
+        -- eleven local runs, including three pinned to two cores to imitate
+        the runner, never reproduced the one CI saw on Python 3.13.
+
+        So this does not try to stop the race; it makes the next one legible.
+        Bare, the failure is an anonymous red step at the end of a green suite,
+        naming a random directory and no test. Here it fails inside the case
+        that leaked, names it, and lists what the late writer left behind --
+        which is the evidence needed to find the thread. The tree is removed
+        either way, so one leak cannot cascade into every later case.
+        """
+        self._tmp.cleanup()
+        root = Path(self._tmp.name)
+        if not root.exists():
+            return
+        left = sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+        shutil.rmtree(root, ignore_errors=True)
+        self.fail(
+            f"{root} was recreated after teardown by a thread that outlived "
+            f"its close(); it left {left or ['nothing but the directory']}")
 
     def sol_memory(self) -> SolMemory:
         mem = SolMemory(self.root / "memory" / "sol")
