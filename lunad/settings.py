@@ -226,7 +226,8 @@ SCHEMA: tuple[Section, ...] = (
         keys=(
             Key("luna_cap_chars", 3000, "int", minimum=200, maximum=100_000),
             Key("user_cap_chars", 2000, "int", minimum=200, maximum=100_000),
-            Key("consolidate_every_turns", 12, "int", minimum=1, maximum=1000),
+            Key("consolidate_every_turns", 12, "int", minimum=0, maximum=1000,
+                comment="0 = never; the pass costs tokens"),
             Key("decay_half_life_days", 30, "int", minimum=1, maximum=3650),
         ),
     ),

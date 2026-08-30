@@ -24,8 +24,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import (__version__, agent, audit as audit_mod, config, confirm,
-               dispatch, log as luna_log, persona, protocol, safety,
-               session as sessions, settings as settings_mod, speech)
+               consolidate, dispatch, log as luna_log, persona, protocol,
+               safety, session as sessions, settings as settings_mod, speech)
 from .memory import (Memory, MemoryCapExceeded, MemoryError as LunaMemoryError,
                      SolMemory)
 
@@ -96,6 +96,13 @@ class Daemon:
         # minutes. Constructing it here means `status` can report why TTS is
         # unavailable without anyone having tried to speak first.
         self.speech = speech.Speech(settings=self.settings)
+        # The consolidation pass. `adapter` is a callable and not the adapter
+        # itself, because `_settings_changed` rebinds `self.adapter` when the
+        # user switches agent, and a background thread holding the old object
+        # would go on shelling out to the CLI they just switched away from.
+        self.consolidator = consolidate.Consolidator(
+            self.memory, adapter=lambda: self.adapter, audit=self.audit,
+            settings=self.settings, on_spend=self._spend)
         self.settings.on_change(self._settings_changed)
         self.settings.start_watching()
         log.info(
@@ -174,6 +181,7 @@ class Daemon:
                 "timeout_s": config.AGENT_TIMEOUT_S,
             },
             memory=self.memory.usage(),
+            consolidation=self.consolidator.snapshot(),
             activity={
                 "in_flight": self.runs.snapshot(),
                 "counters": counters,
@@ -296,8 +304,7 @@ class Daemon:
 
         with self._lock:
             self.counters["ask"] += 1
-            if reply.cost_usd:
-                self.cost_usd += reply.cost_usd
+        self._spend(reply.cost_usd)
 
         spoken = None
         if speak:
@@ -315,7 +322,25 @@ class Daemon:
             payload["spoken"] = spoken
         if episode is not None:
             payload["episode"] = {"id": episode.id, "salience": episode.salience}
+        # Last, and on a thread of its own. The reply is already built; a
+        # consolidation pass must never be something the user waits behind,
+        # and `turn` is written so that it cannot raise into this path.
+        payload["consolidating"] = self.consolidator.turn()
         return protocol.ok(request_id, **payload)
+
+    def _spend(self, cost_usd: float | None) -> None:
+        """Add a metered cost to the session total, from any thread.
+
+        Only a truthy figure moves the counter, which is what keeps a
+        subscription reply (``cost_usd`` is ``None`` on codex) from pretending
+        money was spent. The consolidation pass spends through here too: it is
+        the user's account either way, and a background cost that did not show
+        up in `luna status` would be the least forgivable kind of surprise.
+        """
+        if not cost_usd:
+            return
+        with self._lock:
+            self.cost_usd += cost_usd
 
     def _ask_agent(self, req: dict[str, Any], message: str, system_prompt: str,
                    args: dict[str, Any], run: agent.AgentRun,
@@ -473,7 +498,34 @@ class Daemon:
             recent=[e.to_dict() for e in
                     self.memory.episodes.recent(int(req.get("limit") or 10))],
             tier2=self.memory.episodes.stats(),
+            tier3=self.memory.profile.status(),
         )
+
+    def op_memory_profile(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Read tier 3, or regenerate it from tier 2 first.
+
+        `rebuild` exists because tier 3 is otherwise only refreshed by the
+        consolidation pass, and `[memory] consolidate_every_turns = 0` — a
+        perfectly reasonable setting for someone who does not want background
+        spend — would otherwise strand the profile at whatever it last said.
+        A rebuild is local, free and takes milliseconds, so there is no reason
+        to make anyone wait for a paid pass to get one.
+
+        Sol has no profile. His namespace is a working set for one job, not a
+        model of a person, and deriving a persona from a specialist's job
+        chatter would describe nobody.
+        """
+        if req.get("rebuild"):
+            payload = self.memory.profile.rebuild(self.memory.episodes)
+            log.info("profile rebuilt",
+                     extra={"episodes": payload["episodes"],
+                            "through_id": payload["through_id"]})
+        else:
+            payload = self.memory.profile.load()
+        return protocol.ok(req.get("id"), namespace="luna",
+                           profile=payload,
+                           block=self.memory.profile.block(payload),
+                           status=self.memory.profile.status())
 
     def op_memory_write(self, req: dict[str, Any]) -> dict[str, Any]:
         namespace, store = self._namespace(req)
@@ -761,6 +813,7 @@ class Daemon:
             "memory.read": self.op_memory_read,
             "memory.write": self.op_memory_write,
             "memory.search": self.op_memory_search,
+            "memory.profile": self.op_memory_profile,
             "dispatch": self.op_dispatch,
             "jobs": self.op_jobs,
             "peek": self.op_peek,
@@ -827,6 +880,9 @@ class Daemon:
 
     def close(self) -> None:
         self.settings.stop_watching()
+        # Before the memory it writes into is closed, and bounded so a wedged
+        # agent cannot hold the daemon's shutdown open.
+        self.consolidator.close()
         self.runs.cancel_all()
         self.speech.close()
         self.dispatcher.close()

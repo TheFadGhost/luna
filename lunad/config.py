@@ -35,7 +35,7 @@ AGENT_CWD = STATE_DIR / "agent-cwd"                # neutral cwd for agent runs
 LUNA_MD = MEMORY_DIR / "LUNA.md"
 USER_MD = MEMORY_DIR / "USER.md"
 EPISODES_DB = MEMORY_DIR / "episodes.db"
-PROFILE_JSON = MEMORY_DIR / "profile.json"         # Tier 3, stubbed
+PROFILE_JSON = MEMORY_DIR / "profile.json"         # Tier 3, derived from tier 2
 
 # Sol's namespace. Separate directory, separate files, separate episode store:
 # Sol reports to Luna and must never write into LUNA.md or USER.md.
@@ -110,6 +110,38 @@ ENTRY_DELIMITER = "§"                         # section sign, from Hermes
 
 SALIENCE_HALF_LIFE_DAYS = 30.0
 CORRECTION_SALIENCE = 1.0                          # exempt from decay
+
+# --- Tier 3: the derived profile ------------------------------------------
+#
+# All local, all stdlib, no model call. A rebuild reads at most PROFILE_WINDOW
+# episodes and takes single-digit milliseconds, which is what lets it run on a
+# turn counter without anyone budgeting for it.
+#
+# The window is a bound on *truth* as much as on cost: a profile built from
+# every exchange since installation describes a person who has since changed
+# their mind, and habits from six months ago are not evidence about today.
+
+PROFILE_WINDOW = 2000                 # episodes read per rebuild, newest first
+PROFILE_TOP_N = 6                     # facts kept per slot
+PROFILE_EVIDENCE = 3                  # verbatim examples kept per signal
+
+# --- Consolidation (ARCHITECTURE.md section 4) ----------------------------
+#
+# Fallback default for `[memory] consolidate_every_turns`. 0 there means never.
+#
+# The rest are not settings and are deliberately not offered as any: they are
+# the cost envelope of a background pass that spends the user's own money, and
+# a config file that lets someone set the episode limit to 5000 is a config
+# file that lets someone set fire to their account overnight. The pass is
+# bounded above by roughly 3k input tokens whatever the settings say.
+
+CONSOLIDATE_EVERY_TURNS = 12
+CONSOLIDATE_MIN_INTERVAL_S = 300.0    # floor between passes, whatever the count
+CONSOLIDATE_EPISODE_LIMIT = 24        # episodes offered to one pass
+CONSOLIDATE_EPISODE_CHARS = 240       # per side of an exchange, then clipped
+CONSOLIDATE_ENTRY_CHARS = 300         # longest tier-1 entry a pass may propose
+CONSOLIDATE_MAX_ADDITIONS = 4         # per file, per pass
+CONSOLIDATE_TIMEOUT_S = 90.0          # a librarian's job, not a conversation
 
 # --- Voice / TTS (ARCHITECTURE.md section 5) ------------------------------
 #

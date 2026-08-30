@@ -1,4 +1,4 @@
-# State of play — 2026-08-27
+# State of play — 2026-08-30
 
 ## Done and verified
 
@@ -152,21 +152,23 @@ saves. It is kept for conversational continuity, not for money.
 ## Next (Phase 3)
 1. Bar widget + `subscribe` for live state.
 2. Ambient hooks: crash, battery, `omarchy update`.
-3. Semantic recall (sqlite-vec + local embeddings) and decay in tier 2.
-4. Tier 3 derived profile.
-5. Wire `luna hush` to a keybind so a spoken reply can be cut off by hand.
-6. Parallel worker fan-out — `dispatch` is one job per call today. This is what
+3. Semantic recall. Tier 2 is FTS5 keyword only. If it lands, use a small ONNX
+   model under `onnxruntime` alone — not sentence-transformers, and not
+   VoiceMem. Decay was done in Phase 0 and the old wording here implied
+   otherwise.
+4. Wire `luna hush` to a keybind so a spoken reply can be cut off by hand.
+5. Parallel worker fan-out — `dispatch` is one job per call today. This is what
    `[dispatch] max_parallel` is waiting on: an admission gate (semaphore around
    the spawn), a pending queue with its own state under `jobs/`, and an answer
    for what `luna jobs` shows for a job accepted but not yet started.
-7. A job GC pass, for `[dispatch] job_retention_days`. Nothing under
+6. A job GC pass, for `[dispatch] job_retention_days`. Nothing under
    `~/.local/share/luna/jobs/` is ever collected today. Needs a deletion policy
    — finished, past the window, never the last N — and an audit entry per
    deletion, since those directories are the only record of what a dispatched
    agent did.
-8. A tier-1 consolidation pass, for `[memory] consolidate_every_turns`. Reads
-   recent tier-2 episodes, proposes tier-1 edits through the model, applies
-   them under the same cap rules. There is no turn counter to hang it on yet.
+
+Tier 3 and the consolidation pass were both on this list. They are done — see
+Phase 2d below.
 
 ### Phase 2b — the codex adapter (2026-08-26)
 
@@ -350,6 +352,8 @@ with `max_spoken_chars` was only its fallback constant, not its wiring.
 `[dispatch] job_retention_days`, and the whole of `[listen]`. Each needs a
 subsystem that does not exist, or belongs to another process; see
 `docs/CONFIG-SCHEMA.md` §Not wired for what each one actually requires.
+(`consolidate_every_turns` was wired in Phase 2d, below. The subsystem it
+needed got built.)
 
 - 484 tests pass in the root suite, up from 447; 59 in `jarvis-settings`, up
   from 53. Verified on the final run: no window opened, no toast fired
@@ -380,14 +384,6 @@ subsystem that does not exist, or belongs to another process; see
   warm: piper 96-124 ms short / 341-409 ms for two sentences; OpenRouter
   1.5-1.8 s / 2.3-2.9 s. Better voice, real latency cost. `[voice] provider`
   switches back with no restart.
-- **`[voice] speed` and `[voice] piper_voice` are accepted but inert.** The
-  schema has them, the daemon validates and stores them, and neither is wired
-  into synthesis yet: piper's voice is still `config.VOICE_NAME` and neither
-  provider is being asked to change rate.
-- **`[listen]`, `[memory]`, `[dispatch]` and `[ui]` are stored, not yet wired.**
-  They round-trip correctly and the GUI can edit them; the daemon still uses
-  its `config.py` constants for those. `[assistant]`, `[voice]` and `[confirm]`
-  are live.
 - **Codex `ask` has tools; Claude `ask` does not.** `claude` takes `--tools ""`
   and is genuinely text-in/text-out. codex has no equivalent flag, so the
   sandbox *is* the tool policy: an `ask` runs `-s read-only`, which still lets
@@ -398,8 +394,25 @@ subsystem that does not exist, or belongs to another process; see
   `cost_usd` is `None` and `billing` is `"subscription"`. The daemon's money
   counter stays at zero on codex, which is correct but means `luna status` is
   not a like-for-like comparison between the two agents.
-- **Tier 3 (derived profile) not implemented.** Phase 3.
 - **Semantic recall not implemented** — tier 2 is FTS5 keyword only. Phase 3.
+- **Tier 3 measures; it does not understand.** Pattern extraction has false
+  negatives everywhere: a preference told as a story, a fact stated obliquely,
+  sarcasm of any kind. It reads only the user's own words, so anything Luna
+  inferred and said back is invisible to it. The support count published beside
+  every fact is the mitigation, not a fix — a fact seen once is a guess and is
+  labelled as one.
+- **Tier 3 is not in the prompt.** It is read by the consolidation pass and by
+  `luna memory profile`, and by nothing else. Injecting it would either break
+  the cacheable prefix on every rebuild or add tokens to every turn.
+- **A consolidation pass can decide nothing is worth keeping, repeatedly.**
+  That is the correct answer most of the time and it still costs one call.
+  `[memory] consolidate_every_turns = 0` is the off switch and it is honoured
+  completely — nothing is counted and no call is made.
+- **A consolidation write has no undo.** It goes through `replace`, which
+  discards text nothing else keeps, and this project does not claim inverses it
+  does not have. The audit entry carries the verbatim text of everything a pass
+  removed, so a deletion is recoverable by reading the log; that is the most
+  that can honestly be offered.
 - **`fallback_on_empty` cannot be disabled.** Every Luna recording leaves the
   raw transcript on the clipboard. Harmless, but it does clobber the clipboard
   on every voice turn. If that becomes annoying the only fix is upstream.
@@ -454,3 +467,82 @@ subsystem that does not exist, or belongs to another process; see
   hosted API to fall back to. **Decision: read it for design, do not import
   it.** If semantic recall lands, use a small ONNX embedding model under
   `onnxruntime` alone — not sentence-transformers.
+
+### Phase 2d — tier 3, and the consolidation pass (2026-08-30)
+
+The two things `docs/` had been honest about not having. `[memory]
+consolidate_every_turns` was the last key in §Not wired that needed a feature
+rather than plumbing, and `ProfileStub` was the last class in `lunad/` that
+said `implemented = False`.
+
+- **Tier 3 is real** — `lunad/memory.py`, `Profile`. Derived from tier 2,
+  rebuilt whole, never appended to, and safe to delete: `rm profile.json` costs
+  nothing because the next rebuild reproduces it byte for byte, and a test
+  asserts exactly that.
+- **The dual-brain split, taken from VoiceMem and nothing else taken.** A
+  *factual* half — five slots (`name`, `works_on`, `uses`, `prefers`,
+  `avoids`), extracted from the user's own words only, each fact carrying the
+  number of times it was seen. A *persona* half — corrections (read from the
+  salience already stored at write time, not detected a second time), friction,
+  approval, median message length, vocabulary, hour-of-day, surface split, and
+  the median length of the reply that drew a "perfect" against the one that
+  drew "too long".
+- **It stores measurements and evidence, never prose.** Turning counters into
+  "she finds you long-winded" is a judgement and belongs to the model, not to a
+  regex writing about the user in a file that then looks authoritative.
+- **Hand-rolled on SQLite and the standard library.** No torch, no
+  transformers, no embeddings, no new dependency of any kind. `lunad` is
+  stdlib-only and stays that way. VoiceMem stays rejected as a *dependency* for
+  the reason recorded on 2026-08-30: ~3.27 GB of models against 3-4 GB of free
+  RAM. Semantic recall is still out of scope — tier 2 remains FTS5 keyword
+  search.
+- **`luna memory profile [--rebuild]`** prints it, and tier 3 shows in
+  `luna status` and in `memory.read` alongside the other two tiers. What it
+  prints is the same digest the consolidation pass is given, deliberately:
+  showing the user something other than what the model sees would defeat the
+  point of being able to look. `--rebuild` exists because
+  `consolidate_every_turns = 0` would otherwise strand the profile.
+- **The consolidation pass** — `lunad/consolidate.py`. On the Nth completed
+  ask it reads the episodes recorded since its watermark, rebuilds tier 3, and
+  proposes tier-1 edits through the existing agent adapter. Own thread, started
+  after the reply is built, nothing waits on it.
+- **"Cheap" means the prompt, not the model, and the doc now says so.**
+  `ARCHITECTURE.md` said "a background pass on a cheap model"; there is no
+  second model setting in the contract to name one with. What makes it cost
+  fractions of a cent is running under a librarian's system prompt of a few
+  hundred characters instead of Luna's ~8k-token persona, on at most 24
+  exchanges clipped to 240 characters a side. One call, bounded above by
+  roughly 3k input tokens.
+- **The cap contract is not bent.** A proposal that would overflow a file is
+  rejected whole and recorded; the file is left byte-identical. Additions are
+  *not* dropped one at a time until something fits — that would be the silent
+  rot the cap exists to prevent, coming in through the back door of the feature
+  meant to relieve it.
+- **Safe to interrupt.** Tier-1 writes take the same temp-file-then-rename path
+  as every other write. The watermark lives in a new `meta` table in
+  `episodes.db` and moves *after* the tier-1 write, never before: interrupted,
+  the pass reconsiders exchanges it has seen, which is harmless because the
+  proposal is always made against the current contents of the files. The other
+  order would skip them silently and for ever.
+- **Five bounds against runaway spend**, because this is the user's own money
+  on a timer: `0` means never; one pass at a time; a five-minute floor between
+  passes whatever the count says; **no new episodes means no call at all**, so
+  an idle daemon at `= 1` spends nothing; and the pass records no episode of
+  its own, so it cannot feed its own input. A reply that will not parse still
+  advances the watermark — it would not parse the second time either, and
+  paying twice for the same unusable answer is the runaway worth avoiding.
+- **The cost is visible in three places**: `luna status`, a `consolidated` log
+  line shaped like the ordinary `reply` line (so one grep answers "what did she
+  spend this on"), and one `luna audit` entry per pass carrying the verbatim
+  text of anything removed.
+- **The gotcha this pass produced.** `{"add": "the bar is omarchy-shell"}` —
+  a model answering with a string where a list belongs. A truthiness check
+  passes it, and a string slices perfectly happily, so the file gains one
+  tier-1 entry per letter. The validator now checks `isinstance(..., list)`
+  and there is a test named after it. The same shape would bite anywhere a
+  model's JSON is trusted to have the type it was asked for.
+- **Two docs corrected in place** rather than appended to: `ARCHITECTURE.md`
+  §4 said semantic recall and decay were both pending in tier 2 (decay has
+  worked since Phase 0), and this file's Phase 3 list said the same.
+- 548 tests pass in the root suite, up from 484; 59 in `jarvis-settings`,
+  unchanged.

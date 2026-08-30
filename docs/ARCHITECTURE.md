@@ -3,7 +3,8 @@
 A resident personal assistant for Omarchy. Not a chatbot: a supervised daemon
 with a voice, a memory that compounds, and the run of the desktop.
 
-Status: Phases 0, 1 and 2 built and running. Phase 3 is design.
+Status: Phases 0, 1 and 2 built and running, memory complete to all three
+tiers. Phase 3 is design.
 Where reality contradicted the design, the design text has been corrected
 in place and the correction is marked **CORRECTED**.
 
@@ -72,9 +73,11 @@ is the only thing that touches memory or spawns agents. This is what stops the
 system becoming four half-integrations that each grew their own state.
 
 Requests, as built: `ping`, `ask`, `say`, `speak.cancel`, `session.reset`,
-`status`, `memory.{read,write,search}`, `dispatch`, `jobs`, `peek`, `audit`,
-`spawned`, `cancel`, `shutdown`. `memory.read`/`memory.write` take an optional
-`namespace` (`luna` or `sol`). `subscribe`
+`status`, `memory.{read,write,search,profile}`, `dispatch`, `jobs`, `peek`,
+`audit`, `spawned`, `cancel`, `shutdown`. `memory.read`/`memory.write` take an
+optional `namespace` (`luna` or `sol`); `memory.profile` is Luna's only —
+Sol's namespace is a working set for one job, not a model of a person.
+`subscribe`
 (for the bar widget's live state) is Phase 3. `listen_start` was dropped: the
 keybind talks to voxtype directly, so the daemon never needs to start a
 recording.
@@ -102,17 +105,54 @@ KV-cache prefix stays valid for the whole session.
 `~/.local/share/luna/memory/episodes.db` — SQLite.
 - `episodes` table: every exchange, with timestamp, surface, salience score.
 - FTS5 index for keyword recall ("what did we decide about the bar widget").
-- `sqlite-vec` + a local 90 MB embedding model for semantic recall.
+- a `meta` side table, holding the consolidation watermark and nothing else.
+- `sqlite-vec` + a local 90 MB embedding model for semantic recall. **Still
+  Phase 3** — tier 2 is FTS5 keyword search only today.
 
 **This is our addition, not Hermes'.** Hermes has no native semantic retrieval;
 it outsources that to Honcho (Postgres + pgvector + a second LLM + a paid
 service). That is not viable here, and a local embedding index is strictly
 better than nothing.
 
-### Tier 3 — derived profile
-`~/.local/share/luna/memory/profile.json` — regenerated periodically from
-Tier 2, never hand-written. Working style, recurring frustrations, vocabulary,
-what the user says they'll do vs what they do.
+### Tier 3 — derived profile — BUILT
+`~/.local/share/luna/memory/profile.json` — regenerated from tier 2, never
+hand-written, and rebuilt whole rather than appended to. There is no
+`add_fact`: the only mutation is a rebuild, which is what makes `rm
+profile.json` free. Nothing may live only here.
+
+**The design is stolen; the implementation is stdlib.** VoiceMem
+(`xzf-thu/VoiceMem`, Apache-2.0) was read and rejected as a dependency — ~3.27
+GB of models on torch, transformers, funasr and sherpa-onnx against 3-4 GB of
+free RAM and no GPU, with a Chinese-first ASR that would be a downgrade for
+English dictation and no hosted API to fall back to. What was worth taking is
+its **dual-brain split**, and only that:
+
+- a **factual** half — schema extraction over five slots (`name`, `works_on`,
+  `uses`, `prefers`, `avoids`), read from the user's own words and never from
+  Luna's, since she paraphrases what she was told and counting her text would
+  manufacture support for anything she repeated, mistakes included. Every fact
+  carries the number of times it was seen, because a fact seen once is a guess
+  and has to arrive looking like one.
+- a **persona** half — an accumulator, not an extractor. Corrections (taken
+  from the salience score already stored at write time, not re-detected),
+  friction, approval, the user's median message length, their recurring
+  vocabulary, when in the day they talk to her, and the one measurement that is
+  genuinely about being talked to well: the median length of the reply that
+  drew a "perfect" against the median length of the reply that drew "too long".
+
+**It stores measurements and evidence, never prose.** Turning "seven
+corrections, four about length" into "she finds you long-winded" is a
+judgement, and judgement is what the consolidation pass pays a model for.
+Written here it would be a regex quietly editorialising about the user in a
+file that then looks authoritative.
+
+It is **not** in the prompt. Injecting it would either break the cacheable
+prefix every time it was rebuilt or add tokens to every single turn, and its
+real consumer is the consolidation pass below, which reads it for free. It is
+readable by hand with `luna memory profile` — which prints exactly the digest
+the model is given, because showing the user something else would defeat the
+point of being able to look — and `--rebuild` regenerates it on demand, which
+matters when `consolidate_every_turns` is `0`.
 
 ### Salience and decay — also our addition
 Hermes remembers on pure model judgement, with no decay: memories only get
@@ -147,9 +187,53 @@ resuming replays and re-caches a growing history. They are kept for
 conversational continuity, not for money. A refused resume falls back to a
 fresh session automatically.
 
-### Consolidation nudge
-After N turns, a background pass on a cheap model reviews recent episodes and
-proposes writes to Tier 1. Runs off the critical path; never blocks a reply.
+### Consolidation — `lunad/consolidate.py` — BUILT
+After every `[memory] consolidate_every_turns` completed asks, a background
+pass reads the tier-2 episodes recorded since the last one, rebuilds tier 3,
+and proposes tier-1 edits through the model. It runs on its own thread, is
+started after the reply is built, and nothing waits on it.
+
+**Why a model and not a rule.** Salience scoring already does as much as a
+heuristic honestly can — it decides what is worth *keeping*, and it ranks the
+input here — but what is worth *writing down as identity* is a different
+question. Every attempt to write that one as a rule ends as a keyword list that
+misses the interesting cases or a scoring function that promotes noise with
+confidence.
+
+**CORRECTED: "a cheap model" is not what makes it cheap.** The original note
+said a background pass "on a cheap model", and there is no second model setting
+in the contract to name one with. What makes a pass cost fractions of a cent is
+the *prompt*: it runs under a librarian's system prompt of a few hundred
+characters rather than Luna's ~8k-token persona, on at most 24 exchanges
+clipped to 240 characters a side, with tier 3 as a digest. One call, bounded
+above by roughly 3k tokens in.
+
+**The cap contract is not bent for it.** A proposal that would push a file past
+its cap is rejected whole, the file is left exactly as it was, and the overflow
+is recorded. Additions are *not* dropped one at a time until something fits —
+that would be the silent rot the cap exists to prevent, arriving through the
+back door of the feature meant to relieve it. The model is shown the cap, the
+usage and the numbered entries and can propose removals instead.
+
+**It is safe to interrupt.** Tier-1 writes go through the same
+temp-file-then-rename path as any other write, so a daemon killed mid-pass
+leaves either the old file or the new one. The watermark — the id of the last
+episode considered, kept in a `meta` table inside `episodes.db` — is moved
+*after* the tier-1 write and never before. Interrupted, the pass reconsiders
+exchanges it has already seen, which is harmless because the proposal is always
+made against the current contents of the files; moved first, it would skip them
+silently and for ever.
+
+**What stops it running away**, since it spends the user's own money: `0` means
+never, one pass at a time, a five-minute floor between passes whatever the turn
+count says, no model call at all when there is nothing new since the watermark,
+and no episode recorded by the pass itself so it cannot feed its own input. A
+reply that will not parse still advances the watermark — it would not parse the
+second time either, and paying twice for the same unusable answer is exactly
+the runaway worth avoiding. The cost lands in `luna status`, in a `consolidated`
+log line shaped like the ordinary `reply` line, and in one `luna audit` entry
+per pass carrying the text of anything removed. No undo is claimed: `replace`
+has no inverse, and a fabricated undo command is worse than none.
 
 ## 5. Voice
 
@@ -612,6 +696,7 @@ reports whether a key exists and where it came from, never the key.
 | P1 | **DONE.** piper TTS out, voxtype routing in, session reuse, cost fix. | F10, speak, she answers aloud. Plain dictation (F9) still types — regression-tested. |
 | P2 | **DONE.** Workspace dispatch + Sol + audit log + PID firewall. | `luna dispatch "..."` runs in the `luna` special workspace and reports back; `luna spawned --check <foreign pid>` refuses. |
 | P2b | **DONE.** Jarvis: config file + hot reload, OpenRouter TTS with piper fallback, confirmation policy, name as a setting. | Edit `~/.config/jarvis/config.toml`, do not restart, hear the change. |
-| P3 | Bar widget, ambient hooks (crash/battery/update), semantic recall + decay. | Crash a process, she explains it unprompted. |
+| P2d | **DONE.** Tier 3 (the derived profile) and the tier-1 consolidation pass, wiring `[memory] consolidate_every_turns`. | `luna memory profile --rebuild` prints facts drawn from real episodes; a pass shows in `luna status` with what it cost. |
+| P3 | Bar widget, ambient hooks (crash/battery/update), semantic recall. | Crash a process, she explains it unprompted. |
 
 Each phase is independently useful and independently revertible.

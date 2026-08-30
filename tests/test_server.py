@@ -136,7 +136,9 @@ class DispatchTests(DaemonCase):
         resp = d.dispatch({"op": "status"})
         self.assertTrue(resp["ok"])
         self.assertEqual(resp["memory"]["tier1"]["LUNA.md"]["cap"], 3000)
-        self.assertFalse(resp["memory"]["tier3"]["implemented"])
+        self.assertTrue(resp["memory"]["tier3"]["implemented"])
+        self.assertTrue(resp["memory"]["tier3"]["derived"])
+        self.assertIn("consolidation", resp)
         self.assertGreater(resp["persona"]["chars"], 100)
         self.assertEqual(resp["activity"]["counters"]["ask"], 0)
 

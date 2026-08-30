@@ -12,7 +12,7 @@ Secrets NEVER live here — see §Secrets.
 the GUI wrote the whole file while the daemon used hard-coded constants for most
 of it, so a setting could be changed, saved, redisplayed and have no effect
 whatsoever. The §Wiring table at the end of this document is the record of what
-reads what; the three keys that are still honoured by nothing, and the one
+reads what; the two keys that are still honoured by nothing, and the one
 table that belongs to another process entirely, are named there explicitly
 rather than left to be discovered.
 
@@ -74,7 +74,7 @@ channel = "notification"     # notification | terminal | both
 [memory]
 luna_cap_chars = 3000
 user_cap_chars = 2000
-consolidate_every_turns = 12
+consolidate_every_turns = 12  # 0 = never; the pass costs tokens
 decay_half_life_days = 30
 
 [dispatch]
@@ -138,7 +138,7 @@ file and the file cannot re-enable them.
 |---|---|---|
 | `luna_cap_chars` | `memory.Tier1File.cap` | Live, per write **and per read**. Lowering it below the current contents does not truncate anything — the next write is rejected with what must be consolidated, which is the tier-1 contract. |
 | `user_cap_chars` | `memory.Tier1File.cap` | Live, same. |
-| `consolidate_every_turns` | **nothing** | There is no consolidation pass to schedule. See §Not wired. |
+| `consolidate_every_turns` | `consolidate.Consolidator` | Live. Counts completed asks; on the Nth, a background pass reads the tier-2 episodes recorded since the last one, rebuilds the tier-3 profile, and proposes tier-1 edits through the model. **`0` means never** — nothing is counted, no pass starts, no tokens are spent. The pass is subject to the ordinary cap contract: a proposal that would overflow a file is rejected whole and recorded, and the file is left exactly as it was. Never blocks a reply. |
 | `decay_half_life_days` | `memory.decayed_salience` | Live. Decay is applied at read time, so a change reaches the very next recall. Corrections score 1.0 and never decay regardless. |
 
 `SOL.md` has a cap of its own (`config.SOL_MD_CAP`) with no key: Sol's
@@ -160,19 +160,34 @@ namespace is deliberately outside the user-facing contract.
 | `theme_follows_omarchy` | **the Jarvis GUI**, `jarvis/theme.py` | Live. On, the palette is re-read from the current Omarchy theme's `colors.toml` and follows `omarchy theme set`. Off, the built-in monochrome palette is pinned and `colors.toml` is never opened. The geometry tokens — rounding, border, spacing, font sizes — are *not* part of the switch: they mirror Hyprland's own values, and a window that stops matching the rounding of every other window is not a theme choice. `lunad` draws nothing and has no opinion here. |
 | `notify_on_finish` | `dispatch.Dispatcher.notify_finished` | Live. A dispatched job's window is hidden by design, so without this the only way to learn it finished is to go and look. A failed job's toast is `critical` and carries the exit code. A missing `omarchy-notification-send` is logged and swallowed — a desktop that cannot show a toast is not a job that did not finish. |
 
+### What the consolidation pass costs, since it spends real money
+
+`consolidate_every_turns` is the only key in this file that causes a model call
+nobody asked for, so its cost is stated here rather than left to be discovered
+on a bill.
+
+One pass is **one call**, bounded above by roughly **3k input tokens and a few
+hundred out**. The bound is structural and is not a setting: the pass runs
+under a librarian's system prompt of a few hundred characters rather than
+Luna's ~8k-token persona, reads at most 24 exchanges clipped to 240 characters
+a side, and takes the tier-3 profile as a digest. At the default of 12 turns
+that is one extra call per twelve asks.
+
+Five things stop it running away, and none of them is the turn count: `0` means
+never; only one pass runs at a time; there is a five-minute floor between
+passes whatever the count says; **no new episodes since the last pass means no
+call at all**, so an idle daemon spends nothing even at `= 1`; and the pass
+records no episode of its own, so it cannot feed itself. What it spends shows
+up in `luna status`, in the `consolidated` line in the log next to the ordinary
+`reply` line, and as one entry per pass in `luna audit`.
+
 ## Not wired — and why
 
-These three are in the file, validated, round-tripped and displayed, and are
+These two are in the file, validated, round-tripped and displayed, and are
 honoured by **nothing**. They are listed here rather than quietly wired to a
 stub, because a setting that appears to work and does not is worse than one
 that is documented as pending.
 
-- **`[memory] consolidate_every_turns`** — there is no consolidation pass in the
-  daemon at all. Tier-1 overflow is handled by *rejecting* the write and telling
-  the caller what to consolidate; nothing runs on a turn counter. Wiring this
-  means building the pass first: a background job that reads recent tier-2
-  episodes, proposes tier-1 edits through the model, and applies them under the
-  same cap rules. That is a feature, not plumbing.
 - **`[dispatch] max_parallel`** — dispatch never fans out. Every `luna dispatch`
   spawns immediately and there is no queue to bound. Wiring this means a real
   admission gate: a semaphore around the spawn, a pending queue with its own
