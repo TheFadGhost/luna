@@ -207,7 +207,27 @@ def cmd_status(args: argparse.Namespace) -> int:
     t2 = m["tier2"]
     print(f"  episodes {t2['episodes']} rows, {t2['size_bytes']} bytes, "
           f"mean salience {t2['mean_salience']}")
-    print(f"  profile  tier 3 not implemented (Phase 3)")
+    t3 = m.get("tier3") or {}
+    if t3.get("exists"):
+        print(f"  profile  {t3.get('facts', 0)} fact(s) in "
+              f"{len(t3.get('slots') or [])} slot(s), "
+              f"{t3.get('corrections', 0)} correction(s), from "
+              f"{t3.get('episodes', 0)} episodes "
+              f"{DIM}(rebuilt {t3.get('iso') or '?'}){RESET}")
+    else:
+        print(f"  profile  {DIM}not built yet — "
+              f"luna memory profile --rebuild{RESET}")
+    con = resp.get("consolidation") or {}
+    if con.get("enabled"):
+        print(f"  consolidate every {con['every_turns']} turns "
+              f"({con['turns_since']} since) · {con['passes']} pass(es), "
+              f"{con['added']} added, {con['removed']} removed, "
+              f"${con['cost_usd']:.4f}"
+              + (" · RUNNING" if con.get("running") else ""))
+    else:
+        print(f"  consolidate {DIM}off "
+              f"([memory] consolidate_every_turns = 0)"
+              f"{RESET}")
     print(f"  activity {act['counters']['ask']} asks, "
           f"{act['counters']['errors']} errors, "
           f"{len(act['in_flight'])} in flight, "
@@ -263,6 +283,8 @@ def cmd_memory(args: argparse.Namespace) -> int:
         elif args.mem_cmd == "rm":
             resp = client.call("memory.write", file=args.file or "LUNA.md",
                                mode="remove", index=args.index)
+        elif args.mem_cmd == "profile":
+            resp = client.call("memory.profile", rebuild=args.rebuild)
         else:  # pragma: no cover - argparse guarantees a subcommand
             return 2
     if args.json:
@@ -283,6 +305,9 @@ def cmd_memory(args: argparse.Namespace) -> int:
             reply = hit["luna_text"].strip().replace("\n", "\n    ")
             print(f"    {reply}\n")
         return 0
+
+    if args.mem_cmd == "profile":
+        return _print_profile(resp)
 
     if args.mem_cmd in ("write", "rm"):
         u = resp["usage"]
@@ -311,6 +336,37 @@ def cmd_memory(args: argparse.Namespace) -> int:
     for ep in resp["recent"]:
         print(f"  {ep['iso']} [{ep['surface']} {ep['effective_salience']:.2f}] "
               f"{ep['user_text'].strip()[:80]}")
+    t3 = resp.get("tier3") or {}
+    print(f"\n{BOLD}derived profile{RESET} "
+          + (f"{DIM}{t3.get('facts', 0)} fact(s) from {t3.get('episodes', 0)} "
+             f"episodes, rebuilt {t3.get('iso') or '?'} · "
+             f"luna memory profile{RESET}"
+             if t3.get("exists")
+             else f"{DIM}not built yet — luna memory profile --rebuild{RESET}"))
+    return 0
+
+
+def _print_profile(resp: dict) -> int:
+    """Tier 3, read the way the other tiers are.
+
+    The rendered `block` is printed rather than the raw JSON because the block
+    is what the consolidation pass actually reads, and showing the user
+    something other than what the model sees would defeat the point of being
+    able to look.
+    """
+    st = resp.get("status") or {}
+    if not st.get("exists"):
+        print(f"{DIM}no profile yet. It is derived from episodic memory, so "
+              f"there is nothing to derive until there are episodes.{RESET}")
+        print(f"{DIM}build one: luna memory profile --rebuild{RESET}")
+        return 0
+    print(f"{BOLD}profile.json{RESET} {DIM}{st.get('facts', 0)} fact(s) from "
+          f"{st.get('episodes', 0)} episodes · rebuilt {st.get('iso')} · "
+          f"{st.get('size_bytes', 0)} bytes{RESET}")
+    block = (resp.get("block") or "").strip()
+    print(block if block else f"{DIM}(nothing measurable yet){RESET}")
+    print(f"\n{DIM}derived from tier 2 and safe to delete; the next rebuild "
+          f"reproduces it. {st.get('path')}{RESET}")
     return 0
 
 
@@ -677,6 +733,12 @@ def build_parser() -> argparse.ArgumentParser:
     rm.add_argument("index", type=int)
     rm.add_argument("--file", default="LUNA.md")
     rm.add_argument("--limit", type=int, default=10)
+    prof = msub.add_parser("profile",
+                           help="the derived profile (tier 3), as the "
+                                "consolidation pass reads it")
+    prof.add_argument("--rebuild", action="store_true",
+                      help="regenerate it from episodic memory first")
+    prof.add_argument("--limit", type=int, default=10)
     mem.set_defaults(func=cmd_memory)
 
     lg = sub.add_parser("log", help="tail the daemon log")

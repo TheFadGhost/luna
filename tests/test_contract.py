@@ -19,7 +19,7 @@ import unittest
 
 from ._support import FakeHyprland, TempMemoryCase
 
-from lunad import config, dispatch, memory, speech
+from lunad import config, consolidate, dispatch, memory, speech
 from lunad import settings as settings_mod
 
 
@@ -258,6 +258,51 @@ class DecayCase(TempMemoryCase):
             0.4, places=4)
 
 
+class ConsolidateCase(TempMemoryCase):
+    """`[memory] consolidate_every_turns` is the counter a pass runs on.
+
+    This key spent a release in §Not wired — in the file, validated, displayed
+    and honoured by nothing — because there was no pass to schedule. There is
+    now, so the case here is the same shape as every other in this module:
+    change the setting, watch the behaviour move.
+    """
+
+    def consolidator(self) -> consolidate.Consolidator:
+        self.mem = self.memory()
+        con = consolidate.Consolidator(
+            self.mem, adapter=lambda: None, settings=self.settings,
+            min_interval_s=0.0)
+        self.fired: list[str] = []
+        con.run_once = lambda why="": self.fired.append(why)  # type: ignore[assignment]
+        self.addCleanup(con.close)
+        return con
+
+    def test_the_counter_follows_the_setting(self) -> None:
+        con = self.consolidator()
+        self.assertEqual(con.every, config.CONSOLIDATE_EVERY_TURNS)
+        self.settings.set("memory.consolidate_every_turns", 3)
+        self.assertEqual([con.turn() for _ in range(3)],
+                         [False, False, True])
+        self.assertEqual(len(self.fired), 1)
+
+    def test_zero_turns_it_off_entirely(self) -> None:
+        con = self.consolidator()
+        self.settings.set("memory.consolidate_every_turns", 0)
+        for _ in range(100):
+            self.assertFalse(con.turn())
+        self.assertEqual(self.fired, [])
+
+    def test_zero_is_a_value_the_config_file_accepts(self) -> None:
+        # It was `minimum=1` while the key was inert, which would have made
+        # "never" the one thing a user could not ask for.
+        self.settings.set("memory.consolidate_every_turns", 0)
+        self.assertEqual(self.settings.get("memory.consolidate_every_turns"), 0)
+        again = settings_mod.Settings(self.settings.path)
+        self.addCleanup(again.stop_watching)
+        self.assertEqual(again.get("memory.consolidate_every_turns"), 0)
+        self.assertEqual(again.problems, [])
+
+
 # =========================================================================
 # [dispatch]
 # =========================================================================
@@ -417,6 +462,7 @@ class DriftCase(unittest.TestCase):
         ("voice.max_spoken_chars", "SPEECH_MAX_CHARS"),
         ("voice.piper_voice", "VOICE_NAME"),
         ("memory.decay_half_life_days", "SALIENCE_HALF_LIFE_DAYS"),
+        ("memory.consolidate_every_turns", "CONSOLIDATE_EVERY_TURNS"),
         ("memory.luna_cap_chars", "LUNA_MD_CAP"),
         ("memory.user_cap_chars", "USER_MD_CAP"),
         ("dispatch.workspace", "LUNA_WORKSPACE"),

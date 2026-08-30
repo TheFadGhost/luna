@@ -163,4 +163,4 @@ class MemoryFacadeTests(TempMemoryCase):
         usage = self.memory().usage()
         self.assertEqual(usage["tier1"]["LUNA.md"]["cap"], 3000)
         self.assertIn("episodes", usage["tier2"])
-        self.assertFalse(usage["tier3"]["implemented"])
+        self.assertTrue(usage["tier3"]["implemented"])

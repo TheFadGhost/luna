@@ -206,8 +206,10 @@ SPEC: tuple[Section, ...] = (
                    "USER.md, the user model.",
                    default=2000, min=500, max=20000, step=100, unit="chars"),
             Number("consolidate_every_turns", "Consolidate every",
-                   "Turns between background consolidation passes.",
-                   default=12, min=1, max=200, step=1, unit="turns"),
+                   "Turns between background consolidation passes. Each one "
+                   "is a model call on your account — set it to 0 to turn "
+                   "them off entirely.",
+                   default=12, min=0, max=200, step=1, unit="turns"),
             Number("decay_half_life_days", "Salience half-life",
                    "Trivia ages out on its own. Corrections never decay.",
                    default=30, min=1, max=365, step=1, unit="days"),

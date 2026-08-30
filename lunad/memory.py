@@ -1,20 +1,31 @@
-"""Luna's memory. ARCHITECTURE.md section 4, tiers 1 and 2.
+"""Luna's memory. ARCHITECTURE.md section 4, all three tiers.
 
 Tier 1 — curated identity, always in the prompt, hard character caps.
 Tier 2 — episodic, SQLite + FTS5, searched on demand, salience-scored.
-Tier 3 — derived profile. Stubbed (see ``ProfileStub`` at the bottom).
+Tier 3 — derived profile, rebuilt from tier 2, never hand-written.
 
 The one behaviour inherited wholesale from Hermes Agent (Nous Research, MIT)
 is the cap: a write that would overflow a tier-1 file is REJECTED with a
 report of current usage, never silently truncated. Overflow is a signal to
 consolidate, and swallowing it is how a curated file rots into a log.
+
+The tiers are separated by lifetime, not by subject. Tier 1 is small and
+expensive because it is in every prompt; tier 2 is large and cheap because it
+is only read when something matches; tier 3 is small, free and disposable
+because it is a *measurement* of tier 2 rather than a copy of it. Deleting
+profile.json costs nothing — the next rebuild reproduces it. Deleting
+episodes.db loses history for good, and deleting LUNA.md loses text nobody
+else has. That ordering is the whole reason the tiers are three files and not
+one.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import sqlite3
+import statistics
 import threading
 import time
 from dataclasses import dataclass, field
@@ -92,6 +103,22 @@ class FTS5Unavailable(MemoryError):
 
 _DELIM = config.ENTRY_DELIMITER
 _ENTRY_RE = re.compile(rf"^{re.escape(_DELIM)}[ \t]?", re.MULTILINE)
+
+
+def atomic_write(path: Path, text: str) -> None:
+    """Write ``text`` so that no reader ever sees a half-written file.
+
+    Temp file beside the target, then ``Path.replace``, which is ``os.replace``
+    and is atomic within one filesystem. Every file memory owns goes through
+    here — the tier-1 files and the tier-3 profile alike — because the failure
+    being prevented is identical for both: a daemon killed mid-write leaving a
+    truncated ``LUNA.md``, which is worse than no file at all because it still
+    parses. One mechanism that is known to work beats two that look similar.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
 
 
 def parse_entries(text: str) -> list[str]:
@@ -229,10 +256,7 @@ class Tier1File:
         )
 
     def _atomic_write(self, rendered: str) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(rendered, encoding="utf-8")
-        tmp.replace(self.path)
+        atomic_write(self.path, rendered)
 
 
 # =========================================================================
@@ -408,7 +432,28 @@ CREATE TRIGGER IF NOT EXISTS episodes_au AFTER UPDATE ON episodes BEGIN
     INSERT INTO episodes_fts(rowid, user_text, luna_text)
     VALUES (new.id, new.user_text, new.luna_text);
 END;
+
+-- A tiny key/value side table, and the only mutable state the store carries
+-- that is not an episode. The consolidation pass keeps its watermark here --
+-- how far through the episodes it has read -- rather than in a file of its
+-- own, because a watermark is a fact *about these rows* and belongs under the
+-- same commit as they do. It is also what makes the pass safe to interrupt:
+-- see `CONSOLIDATED_THROUGH` below for the ordering that follows from it.
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
+
+#: Meta key: the id of the last episode the consolidation pass has considered.
+#:
+#: The pass writes tier 1 first and moves this second, and never the other way
+#: round. Killed between the two, it reconsiders episodes it has already seen,
+#: which costs one repeated model call and produces no duplicate entries
+#: because the proposal is made against the *current* tier-1 contents. Killed
+#: in the other order it would skip them silently and forever, and a memory
+#: system that loses things quietly is the failure worth designing against.
+CONSOLIDATED_THROUGH = "consolidated_through_id"
 
 _FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 _STOPWORDS = frozenset(
@@ -570,6 +615,50 @@ class EpisodeStore:
             ).fetchall()
         return [self._hydrate(r, now) for r in rows]
 
+    def since(self, after_id: int = 0, limit: int = 50) -> list[Episode]:
+        """Episodes recorded after ``after_id``, **oldest first**.
+
+        By id and not by timestamp, because the consolidation pass needs a
+        watermark it can store and compare exactly. Timestamps come from
+        ``time.time()`` at the caller's discretion — the tests write episodes
+        dated weeks ago — so "everything since 14:32" is not a question this
+        table can answer without ambiguity, and "everything after row 118" is.
+
+        Oldest first because the pass reads them as a narrative: a preference
+        stated on Tuesday and reversed on Thursday must arrive in that order,
+        or the model consolidates the reversal and then the preference.
+        """
+        now = time.time()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM episodes WHERE id > ? ORDER BY id ASC LIMIT ?",
+                (int(after_id), limit),
+            ).fetchall()
+        return [self._hydrate(r, now) for r in rows]
+
+    # -- the meta side table ---------------------------------------------
+
+    def get_meta(self, key: str, default: str = "") -> str:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (key,)
+            ).fetchone()
+        return row["value"] if row else default
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, str(value)),
+            )
+            self._conn.commit()
+
+    def max_id(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT max(id) AS m FROM episodes").fetchone()
+        return int(row["m"] or 0)
+
     def search(self, query: str, limit: int = 10) -> list[Episode]:
         """Keyword recall, ranked by BM25 lifted by decayed salience.
 
@@ -614,32 +703,419 @@ class EpisodeStore:
 
 
 # =========================================================================
-# Tier 3 — derived profile.  STUB. Not implemented in Phase 0.
+# Tier 3 — the derived profile
 # =========================================================================
+#
+# `profile.json`: what tier 2 says about the user, measured rather than
+# remembered. Rebuilt from scratch on every pass, never appended to, and safe
+# to delete — the next rebuild reproduces it exactly. Nothing may live only
+# here.
+#
+# **The design is stolen, the implementation is not.** VoiceMem
+# (xzf-thu/VoiceMem, Apache-2.0) was read and rejected as a dependency: ~3.27
+# GB of models on top of torch, transformers, funasr and sherpa-onnx, against
+# 3-4 GB of free RAM and no GPU on this machine. It cannot run here and there
+# is no hosted API to fall back to. What was worth taking is its **dual-brain
+# split**, and only that:
+#
+# * a *factual* half — schema and entity extraction. Who the user is, what
+#   they work on, what they use, what they have asked for and ruled out.
+# * a *persona* half — an accumulator for the relationship. How they like to
+#   be talked to, what they react badly to, what earns a "perfect".
+#
+# The two are separated because they age differently and are wrong in
+# different ways. A fact is either right or stale; a persona signal is a
+# tendency and is never more than a tendency. Merging them would produce a
+# single blob in which "you work on Luna" and "you dislike long answers" carry
+# the same weight, and the second is a guess.
+#
+# Everything below is stdlib: regex, `statistics`, `json`. No embeddings, no
+# model call, no new dependency. That is a constraint (`lunad` is stdlib-only
+# and stays that way) but it is also the point — tier 3 has to be cheap enough
+# to rebuild on a turn counter without anyone thinking about it.
+#
+# **What this cannot do, stated plainly.** Pattern extraction has false
+# negatives everywhere: a preference expressed as a story, a fact stated
+# obliquely, sarcasm of any kind. It reads only the user's own words, never
+# Luna's, so anything she inferred and said back is invisible to it. The
+# support count is published beside every fact for exactly this reason — a
+# fact seen once is a guess, and the consolidation pass is told so in those
+# words rather than being handed a tidy list that hides it.
+
+PROFILE_VERSION = 1
+
+#: The factual half: slot -> patterns, each with one capture group.
+#:
+#: Deliberately narrow, on the same reasoning as `_CORRECTION_PATTERNS` above:
+#: a false positive here becomes a "fact" the consolidation pass may promote
+#: into LUNA.md, and an invented fact costs far more to remove than a missed
+#: one costs to re-learn. Every pattern requires the user to have said the
+#: thing in the first person, in a form that has one plain reading.
+_FACT_PATTERNS: tuple[tuple[str, tuple[re.Pattern[str], ...]], ...] = (
+    ("name", (
+        re.compile(r"\bmy name(?:'s| is)\s+([A-Za-z][\w'-]{1,30})", re.IGNORECASE),
+        re.compile(r"\bcall me\s+([A-Za-z][\w'-]{1,30})", re.IGNORECASE),
+        re.compile(r"\bi go by\s+([A-Za-z][\w'-]{1,30})", re.IGNORECASE),
+    )),
+    ("works_on", (
+        re.compile(r"\bi'?m working on (?:the )?(.{3,60}?)(?:[.,;!?\n]|$)",
+                   re.IGNORECASE),
+        re.compile(r"\bmy (?:project|repo|repository|app|widget|site) "
+                   r"(?:is )?(?:called )?(.{2,40}?)(?:[.,;!?\n]|$)",
+                   re.IGNORECASE),
+        # A path under the home directory is the least ambiguous statement of
+        # what somebody works on that this file will ever see.
+        re.compile(r"(~/[\w.@+-]+(?:/[\w.@+-]+)*)"),
+    )),
+    ("uses", (
+        re.compile(r"\bi use\s+(.{2,40}?)(?:[.,;!?\n]|$)", re.IGNORECASE),
+        re.compile(r"\bi'?m on\s+(.{2,40}?)(?:[.,;!?\n]|$)", re.IGNORECASE),
+        re.compile(r"\bi run\s+(.{2,40}?)(?:[.,;!?\n]|$)", re.IGNORECASE),
+    )),
+    ("prefers", (
+        re.compile(r"\bi (?:prefer|like it)\s+(.{3,60}?)(?:[.,;!?\n]|$)",
+                   re.IGNORECASE),
+        re.compile(r"\bfrom now on,?\s+(.{3,60}?)(?:[.,;!?\n]|$)", re.IGNORECASE),
+        re.compile(r"\balways\s+(.{3,60}?)(?:[.,;!?\n]|$)", re.IGNORECASE),
+    )),
+    ("avoids", (
+        re.compile(r"\bnever\s+(.{3,60}?)(?:[.,;!?\n]|$)", re.IGNORECASE),
+        re.compile(r"\bdon'?t\s+(.{3,60}?)(?:[.,;!?\n]|$)", re.IGNORECASE),
+        re.compile(r"\bstop\s+(.{3,60}?)(?:[.,;!?\n]|$)", re.IGNORECASE),
+    )),
+)
+
+FACT_SLOTS: tuple[str, ...] = tuple(slot for slot, _ in _FACT_PATTERNS)
+
+#: The persona half. Corrections are NOT here: they were already detected at
+#: write time and stored as a salience of 1.0, and a second detector would be
+#: a copy that can disagree with the first. These two are the softer signals
+#: either side of one — the user pleased, and the user irritated without
+#: bothering to correct anything.
+_APPROVAL_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\b(perfect|exactly|spot on|nailed it|lovely|brilliant)\b",
+        r"\bthat'?s (it|right|the one)\b",
+        r"\bthank(s| you)\b",
+        r"\byes[,.!]",
+        r"\bgood (call|answer|point)\b",
+    )
+)
+
+_FRICTION_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\btoo (long|much|verbose|wordy)\b",
+        r"\b(shorter|be brief|briefly|just answer|just tell me)\b",
+        r"\bi already (said|told|asked)\b",
+        r"\byou keep\b",
+        r"\bwhy (are|did) you\b",
+        r"\bstop explaining\b",
+        r"\bnot what i asked\b",
+    )
+)
+
+#: Words too common to say anything about a person's vocabulary. The tier-2
+#: search stopwords, plus the handful that only a chat log produces.
+_VOCAB_STOPWORDS = _STOPWORDS | frozenset(
+    "can just like get make know think want need there their they them then "
+    "than have has had will would could should from your yours mine ours "
+    "luna does doing done into more most some also very much".split()
+)
+
+VOCAB_MIN_CHARS = 4
+VOCAB_MIN_COUNT = 3
 
 
-class ProfileStub:
-    """PLACEHOLDER for tier 3 (``profile.json``). Deliberately not implemented.
+def _normalise_fact(raw: str) -> str:
+    """Tidy one extracted value. Case is preserved; only edges are trimmed.
 
-    Tier 3 is regenerated periodically from tier 2 by a background pass on a
-    cheap model: working style, recurring frustrations, vocabulary, stated
-    intent vs actual behaviour. It is never hand-written, which is exactly why
-    it cannot be built before tier 2 has any history in it.
+    Lower-casing would turn a name into a word and a path into a different
+    path, so the only normalisation is whitespace and the punctuation a
+    sentence leaves clinging to a capture group.
+    """
+    return " ".join(raw.split()).strip(" \t\"'`.,;:!?-")
 
-    Phase 0 exposes only its status so ``luna status`` can say "not yet".
+
+def _words(text: str) -> list[str]:
+    return _FTS_TOKEN_RE.findall(text.lower())
+
+
+def _matches(patterns: Sequence[re.Pattern[str]], text: str) -> bool:
+    return any(p.search(text) for p in patterns)
+
+
+def _median_int(values: Sequence[int]) -> int | None:
+    """Median as a whole number, or ``None`` when there is nothing to average.
+
+    ``None`` rather than 0: "no reply has ever drawn a complaint" and "replies
+    that draw complaints are zero words long" are different statements, and
+    the second one is false.
+    """
+    return int(round(statistics.median(values))) if values else None
+
+
+def extract_facts(episodes: Sequence[Episode]) -> dict[str, list[dict[str, Any]]]:
+    """The factual half. Reads the user's words only, never Luna's.
+
+    Luna's replies are excluded on purpose. She paraphrases what the user told
+    her, so scanning her text would count every fact twice and manufacture
+    support for anything she happened to repeat — including anything she got
+    wrong.
+    """
+    found: dict[str, dict[str, dict[str, Any]]] = {s: {} for s in FACT_SLOTS}
+    for episode in episodes:
+        for slot, patterns in _FACT_PATTERNS:
+            for pattern in patterns:
+                for match in pattern.finditer(episode.user_text):
+                    value = _normalise_fact(match.group(1))
+                    if len(value) < 2 or value.lower() in _VOCAB_STOPWORDS:
+                        continue
+                    bucket = found[slot]
+                    key = value.casefold()
+                    entry = bucket.get(key)
+                    if entry is None:
+                        # First spelling seen wins: "Omarchy" beats "omarchy"
+                        # only because it came first, which is at least a rule.
+                        entry = {"value": value, "support": 0,
+                                 "first_seen": episode.ts, "last_seen": episode.ts}
+                        bucket[key] = entry
+                    entry["support"] += 1
+                    entry["last_seen"] = max(entry["last_seen"], episode.ts)
+                    entry["first_seen"] = min(entry["first_seen"], episode.ts)
+    out: dict[str, list[dict[str, Any]]] = {}
+    for slot, bucket in found.items():
+        ranked = sorted(bucket.values(),
+                        key=lambda e: (-e["support"], -e["last_seen"]))
+        if ranked:
+            out[slot] = ranked[:config.PROFILE_TOP_N]
+    return out
+
+
+def accumulate_persona(episodes: Sequence[Episode]) -> dict[str, Any]:
+    """The persona half. Counters and evidence — never prose.
+
+    This function deliberately produces no sentences. Turning "seven
+    corrections, four of them about answer length" into "the user finds you
+    long-winded" is a judgement, and judgement is what the consolidation pass
+    pays a model for. Writing it here would mean a heuristic quietly
+    editorialising about the user in a file that then looks authoritative.
+
+    ``episodes`` must be in chronological order: the reply-length figures pair
+    each reaction with the reply *before* it, which is the reply being reacted
+    to.
+    """
+    corrections: list[str] = []
+    friction: list[str] = []
+    approval: list[str] = []
+    praised: list[int] = []
+    criticised: list[int] = []
+    user_words: list[int] = []
+    luna_words: list[int] = []
+    vocab: dict[str, int] = {}
+    hours: dict[str, int] = {}
+    surfaces: dict[str, int] = {}
+
+    for index, episode in enumerate(episodes):
+        text = episode.user_text.strip()
+        user_words.append(len(_words(text)))
+        luna_words.append(len(_words(episode.luna_text)))
+        surfaces[episode.surface] = surfaces.get(episode.surface, 0) + 1
+        hour = f"{time.localtime(episode.ts).tm_hour:02d}"
+        hours[hour] = hours.get(hour, 0) + 1
+
+        for word in _words(text):
+            if len(word) >= VOCAB_MIN_CHARS and word not in _VOCAB_STOPWORDS:
+                vocab[word] = vocab.get(word, 0) + 1
+
+        # The stored score, not a second detector: score_salience already
+        # decided this at write time and 1.0 is its sentinel for a correction.
+        if episode.salience >= config.CORRECTION_SALIENCE:
+            corrections.append(text)
+        previous = len(_words(episodes[index - 1].luna_text)) if index else None
+        if _matches(_APPROVAL_PATTERNS, text):
+            approval.append(text)
+            if previous:
+                praised.append(previous)
+        if _matches(_FRICTION_PATTERNS, text):
+            friction.append(text)
+            if previous:
+                criticised.append(previous)
+
+    top_vocab = sorted(((w, n) for w, n in vocab.items() if n >= VOCAB_MIN_COUNT),
+                       key=lambda pair: (-pair[1], pair[0]))
+    return {
+        "corrections": {"count": len(corrections),
+                        "recent": corrections[-config.PROFILE_EVIDENCE:]},
+        "friction": {"count": len(friction),
+                     "recent": friction[-config.PROFILE_EVIDENCE:]},
+        "approval": {"count": len(approval),
+                     "recent": approval[-config.PROFILE_EVIDENCE:]},
+        "length": {
+            "user_median_words": _median_int(user_words),
+            "luna_median_words": _median_int(luna_words),
+            "praised_reply_words": _median_int(praised),
+            "criticised_reply_words": _median_int(criticised),
+        },
+        "vocabulary": [list(pair) for pair in top_vocab[:config.PROFILE_TOP_N * 2]],
+        "hours": dict(sorted(hours.items())),
+        "surfaces": dict(sorted(surfaces.items())),
+    }
+
+
+class Profile:
+    """Tier 3. Derived from tier 2, rebuilt whole, never edited by hand.
+
+    There is no ``append``, no ``add_fact`` and no way to write one field: the
+    only mutation is :meth:`rebuild`, which reads tier 2 and replaces the file.
+    That is not minimalism, it is the guarantee — a profile that could be
+    edited would eventually hold something tier 2 does not, and then deleting
+    it would lose data. As built, ``rm profile.json`` is free.
     """
 
-    path = config.PROFILE_JSON
-    implemented = False
+    def __init__(self, path: Path = config.PROFILE_JSON) -> None:
+        self.path = Path(path)
+        self._lock = threading.RLock()
 
-    @classmethod
-    def status(cls) -> dict[str, Any]:
+    # -- reading ---------------------------------------------------------
+
+    def load(self) -> dict[str, Any]:
+        """The profile as written, or ``{}``.
+
+        A corrupt file reads as absent rather than raising. Tier 3 is derived,
+        so the cure for damage is a rebuild and not an error message — and a
+        malformed profile must never be the reason an ask fails.
+        """
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def status(self) -> dict[str, Any]:
+        """What ``luna status`` shows for tier 3."""
+        data = self.load()
+        persona = data.get("persona") or {}
+        facts = data.get("facts") or {}
         return {
             "tier": 3,
-            "implemented": False,
-            "path": str(cls.path),
-            "note": "profile.json is a Phase 3 deliverable; not written in Phase 0",
+            "implemented": True,
+            "derived": True,
+            "path": str(self.path),
+            "exists": self.path.exists(),
+            "version": data.get("version"),
+            "generated": data.get("generated"),
+            "iso": data.get("generated_iso", ""),
+            "episodes": data.get("episodes", 0),
+            "through_id": data.get("through_id", 0),
+            "facts": sum(len(v) for v in facts.values() if isinstance(v, list)),
+            "slots": sorted(facts),
+            "corrections": (persona.get("corrections") or {}).get("count", 0),
+            "size_bytes": self.path.stat().st_size if self.path.exists() else 0,
         }
+
+    def block(self, data: dict[str, Any] | None = None) -> str:
+        """The profile rendered for a prompt. ``""`` when there is nothing.
+
+        Compact on purpose. This is read by the consolidation pass on every
+        run and every character of it is paid for, so it is a digest and not a
+        dump: counts, the strongest facts, and the most recent evidence.
+
+        Support counts are shown because they are the part that matters. A
+        fact seen once is a guess and must arrive looking like one.
+        """
+        data = self.load() if data is None else data
+        if not data:
+            return ""
+        lines: list[str] = []
+        facts = data.get("facts") or {}
+        for slot in FACT_SLOTS:
+            items = facts.get(slot) or []
+            if not items:
+                continue
+            rendered = ", ".join(
+                f"{i.get('value')} (x{i.get('support', 0)})" for i in items)
+            lines.append(f"- {slot}: {rendered}")
+        if lines:
+            lines.insert(0, "Facts extracted from the user's own words "
+                            "(x1 means said once — treat it as a guess):")
+
+        persona = data.get("persona") or {}
+        counts = [f"{(persona.get(k) or {}).get('count', 0)} {k}"
+                  for k in ("corrections", "friction", "approval")]
+        lines.append("")
+        lines.append("Relationship signals over "
+                     f"{data.get('episodes', 0)} exchanges: " + ", ".join(counts) + ".")
+        length = persona.get("length") or {}
+        praised, criticised = (length.get("praised_reply_words"),
+                               length.get("criticised_reply_words"))
+        if praised is not None or criticised is not None:
+            lines.append(
+                "Replies that drew approval ran "
+                f"{praised if praised is not None else '?'} words; replies that "
+                f"drew friction ran {criticised if criticised is not None else '?'}.")
+        if length.get("user_median_words"):
+            lines.append(f"The user writes about {length['user_median_words']} "
+                         "words per message.")
+        for label in ("corrections", "friction"):
+            recent = (persona.get(label) or {}).get("recent") or []
+            if recent:
+                lines.append(f"Most recent {label}:")
+                lines += [f"- {_clip(r, 160)}" for r in recent]
+        vocab = persona.get("vocabulary") or []
+        if vocab:
+            lines.append("Recurring words: "
+                         + ", ".join(str(pair[0]) for pair in vocab))
+        return "\n".join(lines).strip()
+
+    # -- writing ---------------------------------------------------------
+
+    def rebuild(self, store: EpisodeStore, limit: int | None = None,
+                now: float | None = None) -> dict[str, Any]:
+        """Regenerate the whole profile from tier 2 and write it atomically.
+
+        Bounded by ``[PROFILE_WINDOW]`` episodes, newest kept, for two
+        reasons. Cost — this runs on a turn counter and must stay a few
+        milliseconds. And truth — a profile built from every exchange since
+        the daemon was installed describes a person who no longer exists, and
+        the user's habits from six months ago are not evidence about today.
+        """
+        window = config.PROFILE_WINDOW if limit is None else limit
+        stamp = time.time() if now is None else now
+        # `recent` is newest first; everything downstream reads a narrative.
+        episodes = sorted(store.recent(window), key=lambda e: (e.ts, e.id))
+        payload = {
+            "version": PROFILE_VERSION,
+            "generated": stamp,
+            "generated_iso": time.strftime("%Y-%m-%d %H:%M",
+                                           time.localtime(stamp)),
+            "episodes": len(episodes),
+            "window": window,
+            "through_id": max((e.id for e in episodes), default=0),
+            "first_ts": episodes[0].ts if episodes else None,
+            "last_ts": episodes[-1].ts if episodes else None,
+            "facts": extract_facts(episodes),
+            "persona": accumulate_persona(episodes),
+        }
+        self.write(payload)
+        return payload
+
+    def write(self, payload: dict[str, Any]) -> Path:
+        with self._lock:
+            atomic_write(self.path,
+                         json.dumps(payload, indent=2, ensure_ascii=False,
+                                    default=str) + "\n")
+        return self.path
+
+    def clear(self) -> None:
+        with self._lock:
+            self.path.unlink(missing_ok=True)
+
+
+def _clip(text: str, limit: int) -> str:
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
 
 
 # =========================================================================
@@ -655,12 +1131,22 @@ class Memory:
         luna_md: Path = config.LUNA_MD,
         user_md: Path = config.USER_MD,
         episodes_db: Path = config.EPISODES_DB,
+        profile_json: Path | None = None,
     ) -> None:
         self.luna = Tier1File(luna_md, config.LUNA_MD_CAP, "LUNA.md",
                               cap_key="memory.luna_cap_chars")
         self.user = Tier1File(user_md, config.USER_MD_CAP, "USER.md",
                               cap_key="memory.user_cap_chars")
         self.episodes = EpisodeStore(episodes_db)
+        # The profile defaults to sitting *beside the episode store it is
+        # derived from*, not to a fixed path. That is the honest relationship
+        # — tier 3 is a function of tier 2 and belongs with its input — and it
+        # has a useful consequence: a caller who redirects the episode store
+        # (every test does) gets the profile redirected with it, so nothing
+        # can accidentally rebuild over the user's real profile.json.
+        self.profile = Profile(
+            profile_json if profile_json is not None
+            else Path(episodes_db).parent / config.PROFILE_JSON.name)
 
     def file(self, name: str) -> Tier1File:
         key = name.strip().upper().removesuffix(".MD")
@@ -712,7 +1198,7 @@ class Memory:
         return {
             "tier1": {"LUNA.md": self.luna.usage(), "USER.md": self.user.usage()},
             "tier2": self.episodes.stats(),
-            "tier3": ProfileStub.status(),
+            "tier3": self.profile.status(),
         }
 
     def close(self) -> None:

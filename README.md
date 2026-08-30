@@ -12,9 +12,11 @@ prices the work, and delegates the depth to specialists.
 
 ## Status
 
-**Phase 2 — she delegates.** Daemon, socket, memory tiers 1–2, persona, CLI,
-piper speech out, voxtype speech in, conversation sessions — plus workspace
-dispatch, Sol the specialist, an append-only audit log and the PID firewall.
+**Phase 2 — she delegates.** Daemon, socket, all three memory tiers, persona,
+CLI, piper speech out, voxtype speech in, conversation sessions — plus
+workspace dispatch, Sol the specialist, an append-only audit log, the PID
+firewall, and a background pass that promotes what matters out of episodic
+memory into the curated files.
 See `docs/ARCHITECTURE.md` for the design and `docs/STATE-OF-PLAY.md` for what
 is actually built.
 
@@ -28,6 +30,7 @@ bin/luna say "read this aloud"
 bin/luna hush                     # stop speaking now
 bin/luna memory show
 bin/luna memory search "bar widget"
+bin/luna memory profile --rebuild # the derived profile (tier 3)
 
 bin/luna dispatch "go and work this out"   # a worker, in the luna workspace
 bin/luna dispatch --to sol "..."           # the specialist
@@ -123,11 +126,27 @@ by Nous Research (MIT) — specifically its `§`-delimited curated files, hard c
 that *reject* rather than truncate, and the frozen system-prompt block that keeps
 the KV-cache prefix valid.
 
-Two deliberate departures: Hermes outsources semantic retrieval to a paid cloud
-service (Postgres + pgvector + a second LLM), which is not viable on this
-hardware — Luna uses a local embedding index instead. And Hermes has no decay,
-so memories only get tidied at the cap; Luna scores salience and lets trivia age
-out.
+**Tier 1** is the curated identity, always in the prompt. **Tier 2** is every
+exchange in SQLite, searched with FTS5 and ranked by a salience score that
+decays. **Tier 3** is a derived profile: measurements taken from tier 2 —
+stable facts on one side, how the user likes to be talked to on the other —
+rebuilt from scratch rather than appended to, so deleting it costs nothing.
+That split is borrowed from [VoiceMem](https://github.com/xzf-thu/VoiceMem),
+which was read for its design and rejected as a dependency: 3.27 GB of models
+does not fit on this machine. The implementation here is regex and the standard
+library.
+
+Every N turns a background pass reads the new episodes, rebuilds tier 3, and
+proposes edits to tier 1 through the model — under exactly the same cap rules
+as any other write, so a proposal that does not fit is rejected whole rather
+than truncated. `[memory] consolidate_every_turns = 0` turns it off completely.
+
+Two deliberate departures from Hermes. It outsources semantic retrieval to a
+paid cloud service (Postgres + pgvector + a second LLM), which is not viable on
+this hardware — and **nor is the local embedding index this file used to claim
+was already here**. Tier 2 is keyword search today; semantic recall is still
+Phase 3. And Hermes has no decay, so memories only get tidied at the cap; Luna
+scores salience and lets trivia age out.
 
 ## Contributing
 
