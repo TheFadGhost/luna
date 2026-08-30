@@ -401,6 +401,17 @@ OMARCHY_VERSION_FILE = Path("/usr/share/omarchy/version")
 #: so its absence proves nothing.
 OMARCHY_UPDATE_LOG = Path("/tmp/omarchy-update.log")
 
+#: Omarchy ships its own crash announcer, `omarchy-crash-watch.service`, which
+#: streams the coredump MESSAGE_ID out of the journal and toasts
+#: "Process crashed: <comm>" with a click that runs `omarchy-agent-crash`
+#: against the same diagnose-crash skill. These two paths are exactly the
+#: condition that unit's own `ConditionPathExists=!` checks, so Luna can tell
+#: whether the desktop is already watching without forking `systemctl`.
+OMARCHY_CRASH_WATCH_UNIT = Path("/usr/lib/systemd/user/omarchy-crash-watch.service")
+OMARCHY_CRASH_TOGGLE_OFF = (
+    _xdg("XDG_STATE_HOME", HOME / ".local" / "state")
+    / "omarchy" / "toggles" / "crash-capture-off")
+
 #: What each watcher has already seen, so a daemon restart does not re-announce
 #: a fortnight of coredumps.
 AMBIENT_STATE_PATH = STATE_DIR / "ambient.json"

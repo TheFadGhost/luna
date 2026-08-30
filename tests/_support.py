@@ -171,6 +171,17 @@ FORBIDDEN_HUD_MESSAGE = _STATE_DIR / "message"
 FORBIDDEN_COREDUMP_DIR.mkdir(parents=True, exist_ok=True)
 FORBIDDEN_POWER_SUPPLY_DIR.mkdir(parents=True, exist_ok=True)
 
+#: The two paths `CrashWatcher.desktop_already_watching` reads. Not harmful to
+#: read for real -- they are two stat()s on world-readable paths -- but the
+#: answer would then depend on whether the machine running the suite happens to
+#: be an Omarchy box with crash capture on, and a test whose result turns on
+#: that is a test that fails on somebody else's laptop.
+FORBIDDEN_CRASH_WATCH_UNIT = _AMBIENT_DIR / "omarchy-crash-watch.service"
+FORBIDDEN_CRASH_TOGGLE_OFF = _AMBIENT_DIR / "crash-capture-off"
+
+config.OMARCHY_CRASH_WATCH_UNIT = FORBIDDEN_CRASH_WATCH_UNIT
+config.OMARCHY_CRASH_TOGGLE_OFF = FORBIDDEN_CRASH_TOGGLE_OFF
+
 config.COREDUMP_DIR = FORBIDDEN_COREDUMP_DIR
 config.POWER_SUPPLY_DIR = FORBIDDEN_POWER_SUPPLY_DIR
 config.OMARCHY_VERSION_FILE = FORBIDDEN_OMARCHY_VERSION

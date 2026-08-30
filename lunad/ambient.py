@@ -61,6 +61,27 @@ noticing — and this machine produces bursts of eight `foot` cores in a minute
 when a test suite deletes a script out from under a terminal. The click is the
 consent, and it is one click.
 
+**And it is off by default, because Omarchy got there first.** Checking what
+the desktop already does before adding a second nagging source is the rule
+that kept the battery hook off; applied honestly, it keeps this one off too.
+``omarchy-crash-watch.service`` ships with Omarchy, is enabled, and was running
+on this machine while this was being written. It streams the coredump
+``MESSAGE_ID`` out of the journal — event-driven, no polling at all — dedupes
+crash loops on a 60 s window, and toasts *"Process crashed: <comm>"* with a
+click that runs ``omarchy-agent-crash``, which points the default coding agent
+at the **same** ``diagnose-crash`` skill this module names. It knows the signal
+name and the full executable path, which a core *filename* does not.
+
+So the desktop's is better at the job, and Luna's is the strictly worse of two
+identical toasts. Hers is kept, and kept switchable, for the two things the
+desktop's cannot do: the crash and its diagnosis land in her **audit log** and
+her **job list**, under her confirmation policy, rather than in a terminal
+nobody records. Turn it on if that is what you want — ideally after
+``omarchy-toggle-crash-capture`` has turned the other one off.
+:meth:`CrashWatcher.desktop_already_watching` reads the same two paths that
+unit's own ``ConditionPathExists=!`` reads, so ``luna ambient`` can say which
+of the two is live without forking ``systemctl``.
+
 **Battery.** ``/sys/class/power_supply/`` — read, not assumed: the battery on
 this laptop is ``BAT1``, not ``BAT0``, and it reports in *energy* units with no
 ``charge_now`` at all, so the hook discovers the battery by reading each
@@ -492,6 +513,12 @@ class CrashWatcher(Watcher):
     Only this user's dumps are reported. ``coredumpctl`` restricts a
     non-root caller to their own uid anyway, and a crash in another account's
     process is not something the person at this desk can act on.
+
+    **Off by default.** Omarchy's own ``omarchy-crash-watch.service`` already
+    announces these, event-driven and with more to say — see the module
+    docstring for the whole argument. This one is for people who have turned
+    that off, or who want the crash in Luna's audit log and the diagnosis in
+    her job list.
     """
 
     name = CRASH
@@ -508,6 +535,35 @@ class CrashWatcher(Watcher):
         # points this at an empty temp directory, and a default captured at
         # import would walk the machine's real coredumps instead.
         return self._dir if self._dir is not None else config.COREDUMP_DIR
+
+    def enabled(self) -> bool:
+        # Explicit default of False rather than the base class's True, for the
+        # same reason `battery` has one: a config that has never heard of
+        # `[ambient]` must not start a second crash announcer behind the one
+        # the desktop is already running.
+        return bool(settings_mod.get("ambient.crash", False))
+
+    @staticmethod
+    def desktop_already_watching() -> bool:
+        """Whether ``omarchy-crash-watch.service`` would be running.
+
+        Two ``stat()``s and no fork, reading exactly what that unit's own
+        conditions read: it ships as a unit file under ``/usr/lib/systemd/user``
+        and refuses to start when
+        ``~/.local/state/omarchy/toggles/crash-capture-off`` exists (which is
+        what ``omarchy-toggle-crash-capture`` writes). Asking ``systemctl`` the
+        same question would be a subprocess on a path that is meant to be free.
+
+        Advisory, never an override. It is reported, and it is why the default
+        is off, but a user who has explicitly turned this hook on gets it —
+        silently disabling a setting somebody set is worse than a second toast.
+        """
+        try:
+            if not config.OMARCHY_CRASH_WATCH_UNIT.exists():
+                return False
+            return not config.OMARCHY_CRASH_TOGGLE_OFF.exists()
+        except OSError:
+            return False
 
     def check(self) -> list[Event]:
         directory = self.directory
@@ -599,7 +655,8 @@ class CrashWatcher(Watcher):
                      "last_usec": self.state.get("last_usec"),
                      "known": len(self.state.get("recent") or ()),
                      "diagnose": bool(settings_mod.get("ambient.crash_diagnose",
-                                                       True))})
+                                                       True)),
+                     "desktop_already_watching": self.desktop_already_watching()})
         return snap
 
 
@@ -989,7 +1046,36 @@ class Ambient:
             self._thread = threading.Thread(target=self._run, daemon=True,
                                             name="luna-ambient")
             self._thread.start()
-            return True
+        for name in self.duplicated_hooks():
+            log.warning(
+                "the %s hook is on, but the desktop already announces these; "
+                "expect two notifications for one event", name,
+                extra={"hook": name,
+                       "desktop_unit": "omarchy-crash-watch.service",
+                       "turn_the_other_off": "omarchy-toggle-crash-capture"})
+        return True
+
+    def duplicated_hooks(self) -> tuple[str, ...]:
+        """Enabled hooks that sit behind something the desktop already runs.
+
+        Returned rather than only logged, for two reasons: `luna ambient` can
+        show it, and the suite can assert it — `tests/__init__.py` calls
+        `logging.disable(CRITICAL)`, so `assertLogs` captures nothing anywhere
+        in this codebase and a rule that lived only in a log line would be a
+        rule with no test.
+
+        Never a refusal. A setting somebody turned on has to work; silently
+        disabling it would be the daemon overriding the user, which is the
+        opposite of what `settings.set` does everywhere else. But two toasts
+        for one crash is the failure that gets an ambient system switched off
+        entirely, so the person who turned it on is told.
+        """
+        out = []
+        for watcher in self.watchers:
+            duplicate = getattr(watcher, "desktop_already_watching", None)
+            if watcher.enabled() and callable(duplicate) and duplicate():
+                out.append(watcher.name)
+        return tuple(out)
 
     def close(self, timeout: float = 2.0) -> None:
         """Stop the thread and retract anything ambient put on the HUD."""
@@ -1149,6 +1235,7 @@ class Ambient:
     def snapshot(self) -> dict[str, Any]:
         return {"enabled": self.enabled(),
                 "running": self._thread is not None,
+                "duplicated": list(self.duplicated_hooks()),
                 "poll_seconds": self.interval(),
                 "ticks": self.ticks,
                 "delivered": self.delivered,

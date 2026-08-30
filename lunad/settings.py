@@ -299,10 +299,18 @@ SCHEMA: tuple[Section, ...] = (
                 comment="master switch for all three hooks"),
             Key("poll_seconds", 60, "int", minimum=5, maximum=3600,
                 comment="one tick; each hook is a stat(), not a fork"),
-            Key("crash", True, "bool",
-                comment="a process on this machine dumped core"),
+            # OFF, and for the same reason `battery` is: Omarchy already
+            # ships `omarchy-crash-watch.service`, it is running, and it does
+            # this better -- it streams the coredump MESSAGE_ID out of the
+            # journal (so it has the signal name and the full exe path, which
+            # a core filename does not) and its toast already offers a
+            # click-to-diagnose against the same skill. Luna's exists for
+            # anyone who has turned that one off, or who wants the crash and
+            # the diagnosis in her audit log and her job list instead.
+            Key("crash", False, "bool",
+                comment="OFF: omarchy-crash-watch already announces these"),
             Key("crash_diagnose", True, "bool",
-                comment="the toast's one click dispatches the diagnosis"),
+                comment="when crash is on, the toast's click dispatches it"),
             # OFF by default, and the only hook that is. Omarchy already
             # notifies at 10% from its own bar service, and UPower hibernates
             # at 2%. A second source nagging about the same battery at the

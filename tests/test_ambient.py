@@ -233,6 +233,7 @@ class NeverSpeaksCase(AmbientCase):
         amb.watchers = self.build().watchers
         self.addCleanup(amb.close)
         self.settings.set("ambient.battery", True)
+        self.settings.set("ambient.crash", True)
         self.version.write_text("4.0.0.alpha\n")
         amb.tick(now=0.0)                                    # seeds, says nothing
         self.dump("foot", 4242, 1_787_717_390_000_000)
@@ -372,6 +373,12 @@ class DumpNameCase(unittest.TestCase):
 
 
 class CrashCase(AmbientCase):
+    def setUp(self) -> None:
+        super().setUp()
+        # Off by default now: Omarchy's own omarchy-crash-watch already
+        # announces these, so every case here is the opted-in path.
+        self.settings.set("ambient.crash", True)
+
     def test_the_first_tick_seeds_and_announces_nothing(self) -> None:
         # tmpfiles keeps dumps for two weeks. A daemon that started after a
         # bad afternoon must not open with fourteen critical toasts.
@@ -641,6 +648,10 @@ class UpdateCase(AmbientCase):
 class DeliveryCase(AmbientCase):
     """The one function every event leaves through."""
 
+    def setUp(self) -> None:
+        super().setUp()
+        self.settings.set("ambient.crash", True)
+
     def test_the_toast_is_spawned_through_the_firewall_and_reaped(self) -> None:
         """Everything lunad forks lands in the allowlist, and nothing leaks.
 
@@ -742,6 +753,7 @@ class _FakeProc:
 class AuditCase(AmbientCase):
     def test_every_event_is_recorded_with_its_why_and_its_outcome(self) -> None:
         self.settings.set("ambient.battery", True)
+        self.settings.set("ambient.crash", True)
         self.version.write_text("4.0.0.alpha\n")
         amb = self.build()
         amb.tick(now=0.0)
@@ -760,6 +772,7 @@ class AuditCase(AmbientCase):
     def test_an_event_nobody_could_be_shown_is_still_recorded(self) -> None:
         """"She noticed and could not tell you" and "she never noticed" are
         different facts, and the log has to keep them apart."""
+        self.settings.set("ambient.crash", True)
         self.notifier.fail = True
         amb = self.build()
         amb.tick(now=0.0)
@@ -770,6 +783,7 @@ class AuditCase(AmbientCase):
         self.assertFalse(entry["delivered"])
 
     def test_a_watcher_that_raises_is_audited_and_does_not_stop_the_others(self) -> None:
+        self.settings.set("ambient.crash", True)
         self.version.write_text("4.0.0.alpha\n")
         amb = self.build()
         amb.tick(now=0.0)
@@ -789,6 +803,10 @@ class AuditCase(AmbientCase):
 
 
 class StateCase(AmbientCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.settings.set("ambient.crash", True)
+
     def test_a_restart_does_not_re_announce_what_was_already_seen(self) -> None:
         self.dump("foot", 5, 1_787_717_400_000_000)
         first = self.build()
@@ -866,17 +884,72 @@ class TickCase(AmbientCase):
         self.assertEqual(amb.tick(now=1000.0), 0)
         self.assertEqual(self.notifier.events, [])
 
+    def test_the_hook_is_off_by_default_because_omarchy_watches_too(self) -> None:
+        # The same rule as `battery`, applied honestly:
+        # `omarchy-crash-watch.service` ships enabled and does this better --
+        # it reads the journal's structured coredump fields, so it has the
+        # signal name and the full exe path, and its own toast already offers
+        # a click-to-diagnose against the same skill.
+        self.assertIs(settings_mod.defaults()["ambient"]["crash"], False)
+        fresh = settings_mod.Settings(self.root / "fresh.toml")
+        self.addCleanup(fresh.stop_watching)
+        old = settings_mod.use_settings(fresh)
+        self.addCleanup(settings_mod.use_settings, old)
+        self.assertFalse(ambient.CrashWatcher({}).enabled())
+
+    def test_a_live_desktop_watcher_is_detected_without_forking(self) -> None:
+        # Read from the same two paths the unit's own conditions read, so
+        # `luna ambient` can say which of the two is live without a subprocess.
+        watcher = ambient.CrashWatcher({})
+        self.assertFalse(watcher.desktop_already_watching(),
+                         "the sentinel unit file should not exist")
+        config.OMARCHY_CRASH_WATCH_UNIT.write_text("[Service]\n")
+        self.addCleanup(config.OMARCHY_CRASH_WATCH_UNIT.unlink, True)
+        self.assertTrue(watcher.desktop_already_watching())
+        # ...and `omarchy-toggle-crash-capture` turning it off is visible here.
+        config.OMARCHY_CRASH_TOGGLE_OFF.write_text("")
+        self.addCleanup(config.OMARCHY_CRASH_TOGGLE_OFF.unlink, True)
+        self.assertFalse(watcher.desktop_already_watching())
+
+    def test_a_duplicate_is_warned_about_and_never_silently_disabled(self) -> None:
+        """A setting somebody turned on has to work, even behind the desktop's.
+
+        Silently disabling it would be the daemon overriding the user, which
+        is the opposite of what the rest of this config does. So it warns.
+        """
+        self.settings.set("ambient.crash", True)
+        config.OMARCHY_CRASH_WATCH_UNIT.write_text("[Service]\n")
+        self.addCleanup(config.OMARCHY_CRASH_WATCH_UNIT.unlink, True)
+        amb = self.build()
+        # Asserted on the return value, not on a log line: tests/__init__.py
+        # calls logging.disable(CRITICAL), so assertLogs captures nothing
+        # anywhere in this suite and a rule that lived only in a log line
+        # would be a rule with no test.
+        self.assertEqual(amb.duplicated_hooks(), ("crash",))
+        self.assertEqual(amb.snapshot()["duplicated"], ["crash"])
+        amb.start()
+        # Still armed. Warned, not disabled.
+        self.assertTrue(amb.watchers[0].enabled())
+        amb.tick(now=0.0)
+        self.dump("foot", 5, 1_787_717_400_000_000)
+        self.assertEqual(amb.tick(now=1000.0), 1)
+
     def test_each_hook_switches_off_on_its_own(self) -> None:
         for hook in ambient.SOURCES:
             with self.subTest(hook=hook):
                 self.assertIn(f"ambient.{hook}",
                               [f"{s.name}.{k.name}"
                                for s in settings_mod.SCHEMA for k in s.keys])
-        self.settings.set("ambient.crash", False)
+        # Seed with the hook on, so the assertion below is the switch working
+        # rather than the watcher still seeding.
+        self.settings.set("ambient.crash", True)
         amb = self.build()
         amb.tick(now=0.0)
+        self.settings.set("ambient.crash", False)
         self.dump("foot", 5, 1_787_717_400_000_000)
         self.assertEqual(amb.tick(now=1000.0), 0)
+        self.settings.set("ambient.crash", True)
+        self.assertEqual(amb.tick(now=2000.0), 1)
 
     def test_the_update_hook_runs_on_its_own_slower_cadence(self) -> None:
         amb = self.build()
@@ -977,10 +1050,16 @@ class ContractCase(unittest.TestCase):
         """
         amb = settings_mod.defaults()["ambient"]
         self.assertIs(amb["enabled"], True)
-        self.assertIs(amb["crash"], True)
-        self.assertIs(amb["crash_diagnose"], True)
+        # Two of the three are off, and both for the same reason: the desktop
+        # already does it. `omarchy-crash-watch.service` announces crashes
+        # (event-driven, with the signal name, and with its own
+        # click-to-diagnose against the same skill); Omarchy's battery service
+        # toasts at 10% and UPower hibernates at 2%. What is left on is the
+        # one thing nothing else on this machine watches.
+        self.assertIs(amb["crash"], False)
         self.assertIs(amb["battery"], False)
         self.assertIs(amb["update"], True)
+        self.assertIs(amb["crash_diagnose"], True)
         self.assertEqual(amb["poll_seconds"], 60)
         # Either side of Omarchy's own 10% toast, and above UPower's 2%
         # hibernate, so the three do not land on top of each other.

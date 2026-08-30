@@ -25,7 +25,8 @@ import unittest
 from pathlib import Path
 
 from ._support import (FORBIDDEN_AMBIENT_STATE, FORBIDDEN_APLAY,
-                       FORBIDDEN_COREDUMP_DIR, FORBIDDEN_GRIM,
+                       FORBIDDEN_COREDUMP_DIR, FORBIDDEN_CRASH_TOGGLE_OFF,
+                       FORBIDDEN_CRASH_WATCH_UNIT, FORBIDDEN_GRIM,
                        FORBIDDEN_HUD_MESSAGE, FORBIDDEN_HYPRCTL,
                        FORBIDDEN_JOBS_DIR, FORBIDDEN_NOTIFIER,
                        FORBIDDEN_OMARCHY_UPDATE_LOG, FORBIDDEN_OMARCHY_VERSION,
@@ -221,6 +222,12 @@ class AmbientPathCase(TempMemoryCase):
                                  "reads the live /usr/share/omarchy"),
         "OMARCHY_UPDATE_LOG": (FORBIDDEN_OMARCHY_UPDATE_LOG,
                                "reads the live update log"),
+        "OMARCHY_CRASH_WATCH_UNIT": (
+            FORBIDDEN_CRASH_WATCH_UNIT,
+            "makes the answer depend on whether this machine runs Omarchy"),
+        "OMARCHY_CRASH_TOGGLE_OFF": (
+            FORBIDDEN_CRASH_TOGGLE_OFF,
+            "makes the answer depend on the tester's own toggle"),
     }
     OUTPUTS = {
         "AMBIENT_STATE_PATH": (FORBIDDEN_AMBIENT_STATE,
