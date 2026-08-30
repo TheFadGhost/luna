@@ -158,18 +158,13 @@ saves. It is kept for conversational continuity, not for money.
    VoiceMem. Decay was done in Phase 0 and the old wording here implied
    otherwise.
 4. Wire `luna hush` to a keybind so a spoken reply can be cut off by hand.
-5. Parallel worker fan-out — `dispatch` is one job per call today. This is what
-   `[dispatch] max_parallel` is waiting on: an admission gate (semaphore around
-   the spawn), a pending queue with its own state under `jobs/`, and an answer
-   for what `luna jobs` shows for a job accepted but not yet started.
-6. A job GC pass, for `[dispatch] job_retention_days`. Nothing under
-   `~/.local/share/luna/jobs/` is ever collected today. Needs a deletion policy
-   — finished, past the window, never the last N — and an audit entry per
-   deletion, since those directories are the only record of what a dispatched
-   agent did.
+5. Worker fan-out as a *plan* — the gate and the queue are built, so several
+   jobs can be in flight and the number is bounded, but Luna still does not
+   decide on her own to split a task across workers. That is a planning change
+   in the persona and the ask path, not plumbing.
 
-Tier 3 and the consolidation pass were both on this list. They are done — see
-Phase 2d below.
+Tier 3, the consolidation pass, the admission gate and the job GC were all on
+this list. They are done — see Phase 2d and Phase 2e below.
 
 ### Phase 3 — presence, and the bar widget (2026-08-30)
 
@@ -380,18 +375,107 @@ toast and log label through `settings_mod.assistant_name()`, and the voice
 settings are read per utterance in `speech._voice_settings()`. What was wrong
 with `max_spoken_chars` was only its fallback constant, not its wiring.
 
-**Deliberately not wired**, and now documented as such rather than stubbed:
+**Deliberately not wired**, and documented as such rather than stubbed:
 `[memory] consolidate_every_turns`, `[dispatch] max_parallel`,
 `[dispatch] job_retention_days`, and the whole of `[listen]`. Each needs a
 subsystem that does not exist, or belongs to another process; see
 `docs/CONFIG-SCHEMA.md` §Not wired for what each one actually requires.
-(`consolidate_every_turns` was wired in Phase 2d, below. The subsystem it
-needed got built.)
+(All four were wired in the end: `consolidate_every_turns` in Phase 2d and the
+two `[dispatch]` keys in Phase 2e, both below. `[listen]` is still voxtype's.)
 
 - 484 tests pass in the root suite, up from 447; 59 in `jarvis-settings`, up
   from 53. Verified on the final run: no window opened, no toast fired
   (`journalctl --user` clean), no `/tmp/luna-test-*` left behind, and no core
   dump produced.
+
+### Phase 2e — the admission gate, the job GC and audit rotation (2026-08-30)
+
+The last two "honoured by nothing" `[dispatch]` keys, plus the unbounded audit
+log. All three were documented as pending with a note on what each would need;
+what follows is what each actually needed, and the answers that were not
+obvious from the outside.
+
+**`[dispatch] max_parallel` — a queue, not a refusal.** A dispatch over the
+limit is *accepted*: it gets its id, its directory and its composed prompt at
+once, lands in `jobs/` as `queued`, shows in `luna jobs` as `wait`, and can be
+cancelled there. The only thing it lacks is a pid. Three decisions inside that:
+
+- **FIFO even when a slot is free.** A newcomer arriving while the queue drains
+  must not overtake jobs already waiting, or the queue is a lottery.
+- **The limit is read at every admission decision, never captured.** Lowering
+  it below the number of running jobs kills nothing — it stops admitting and
+  the count drains. Raising it releases waiting work immediately, because
+  `Daemon._settings_changed` pokes `admit_ready()` rather than waiting for the
+  next job to end; without that the setting would look inert until something
+  else happened to move.
+- **A queued job is dropped on shutdown, not left promised.** The queue only
+  ever existed in one process's memory. Each is written back as `cancelled`
+  with the reason, and a `queued` directory found without a live daemon reads
+  as `orphaned`, not as something still waiting.
+
+**The shutdown drain had to be tightened, and CI is what caught it.** `close()`
+sets its closing flag before draining, so a job finishing mid-shutdown cannot
+admit a fresh one — but a watcher already *inside* `_admit_next` when the flag
+went up wins that race and starts one more job, and therefore one more watcher,
+appended after the drain had taken its snapshot. The snapshot loop then never
+joined it; it wrote its `dispatch.finish` into a temporary tree teardown had
+already deleted, and `AuditLog._emit`'s `mkdir(parents=True)` **recreated the
+tree** — one empty `/tmp/luna-test-*`, which is exactly what the CI step added
+after the `foot`-windows incident looks for. It never reproduced on this
+machine, not in eight runs and not with six suites running at once; only on the
+slower runner, and there on three of the four Python versions. The drain now
+re-reads `self._watchers` each pass rather than joining one snapshot, still
+bounded by the same deadline. One test was also leaving two jobs mid-flight at
+teardown, which is how the race got a window that wide.
+
+**`[dispatch] job_retention_days` — a GC pass, with the policy written down.**
+Aged from when the job *stopped* (`finished`, then `started`, then the
+manifest's mtime), because retention is how long the *record* is kept and a
+six-hour job's record begins when it ends. Nothing running or queued is
+collected at any age; an orphan is, once past the window, because it will never
+finish and one crash should not pin a directory for the life of the machine.
+Six-hour timer in its own thread plus one pass on the way up — a laptop that is
+suspended and resumed daily would never reach a first tick otherwise — and
+never on the request path. One audit entry per deletion, with no `undo`,
+because there is not one.
+
+**Zero means never, in both new places.** `job_retention_days = 0` collects
+nothing and `[audit] max_mb = 0` never rotates. Read as a duration, "0 days"
+looks like "keep nothing", which is the one thing a user typing the smallest
+number they are allowed cannot want; and there would otherwise be no way to say
+"keep everything" at all. Both have an explicit test.
+
+**`audit.jsonl` rotation, without losing anything silently.** The old note
+("never rotated, on purpose") was right about the risk and wrong about the
+remedy. Rotation now *moves* bytes: past `[audit] max_mb` the live file becomes
+`audit.jsonl.1`, siblings shift up, and only the oldest of `[audit] keep` is
+deleted — and that deletion is itself an entry, `audit.rotated`, written as the
+first line of the new live file naming what was renamed and what was dropped.
+The chain therefore reads backwards from the live file and any gap in it
+explains itself. `luna audit` reads the siblings too, stopping at the first
+file that cannot hold anything the query asked for, so `-n 40` does not read
+months of history. Two details worth keeping:
+
+- The size check runs **after** the write, on the position `tell()` already
+  returned, so it costs no extra syscall and can never land between a line and
+  its `fsync`. A rotated sibling is one line *past* the ceiling, never short.
+- Lowering `keep` leaves the files beyond it on disk. They are still *read* —
+  history you stopped rotating is not history that stopped existing — and
+  nothing deletes them for you.
+
+**One guard added, for the obvious reason.** `Dispatcher(jobs_dir=...)` was a
+signature default bound to `config.JOBS_DIR`, which was harmless while the
+dispatcher only *created* directories there. A collector makes it the thing
+that deletes the user's job records, so `jobs_dir` joins the family in
+`tests/_support.py`: resolved late, and pointed at a throwaway tree for the
+test process. It is the one guard in that family that has to *resolve* rather
+than fail — `config.ensure_dirs()` creates it — so `test_guards.py` asserts it
+is not under `$HOME` instead.
+
+- 610 tests pass in the root suite, up from 567; 59 in `jarvis-settings`,
+  unchanged. Verified across three consecutive runs: no window, no toast, no
+  core dump, no stray `/tmp/luna-test-*` or `/tmp/luna-tests-jobs-*`, and the
+  live daemon was not restarted or signalled.
 
 ## Known limitations / stubbed
 - **The confirmation system cannot see inside a running job.** It is enforced
@@ -460,10 +544,16 @@ needed got built.)
   and is re-added by the next dispatch. Between the two, a dispatched window
   would open on the active workspace — the job still runs, and `luna jobs`
   says so in its note.
-- **`dispatch` does not fan out.** One job per call.
-- **Job directories are never garbage-collected.** `~/.local/share/luna/jobs/`
-  grows one directory per dispatch.
-- **The audit log is never rotated**, on purpose. It grows without bound.
+- **`dispatch` does not fan out *by itself*.** One call is one job. Several can
+  be in flight and `[dispatch] max_parallel` bounds them, but Luna does not
+  plan a fan-out for you.
+- **A queued job does not survive the daemon.** It is cancelled on shutdown
+  with the reason recorded, rather than left as a promise a restarted daemon
+  has no queue to keep. Nothing was spawned, so nothing is lost but the wait.
+- **Rotation retains a bounded history**, `[audit] keep` files of
+  `[audit] max_mb` — 48 MB by default. Past that the oldest file *is* deleted;
+  the deletion is recorded but the bytes are gone. Set `max_mb = 0` to keep the
+  old unbounded behaviour.
 - **The `[osd]` sizing keys are inert under the Quickshell frontend.**
   `position` / `width_px` / `height_px` / `margin_px` reach only the GTK4 and
   native frontends; the Quickshell OSD's geometry lives in its `Theme.qml`.

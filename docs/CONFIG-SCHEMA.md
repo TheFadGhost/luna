@@ -12,9 +12,8 @@ Secrets NEVER live here — see §Secrets.
 the GUI wrote the whole file while the daemon used hard-coded constants for most
 of it, so a setting could be changed, saved, redisplayed and have no effect
 whatsoever. The §Wiring table at the end of this document is the record of what
-reads what; the two keys that are still honoured by nothing, and the one
-table that belongs to another process entirely, are named there explicitly
-rather than left to be discovered.
+reads what; the one table that belongs to another process entirely is named
+there explicitly rather than left to be discovered.
 
 Where a key has a matching constant in `lunad/config.py`, that constant is a
 **fallback only** — what a daemon with no config file at all uses. The setting
@@ -78,10 +77,16 @@ consolidate_every_turns = 12  # 0 = never; the pass costs tokens
 decay_half_life_days = 30
 
 [dispatch]
-workspace   = "luna"         # hyprland special workspace name
-app_id      = "org.omarchy.luna"
-max_parallel = 1
-job_retention_days = 14
+workspace          = "luna"  # hyprland special workspace name
+app_id             = "org.omarchy.luna"
+max_parallel       = 1       # jobs running at once; the rest queue
+job_retention_days = 14      # finished job directories older than this are collected; 0 = never
+
+# The append-only record. Rotation moves bytes, it never drops them:
+# audit.jsonl -> audit.jsonl.1 -> ... -> audit.jsonl.N, oldest deleted last.
+[audit]
+max_mb = 8                   # rotate once the live log passes this; 0 = never
+keep   = 5                   # numbered siblings kept; the oldest is deleted
 
 [ui]
 theme_follows_omarchy = true
@@ -150,8 +155,15 @@ namespace is deliberately outside the user-facing contract.
 |---|---|---|
 | `workspace` | `dispatch.Hyprland` | Live, for the **next** job. The window rule is re-installed when either half of the pair changes — the Lua guard that stops rules stacking is keyed on a digest of `(app_id, workspace)` precisely so a change is not suppressed by the old rule's guard. |
 | `app_id` | `dispatch.Hyprland`, `dispatch.Dispatcher` | Live, for the **next** job. Windows already open keep the app-id they were born with: an app-id is set at map time and cannot be changed afterwards, so a running job stays where it is. |
-| `max_parallel` | **nothing** | See §Not wired. |
-| `job_retention_days` | **nothing** | See §Not wired. |
+| `max_parallel` | `dispatch.Dispatcher.max_parallel` | Live, at every admission decision — never captured. A dispatch over the limit is **queued**, not refused: it gets its id, its directory and its prompt straight away, shows in `luna jobs` as `queued`, and can be cancelled there, it just has no pid until a slot frees. Lowering it below the number of running jobs kills nothing; it stops admitting and the count drains. Raising it releases waiting work at once, because the daemon's settings listener calls `admit_ready()` on the change rather than waiting for the next job to end. The queue is FIFO even when a slot is free — admitting a newcomer past jobs already waiting would make it a lottery. |
+| `job_retention_days` | `dispatch.Dispatcher.collect` | Live, at the next pass. A job directory is aged from when the job **stopped**: `finished` out of its `job.json`, falling back to `started`, and to the file's mtime if the JSON is unreadable. Retention is how long the *record* is kept, and a six-hour job's record begins when it ends. Nothing `running` or `queued` is collected at any age; an `orphaned` job — one whose daemon died — is, once past the window, because it will never finish and one crash should not pin a directory forever. **`0` means never collect**, and that is deliberate: read as a duration, zero days would mean "delete everything", which is the one thing a user typing the smallest allowed number cannot want. Every deletion is an audit entry (`job.collected`) with no `undo`, because there is not one. The pass runs on a six-hour timer in its own thread, plus once at start-up, and never on the request path. |
+
+### `[audit]`
+
+| key | read by | effect |
+|---|---|---|
+| `max_mb` | `audit.AuditLog.append` | Live, checked after each line on the position the write already reached — so the decision costs no extra syscall and can never land between a line and its `fsync`. A rotated sibling is therefore one line *past* the ceiling, never short of it. `0` means never rotate, for the same reason `job_retention_days` has an off switch: this is evidence, and someone keeping a machine under scrutiny must be able to say "grow without bound" in the file rather than by patching the daemon. |
+| `keep` | `audit.AuditLog.append` | Live. The live file becomes `audit.jsonl.1`, each sibling shifts up one, and only `audit.jsonl.<keep>` is ever deleted — and that deletion is itself an entry, `audit.rotated`, written as the **first line of the new live file**, naming what was renamed and what was dropped. So the chain reads backwards from the live file and any gap in it explains itself. `luna audit` reads the siblings too, stopping at the first file that cannot hold anything the query asked for. Lowering `keep` from 8 to 5 leaves `.6` and `.7` on disk and rotation will never touch them again — they are still *read*, because history you stopped rotating is not the same as history that silently stopped existing. Delete them by hand if you want them gone. |
 
 ### `[ui]`
 
@@ -183,27 +195,27 @@ up in `luna status`, in the `consolidated` line in the log next to the ordinary
 
 ## Not wired — and why
 
-These two are in the file, validated, round-tripped and displayed, and are
-honoured by **nothing**. They are listed here rather than quietly wired to a
-stub, because a setting that appears to work and does not is worse than one
-that is documented as pending.
+**Nothing in `[assistant]`, `[voice]`, `[confirm]`, `[memory]`, `[dispatch]`,
+`[audit]` or `[ui]` is unwired any more.** Every key in those tables is read by
+something and its effect is in the §Wiring table above. This section is kept
+rather than deleted because the thing it records — that a setting which appears
+to work and does not is worse than one documented as pending — is the rule that
+got them all wired, and because one table is still genuinely not `lunad`'s.
 
-- **`[dispatch] max_parallel`** — dispatch never fans out. Every `luna dispatch`
-  spawns immediately and there is no queue to bound. Wiring this means a real
-  admission gate: a semaphore around the spawn, a pending queue with its own
-  state in `jobs/`, and an answer for what `luna jobs` shows for a job that has
-  been accepted but not started.
-- **`[dispatch] job_retention_days`** — nothing under
-  `~/.local/share/luna/jobs/` is ever collected. Wiring this means a GC pass
-  with a deletion policy: which directories are safe to remove (finished, past
-  the retention window, not the last N), when it runs, and an audit entry per
-  deletion, since these directories are the only record of what a dispatched
-  agent did.
-
-And `[listen]` — five keys — is voxtype's configuration, read by a separate
+`[listen]` — five keys — is voxtype's configuration, read by a separate
 process from a separate file. `lunad` can display it and cannot honour it.
 Changing `[listen] keybind` here does not move the keybind; changing it in
 `~/.config/voxtype/config.toml` does.
+
+**`[memory] consolidate_every_turns`, `[dispatch] max_parallel` and
+`[dispatch] job_retention_days` were all on that list**, the last two alongside
+a note that the audit log was never rotated. What each of the dispatch pair
+needed turned out to be roughly what this section predicted — an admission gate
+with a pending queue and a state of its own, and a GC pass with a stated
+deletion policy and an audit entry per deletion — but two answers were not
+obvious from the outside and are worth repeating here: a queued job is
+cancellable and is *dropped* on shutdown rather than left as a promise nobody
+will keep, and `job_retention_days = 0` means never, not everything.
 
 ## Known cosmetic gap
 

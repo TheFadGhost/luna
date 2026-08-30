@@ -15,12 +15,24 @@ documents and 700 in the code.
 
 from __future__ import annotations
 
+import json
+import time
 import unittest
+from pathlib import Path
 
 from ._support import FakeHyprland, TempMemoryCase
 
+from lunad import audit as audit_mod
 from lunad import config, consolidate, dispatch, memory, speech
 from lunad import settings as settings_mod
+
+
+def _stop_quietly(d: dispatch.Dispatcher, job: dispatch.Job) -> None:
+    """Cleanup for a job deliberately left running by a case."""
+    try:
+        d.cancel(job.id)
+    except Exception:  # noqa: BLE001 - cleanup, and the test already failed
+        pass
 
 
 # =========================================================================
@@ -237,10 +249,9 @@ class DecayCase(TempMemoryCase):
             places=4)
 
     def test_recall_ranking_moves_with_it(self) -> None:
-        import time as _time
         store = self.episodes()
         store.record("the note about kettles", "mm",
-                     ts=_time.time() - 20 * 86400.0, salience=0.8)
+                     ts=time.time() - 20 * 86400.0, salience=0.8)
 
         self.settings.set("memory.decay_half_life_days", 20)
         [row] = store.recent()
@@ -371,6 +382,127 @@ class WorkspaceCase(TempMemoryCase):
         self.assertEqual(d.app_id, "org.fake")
 
 
+class MaxParallelCase(TempMemoryCase):
+    """`[dispatch] max_parallel` is the admission gate, read live.
+
+    The mechanics of the queue live in test_dispatch; what is asserted here is
+    the contract itself — that changing the number changes what the daemon
+    does, in both directions, without a restart.
+    """
+
+    def dispatcher(self) -> dispatch.Dispatcher:
+        d = dispatch.Dispatcher(jobs_dir=self.root / "jobs",
+                                hypr=FakeHyprland(), audit=self.audit,
+                                terminal="/bin/bash", agent_bin="/bin/true")
+        real_spawn = d.spawn
+
+        def spawn_without_a_terminal(argv, **kw):  # noqa: ANN001, ANN202
+            return real_spawn(["/bin/bash", argv[-1]], **kw)
+
+        d.spawn = spawn_without_a_terminal      # type: ignore[method-assign]
+        self.addCleanup(d.close)
+        return d
+
+    def hold(self, d: dispatch.Dispatcher) -> dispatch.Job:
+        job = d.dispatch("hold a slot", timeout=30, linger=20)
+        self.addCleanup(_stop_quietly, d, job)
+        return job
+
+    def test_the_limit_is_read_at_every_admission_not_captured(self) -> None:
+        d = self.dispatcher()
+        self.assertEqual(d.max_parallel, 1)
+        self.settings.set("dispatch.max_parallel", 3)
+        self.assertEqual(d.max_parallel, 3)
+
+    def test_one_means_the_second_job_waits(self) -> None:
+        d = self.dispatcher()
+        self.hold(d)
+        self.assertEqual(d.dispatch("second", timeout=30, linger=0).state,
+                         "queued")
+
+    def test_two_means_it_does_not(self) -> None:
+        d = self.dispatcher()
+        self.settings.set("dispatch.max_parallel", 2)
+        self.hold(d)
+        second = d.dispatch("second", timeout=30, linger=20)
+        self.addCleanup(_stop_quietly, d, second)
+        self.assertEqual(second.state, "running")
+
+    def test_the_snapshot_reports_the_limit_and_who_is_waiting(self) -> None:
+        d = self.dispatcher()
+        self.hold(d)
+        waiting = d.dispatch("second", timeout=30, linger=0)
+        snap = d.snapshot()
+        self.assertEqual(snap["max_parallel"], 1)
+        self.assertEqual([j["id"] for j in snap["queued"]], [waiting.id])
+
+
+class JobRetentionCase(TempMemoryCase):
+    """`[dispatch] job_retention_days` decides what `collect` may delete."""
+
+    def dispatcher(self) -> dispatch.Dispatcher:
+        d = dispatch.Dispatcher(jobs_dir=self.root / "jobs",
+                                hypr=FakeHyprland(), audit=self.audit,
+                                terminal="/bin/bash", agent_bin="/bin/true")
+        self.addCleanup(d.close)
+        return d
+
+    def aged_job(self, jid: str, days: float) -> Path:
+        path = self.root / "jobs" / jid
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "job.json").write_text(json.dumps({
+            "id": jid, "task": "an old job", "to": "worker",
+            "state": "finished", "pid": 4_194_303,
+            "started": time.time() - days * 86_400.0,
+            "finished": time.time() - days * 86_400.0,
+            "iso": "x", "elapsed_s": 1.0, "exit_code": 0,
+            "dir": str(path)}), encoding="utf-8")
+        return path
+
+    def test_the_window_follows_the_setting(self) -> None:
+        d = self.dispatcher()
+        job = self.aged_job("aaaaaaaa", days=20)
+        self.settings.set("dispatch.job_retention_days", 30)
+        self.assertEqual(d.collect()["collected"], 0)
+        self.assertTrue(job.exists())
+
+        self.settings.set("dispatch.job_retention_days", 10)
+        self.assertEqual(d.collect()["collected"], 1)
+        self.assertFalse(job.exists())
+
+    def test_zero_is_off_and_not_the_shortest_window(self) -> None:
+        d = self.dispatcher()
+        job = self.aged_job("bbbbbbbb", days=9_000)
+        self.settings.set("dispatch.job_retention_days", 0)
+        self.assertEqual(d.collect()["collected"], 0)
+        self.assertTrue(job.exists())
+
+
+class AuditRotationCase(TempMemoryCase):
+    """`[audit] max_mb` and `keep` bound the record without shortening it."""
+
+    def fill(self, log, entries: int) -> None:  # noqa: ANN001
+        for i in range(entries):
+            log.append("test", index=i, filler="x" * 300_000)
+
+    def test_the_ceiling_follows_the_setting(self) -> None:
+        log = audit_mod.AuditLog(self.root / "audit.jsonl")
+        self.assertEqual(log._rotate_at(), config.AUDIT_MAX_MB * 1_048_576)
+        self.settings.set("audit.max_mb", 2)
+        self.assertEqual(log._rotate_at(), 2 * 1_048_576)
+        self.settings.set("audit.max_mb", 0)
+        self.assertEqual(log._rotate_at(), 0, "0 is the off switch")
+
+    def test_how_many_siblings_survive_follows_the_setting(self) -> None:
+        self.settings.set("audit.max_mb", 1)
+        self.settings.set("audit.keep", 2)
+        log = audit_mod.AuditLog(self.root / "audit.jsonl")
+        self.fill(log, 16)
+        self.assertGreaterEqual(log.rotations, 3)
+        self.assertTrue(log.sibling(2).exists())
+        self.assertFalse(log.sibling(3).exists())
+
+
 class NotifyOnFinishCase(TempMemoryCase):
     """`[ui] notify_on_finish` decides whether a finished job says so."""
 
@@ -467,6 +599,10 @@ class DriftCase(unittest.TestCase):
         ("memory.user_cap_chars", "USER_MD_CAP"),
         ("dispatch.workspace", "LUNA_WORKSPACE"),
         ("dispatch.app_id", "LUNA_APP_ID"),
+        ("dispatch.max_parallel", "DISPATCH_MAX_PARALLEL"),
+        ("dispatch.job_retention_days", "JOB_RETENTION_DAYS"),
+        ("audit.max_mb", "AUDIT_MAX_MB"),
+        ("audit.keep", "AUDIT_KEEP"),
     )
 
     def test_every_default_matches_its_fallback_constant(self) -> None:

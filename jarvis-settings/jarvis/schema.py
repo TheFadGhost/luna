@@ -226,9 +226,14 @@ SPEC: tuple[Section, ...] = (
                  "workspace.",
                  default="org.omarchy.luna", allow_empty=False),
             Number("max_parallel", "Max parallel jobs",
+                   "Anything over the limit waits in the queue with a job id "
+                   "of its own. Lowering this never stops a job already "
+                   "running.",
                    default=1, min=1, max=8, step=1),
             Number("job_retention_days", "Keep job directories for",
-                   default=14, min=1, max=365, step=1, unit="days"),
+                   "0 keeps them forever. Running and queued jobs are never "
+                   "collected, whatever their age.",
+                   default=14, min=0, max=365, step=1, unit="days"),
         ),
     ),
     Section(
@@ -238,6 +243,20 @@ SPEC: tuple[Section, ...] = (
                    default=True),
             Toggle("notify_on_finish", "Notify when a job finishes",
                    default=True),
+        ),
+    ),
+    Section(
+        key="audit", title="Audit log", pane="about",
+        doc="The record of everything the daemon did. Rotation moves bytes "
+            "rather than dropping them: the live log becomes audit.jsonl.1, "
+            "each sibling shifts up one, and only the oldest is deleted.",
+        fields=(
+            Number("max_mb", "Rotate past", "0 never rotates.",
+                   default=8, min=0, max=1024, step=1, unit="MB"),
+            Number("keep", "Numbered siblings kept",
+                   "The oldest is deleted, and the deletion is itself an "
+                   "entry in the new log.",
+                   default=5, min=1, max=100, step=1, unit="files"),
         ),
     ),
 )
@@ -274,6 +293,19 @@ _BY_KEY = {f"{s.key}.{f.key}": (s, f) for s in SPEC for f in s.fields}
 
 def sections_for(pane: str) -> tuple[Section, ...]:
     return tuple(s for s in SPEC if s.pane == pane)
+
+
+def section_for(key: str) -> Section:
+    """One section by its TOML table name.
+
+    Panes used to index `sections_for(pane)[0]`, which was correct only while
+    every pane owned exactly one table. `[audit]` shares the About pane with
+    `[ui]`, and the positional form would have silently rendered `[ui]` twice.
+    """
+    for section in SPEC:
+        if section.key == key:
+            return section
+    raise KeyError(f"no section [{key}] in the schema")
 
 
 def field_for(dotted: str) -> tuple[Section, Field] | None:

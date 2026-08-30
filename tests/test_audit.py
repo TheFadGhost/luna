@@ -164,6 +164,122 @@ class SinceParsingTests(unittest.TestCase):
         self.assertIn("30m", str(caught.exception))
 
 
+class RotationTests(TempMemoryCase):
+    """`[audit] max_mb` / `keep`: bounded, and never quietly shorter.
+
+    The ceiling is in whole megabytes because that is the only unit a person
+    setting it thinks in, so the entries here carry a fat payload rather than
+    the suite writing four thousand ordinary lines and four thousand fsyncs to
+    cross one. What is being tested is the rotation, not the arithmetic.
+    """
+
+    FAT = 300_000       # a third of a megabyte per entry
+
+    def log(self) -> audit_mod.AuditLog:
+        self.settings.set("audit.max_mb", 1)
+        return audit_mod.AuditLog(self.root / "audit.jsonl")
+
+    def fill(self, log: audit_mod.AuditLog, entries: int,
+             start: int = 0) -> None:
+        for i in range(start, start + entries):
+            log.append("test", index=i, filler="x" * self.FAT)
+
+    def test_the_live_log_rotates_and_the_old_bytes_move_to_a_sibling(self):
+        log = self.log()
+        self.fill(log, 4)
+        self.assertEqual(log.rotations, 1)
+        self.assertTrue(log.sibling(1).exists())
+        self.assertGreater(log.sibling(1).stat().st_size, 1_048_576)
+        self.assertLess(log.path.stat().st_size, 1_048_576)
+
+    def test_the_new_file_opens_with_the_entry_that_explains_the_gap(self):
+        log = self.log()
+        self.fill(log, 4)
+        first = json.loads(log.path.read_text(encoding="utf-8")
+                           .splitlines()[0])
+        self.assertEqual(first["action"], "audit.rotated")
+        self.assertEqual(first["rotated_to"], str(log.sibling(1)))
+        self.assertEqual(first["keep"], 5)
+
+    def test_no_entry_is_lost_across_a_rotation(self):
+        log = self.log()
+        self.fill(log, 8)
+        self.assertGreaterEqual(log.rotations, 2)
+        seen = [e["index"] for e in log.read(newest_first=False)
+                if e["action"] == "test"]
+        self.assertEqual(seen, list(range(8)))
+
+    def test_a_rotation_never_splits_a_line(self):
+        log = self.log()
+        self.fill(log, 8)
+        for path in log.chain():
+            for lineno, raw in enumerate(
+                    path.read_text(encoding="utf-8").splitlines(), 1):
+                with self.subTest(path=path.name, line=lineno):
+                    json.loads(raw)      # must parse; a torn write would not
+
+    def test_the_oldest_sibling_is_dropped_and_the_drop_is_recorded(self):
+        self.settings.set("audit.keep", 1)
+        log = self.log()
+        self.fill(log, 4)
+        dropped_none = json.loads(log.path.read_text(
+            encoding="utf-8").splitlines()[0])
+        self.assertNotIn("dropped", dropped_none,
+                         "nothing had to be deleted on the first rotation")
+        self.fill(log, 4, start=4)
+        self.assertFalse(log.sibling(2).exists(), "keep = 1")
+        entry = json.loads(log.path.read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(entry["dropped"], str(log.sibling(1)))
+
+    def test_zero_means_never_rotate(self):
+        self.settings.set("audit.max_mb", 0)
+        log = audit_mod.AuditLog(self.root / "audit.jsonl")
+        self.fill(log, 6)
+        self.assertEqual(log.rotations, 0)
+        self.assertFalse(log.sibling(1).exists())
+        self.assertGreater(log.path.stat().st_size, 1_048_576)
+
+    def test_reading_stops_at_the_first_file_that_cannot_help(self):
+        """The whole retained history is up to `keep` x `max_mb`. A
+        `luna audit -n 40` must not read all of it to answer."""
+        opened: list[str] = []
+
+        class _Counting(audit_mod.AuditLog):
+            def _read_file(self, path, since, action):  # noqa: ANN001, ANN202
+                opened.append(path.name)
+                return super()._read_file(path, since, action)
+
+        self.settings.set("audit.max_mb", 1)
+        log = _Counting(self.root / "audit.jsonl")
+        self.fill(log, 8)
+        opened.clear()
+        log.read(limit=1)
+        self.assertEqual(opened, ["audit.jsonl"])
+        opened.clear()
+        # A `since` older than everything has to walk the whole chain.
+        log.read(since=0.0)
+        self.assertEqual(len(opened), len(log.chain()))
+
+    def test_a_sibling_beyond_a_lowered_keep_is_still_read(self):
+        # History you stopped rotating is not history that stopped existing.
+        log = self.log()
+        self.fill(log, 4)
+        self.settings.set("audit.keep", 1)
+        self.assertIn(log.sibling(1), log.chain())
+        seen = [e["index"] for e in log.read(newest_first=False)
+                if e["action"] == "test"]
+        self.assertEqual(seen, [0, 1, 2, 3])
+
+    def test_stats_report_the_whole_retained_chain(self):
+        log = self.log()
+        self.fill(log, 4)
+        stats = log.stats()
+        self.assertEqual(stats["siblings"], 1)
+        self.assertEqual(stats["rotated_this_session"], 1)
+        self.assertEqual(stats["rotates_at_bytes"], 1_048_576)
+        self.assertGreater(stats["retained_bytes"], stats["size_bytes"])
+
+
 class UndoTests(TempMemoryCase):
     def test_an_append_records_the_inverse_that_actually_exists(self):
         undo = audit_mod.undo_for_memory_append("LUNA.md", 3)

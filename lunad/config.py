@@ -27,7 +27,7 @@ HOME = Path.home()
 STATE_DIR = _xdg("XDG_DATA_HOME", HOME / ".local" / "share") / "luna"
 MEMORY_DIR = STATE_DIR / "memory"
 LOG_PATH = STATE_DIR / "luna.log"
-AUDIT_PATH = STATE_DIR / "audit.jsonl"             # append-only, never rotated
+AUDIT_PATH = STATE_DIR / "audit.jsonl"             # append-only; rotates to .1 .. .N
 SPAWNED_PATH = STATE_DIR / "spawned.json"          # the signal allowlist
 JOBS_DIR = STATE_DIR / "jobs"                      # one directory per dispatch
 AGENT_CWD = STATE_DIR / "agent-cwd"                # neutral cwd for agent runs
@@ -259,6 +259,31 @@ DISPATCH_LINGER_S = 8.0                            # window stays up after exit
 JOB_OUTPUT_MAX_CHARS = 20_000                      # what `luna jobs` will show
 JOB_LIST_LIMIT = 20
 SPAWN_LEDGER_MAX = 200                             # records kept in spawned.json
+
+# Fallback default for `[dispatch] max_parallel`. One, because two agent
+# sessions on this 8 GB machine is already most of the headroom, and because a
+# job the user cannot see is a job they cannot notice thrashing.
+DISPATCH_MAX_PARALLEL = 1
+
+# Fallback default for `[dispatch] job_retention_days`, and how often the
+# collector wakes. Six hours, not once at startup: this daemon is meant to run
+# for weeks, and a pass that only runs at boot never runs at all.
+JOB_RETENTION_DAYS = 14
+JOB_GC_INTERVAL_S = 21_600.0
+
+# --- Audit log rotation ---------------------------------------------------
+#
+# Fallback defaults for `[audit] max_mb` and `[audit] keep`. The log is
+# evidence, so rotation moves bytes rather than dropping them: the live file
+# becomes `audit.jsonl.1`, each sibling shifts up one, and only the oldest of
+# `AUDIT_KEEP` is ever deleted. Measured on real entries, a `dispatch.spawn`
+# line is 633 bytes and a bare `process.spawned` 239, so 8 MB is on the order
+# of twenty thousand actions and five siblings is months of history — bounded
+# at 48 MB, which is nothing, and long enough that nobody rotates away the
+# evidence of the week they are asking about.
+
+AUDIT_MAX_MB = 8
+AUDIT_KEEP = 5
 
 # --- Conversation sessions (prompt-cache reuse) ---------------------------
 #

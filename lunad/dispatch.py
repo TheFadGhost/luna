@@ -5,7 +5,7 @@ Hyprland special workspace, tracks the pid she created, captures what it wrote,
 and reports back. The workspace is hidden, so the job does not interrupt what
 the user is doing; ``luna peek`` brings it into view.
 
-Three decisions worth the words:
+Four decisions worth the words:
 
 **Luna spawns the terminal, Hyprland does not.** The obvious route is
 ``hyprctl dispatch exec``, which lets the compositor place the window with an
@@ -27,6 +27,17 @@ stack duplicates, and it disappears on the next Hyprland config reload — at
 which point the next dispatch adds it again. Nothing under ``~/.config/hypr``
 is edited, so there is nothing to undo and nothing to survive an
 ``omarchy update``.
+
+**A job that cannot start yet is still a job.** ``[dispatch] max_parallel``
+bounds how many agent sessions run at once, and the alternative to a queue was
+refusing the dispatch — which reads as "Luna cannot do that" when the truth is
+"not yet". So a job over the limit gets its directory, its prompt and its id
+immediately, goes into ``jobs/`` in the ``queued`` state, appears in
+``luna jobs`` and can be cancelled there; it is simply not spawned until a slot
+frees. The only thing it does not have is a pid. Admission is re-decided every
+time a slot frees and every time the setting changes, and the limit is read at
+that moment rather than captured, so lowering it below the number of running
+jobs stops *admitting* without killing anything: the count drains on its own.
 
 The exact Hyprland incantation is documented in :class:`Hyprland`; it was not
 the obvious one.
@@ -271,17 +282,28 @@ def _lua_escape(text: str) -> str:
 # A job
 # =========================================================================
 
-_STATES = ("running", "finished", "failed", "cancelled")
+_STATES = ("queued", "running", "finished", "failed", "cancelled")
 
 
 @dataclass
 class Job:
+    """One dispatched task.
+
+    ``started`` is when the job was *accepted* — the moment the directory and
+    the prompt were written — and ``admitted`` is when it was actually spawned.
+    They are the same instant for a job that was not held behind
+    ``max_parallel``, and the gap between them is the wait. Keeping both means
+    ``luna jobs`` can sort by when the user asked without reporting an hour of
+    queueing as an hour of work.
+    """
+
     id: str
     task: str
     to: str = "worker"
     state: str = "running"
     pid: int | None = None
     started: float = field(default_factory=time.time)
+    admitted: float | None = None
     finished: float | None = None
     exit_code: int | None = None
     note: str = ""
@@ -296,8 +318,15 @@ class Job:
             "pid": self.pid,
             "started": round(self.started, 3),
             "iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(self.started)),
+            "admitted": round(self.admitted, 3) if self.admitted else None,
+            "queued_s": round((self.admitted or time.time()) - self.started, 1),
             "finished": round(self.finished, 3) if self.finished else None,
-            "elapsed_s": round((self.finished or time.time()) - self.started, 1),
+            # Time the *agent* has had, not time the request has existed. A job
+            # still in the queue, or cancelled before it ever ran, has had
+            # none: reporting the wait here would make `luna jobs` claim work
+            # that never happened.
+            "elapsed_s": (0.0 if self.admitted is None else
+                          round((self.finished or time.time()) - self.admitted, 1)),
             "exit_code": self.exit_code,
             "note": self.note,
             "dir": str(self.dir) if self.dir else None,
@@ -343,10 +372,25 @@ def _read(path: Path, limit: int) -> str:
 # =========================================================================
 
 
+@dataclass
+class _Pending:
+    """A job accepted but not yet spawned, and what spawning it will need.
+
+    The confirmation decisions travel with it because they were made when the
+    user asked, not when the slot freed: an entry claiming a job was confirmed
+    at admission time would misdate the one thing in the log that says a human
+    agreed to it.
+    """
+
+    job: Job
+    timeout: float
+    confirmed: list[str] | None = None
+
+
 class Dispatcher:
     """Spawns jobs, owns their pids, and answers ``jobs`` / ``peek``."""
 
-    def __init__(self, *, jobs_dir: Path = config.JOBS_DIR,
+    def __init__(self, *, jobs_dir: Path | None = None,
                  hypr: Hyprland | None = None,
                  audit: audit_mod.AuditLog | None = None,
                  terminal: str | None = None,
@@ -357,8 +401,18 @@ class Dispatcher:
                  confirm: confirm_mod.ConfirmBroker | None = None,
                  notify_bin: str | None = None,
                  spawn: Any = None) -> None:
-        self.jobs_dir = Path(jobs_dir)
-        self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        # Late read, and for a sharper reason than the terminal's: since
+        # `collect()` exists, this directory is one this object *deletes* from.
+        # A signature default is bound at import and cannot be patched, so a
+        # test that forgot to pass one would have had the collector walking the
+        # user's real jobs tree. See tests/_support.py.
+        self.jobs_dir = Path(jobs_dir) if jobs_dir is not None else config.JOBS_DIR
+        try:
+            self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise DispatchUnavailable(
+                f"cannot use {self.jobs_dir} as the jobs directory: {exc}"
+            ) from exc
         self.hypr = hypr if hypr is not None else Hyprland(app_id=app_id)
         self.audit = audit if audit is not None else audit_mod.audit()
         # Resolved here, not in the signature default: a default is
@@ -389,10 +443,49 @@ class Dispatcher:
         self.spawn = spawn or safety.spawn
         self._jobs: dict[str, Job] = {}
         self._procs: dict[str, subprocess.Popen] = {}
+        # Job ids admitted but not yet holding a Popen. The slot has to be
+        # reserved at the *decision*, not at the spawn: the daemon answers each
+        # connection on its own thread, so two simultaneous dispatches would
+        # otherwise both look at an empty `_procs` -- the first one's process
+        # does not exist until `_start` returns -- and both be admitted past a
+        # limit of one.
+        self._admitting: set[str] = set()
+        self._queue: list[_Pending] = []
         self._watchers: list[threading.Thread] = []
         self._lock = threading.Lock()
+        # Set by close(). Admission checks it, so a watcher that finishes
+        # during shutdown cannot start a fresh job — and a fresh job means a
+        # fresh watcher, which close() has already snapshotted the list of and
+        # would never join. That is exactly the leak the bounded drain exists
+        # to prevent.
+        self._closing = threading.Event()
+        self._gc: threading.Thread | None = None
 
     # -- helpers ---------------------------------------------------------
+
+    @property
+    def max_parallel(self) -> int:
+        """`[dispatch] max_parallel`, read at every admission decision.
+
+        Never captured: the whole point is that raising it lets waiting work
+        through and lowering it stops admitting, both without a restart, and a
+        value read once at construction would do neither.
+        """
+        try:
+            wanted = int(settings_mod.get("dispatch.max_parallel",
+                                          config.DISPATCH_MAX_PARALLEL))
+        except (TypeError, ValueError):
+            wanted = config.DISPATCH_MAX_PARALLEL
+        return max(1, wanted)
+
+    @property
+    def retention_days(self) -> int:
+        """`[dispatch] job_retention_days`. Zero or less means never collect."""
+        try:
+            return int(settings_mod.get("dispatch.job_retention_days",
+                                        config.JOB_RETENTION_DAYS))
+        except (TypeError, ValueError):
+            return config.JOB_RETENTION_DAYS
 
     def agent_bin(self) -> str:
         if self._agent_bin:
@@ -486,6 +579,61 @@ class Dispatcher:
                           encoding="utf-8")
         runner.chmod(0o700)
 
+        # Everything above happens whether or not there is a slot: a queued job
+        # is a real job with a real directory, and the work of composing its
+        # prompt is done once, now, while the caller is still here to be told
+        # about a failure.
+        pending = _Pending(job=job, timeout=timeout,
+                           confirmed=[d.action for d in decisions] or None)
+        limit = self.max_parallel
+        with self._lock:
+            self._jobs[job_id] = job
+            running, waiting = self._taken(), len(self._queue)
+            # FIFO even when a slot is free: admitting a newcomer past jobs
+            # that are already waiting would turn a queue into a lottery.
+            if running >= limit or waiting:
+                job.state = "queued"
+                self._queue.append(pending)
+            else:
+                self._admitting.add(job_id)
+        if job.state == "queued":
+            job.note = (f"queued: {running} of {limit} running, "
+                        f"{waiting} already waiting")
+            self._write_job(job)
+            self.audit.append(
+                "dispatch.queued", ok=True, job_id=job_id, to=to,
+                why=task[:500], job_dir=str(job_dir), position=waiting + 1,
+                running=running, max_parallel=limit,
+                confirmed=pending.confirmed,
+                undo={"what": "drop the job before it starts",
+                      "cmd": ["luna", "jobs", "--cancel", job_id],
+                      "valid_while": "the job has not been admitted yet"})
+            log.info("queued", extra={"job_id": job_id, "to": to,
+                                      "running": running, "waiting": waiting,
+                                      "max_parallel": limit})
+            return job
+        return self._start(pending)
+
+    def _taken(self) -> int:
+        """Slots in use. Call with the lock held."""
+        return len(self._procs) + len(self._admitting)
+
+    def _start(self, pending: _Pending) -> Job:
+        """Spawn an accepted job. Called at dispatch time, or when a slot frees.
+
+        The caller has already reserved the slot in ``_admitting``; this
+        releases the reservation either way, into ``_procs`` on success and
+        into nothing on failure.
+
+        Raises :class:`DispatchUnavailable` if the terminal will not start —
+        the job is marked ``failed`` and written to disk first, because from
+        the queue there is no caller left to raise at and the record is the
+        only thing that will be read afterwards.
+        """
+        job = pending.job
+        task, job_id, to = job.task, job.id, job.to
+        job_dir = job.dir
+
         # Best effort: without the rule the job still runs, it just opens the
         # window where the user is looking. Say so rather than failing.
         placed = True
@@ -499,7 +647,7 @@ class Dispatcher:
 
         argv = [self.terminal, "--app-id", self.app_id,
                 "--title", f"luna job {job_id} → {to}",
-                "--", "/bin/bash", str(runner)]
+                "--", "/bin/bash", str(job_dir / "run.sh")]
         try:
             proc = self.spawn(argv, kind="dispatch", job_id=job_id, durable=True,
                               note=f"dispatch to {to}: {task[:80]}",
@@ -510,38 +658,96 @@ class Dispatcher:
         except OSError as exc:
             job.state = "failed"
             job.note = f"could not start {self.terminal}: {exc}"
+            job.finished = time.time()
+            with self._lock:
+                self._admitting.discard(job_id)
             self._write_job(job)
             self.audit.append("dispatch.failed", ok=False, job_id=job_id,
                               why=task[:200], reason=str(exc))
             raise DispatchUnavailable(job.note) from exc
 
         job.pid = proc.pid
+        job.admitted = time.time()
+        job.state = "running"
         job.note = ("in special workspace" if placed
                     else "workspace rule unavailable; window is on the active "
                          "workspace")
         with self._lock:
             self._jobs[job_id] = job
             self._procs[job_id] = proc
+            self._admitting.discard(job_id)
         self._write_job(job)
 
+        waited = round(job.admitted - job.started, 1)
         self.audit.append(
             "dispatch.spawn", ok=True, job_id=job_id, to=to, pid=proc.pid,
             why=task[:500], cmd=argv, job_dir=str(job_dir),
             workspace=f"special:{self.hypr.workspace}", rule=rule,
-            confirmed=[d.action for d in decisions] or None,
+            # Only when it actually waited. A `queued_s: 0.0` on every job
+            # would be noise on the line a reader is scanning for the pid.
+            queued_s=waited if waited >= 0.1 else None,
+            confirmed=pending.confirmed,
             undo={"what": "stop the dispatched job",
                   "cmd": ["luna", "jobs", "--cancel", job_id],
                   "valid_while": "the job is still running"})
         log.info("dispatched", extra={"job_id": job_id, "to": to,
-                                      "pid": proc.pid, "placed": placed})
+                                      "pid": proc.pid, "placed": placed,
+                                      "queued_s": waited})
 
-        watcher = threading.Thread(target=self._watch, args=(job, proc, timeout),
-                                   daemon=True, name=f"luna-job-{job_id}")
+        watcher = threading.Thread(
+            target=self._watch, args=(job, proc, pending.timeout),
+            daemon=True, name=f"luna-job-{job_id}")
         with self._lock:
             self._watchers = [t for t in self._watchers if t.is_alive()]
             self._watchers.append(watcher)
         watcher.start()
         return job
+
+    # -- the admission gate, `[dispatch] max_parallel` --------------------
+
+    def _admit_next(self) -> Job | None:
+        """Start the oldest waiting job, if there is now room for it.
+
+        The limit is re-read here rather than passed in, so a job that finished
+        while the user was lowering ``max_parallel`` does not hand its slot on.
+        A job that cannot be spawned at all does not block the queue: it is
+        recorded as failed and the next one is tried.
+        """
+        while not self._closing.is_set():
+            limit = self.max_parallel
+            with self._lock:
+                # `_closing` is re-checked here, under the lock close() also
+                # takes, so a shutdown that begins mid-loop wins the tie.
+                if (self._closing.is_set() or not self._queue
+                        or self._taken() >= limit):
+                    return None
+                pending = self._queue.pop(0)
+                self._admitting.add(pending.job.id)
+            try:
+                return self._start(pending)
+            except DispatchUnavailable as exc:
+                log.warning("a queued job could not be started",
+                            extra={"job_id": pending.job.id,
+                                   "detail": str(exc)})
+        return None
+
+    def admit_ready(self) -> list[str]:
+        """Start everything the current limit now has room for.
+
+        Called when a slot frees and when ``max_parallel`` changes on disk —
+        raising the limit has to release waiting work immediately, or the
+        setting only appears to take effect when the next job happens to end.
+        """
+        started: list[str] = []
+        while True:
+            job = self._admit_next()
+            if job is None:
+                return started
+            started.append(job.id)
+
+    def queued(self) -> list[Job]:
+        with self._lock:
+            return [p.job for p in self._queue]
 
     def _runner_script(self, job: Job, timeout: float, linger: float) -> str:
         """The script the terminal runs.
@@ -625,12 +831,16 @@ exit "$rc"
         self.audit.append(
             "dispatch.finish", ok=(job.exit_code == 0), job_id=job.id,
             to=job.to, pid=job.pid, exit_code=job.exit_code,
-            elapsed_s=round(job.finished - job.started, 1),
+            elapsed_s=round(job.finished - (job.admitted or job.started), 1),
             why=job.task[:200], output_chars=len(job.read_output()),
             output_head=output[:400])
         log.info("job finished", extra={"job_id": job.id,
                                         "exit_code": job.exit_code,
                                         "state": job.state})
+        # The slot is free before the toast is sent: notifying is best-effort
+        # and can take a moment, and the next job should not wait on a desktop
+        # nicety. Nothing is admitted once close() has begun.
+        self._admit_next()
         self.notify_finished(job)
 
     # -- `[ui] notify_on_finish` -----------------------------------------
@@ -691,10 +901,32 @@ exit "$rc"
         return proc.returncode if proc is not None else None
 
     def cancel(self, job_id: str) -> bool:
+        """Stop a job. A queued one is dropped; a running one is signalled.
+
+        Cancelling from the queue is the easy half and the important half: it
+        is the only way to take back a dispatch that has not started, and it
+        signals nothing at all, so the firewall is never involved.
+        """
         with self._lock:
             proc = self._procs.get(job_id)
             job = self._jobs.get(job_id)
-        if proc is None or job is None:
+            pending = next((p for p in self._queue if p.job.id == job_id), None)
+            if pending is not None:
+                self._queue.remove(pending)
+        if job is None:
+            return False
+        if pending is not None and proc is None:
+            job.state = "cancelled"
+            job.finished = time.time()
+            job.note = "cancelled before it started; nothing was spawned"
+            self._write_job(job)
+            self.audit.append("dispatch.cancel", ok=True, job_id=job_id,
+                              why="cancel requested", was="queued",
+                              queued_s=round(job.finished - job.started, 1),
+                              note="never admitted; no process existed")
+            log.info("dropped a queued job", extra={"job_id": job_id})
+            return True
+        if proc is None:
             return False
         try:
             stopped = safety.terminate(proc, reason=f"job {job_id} cancelled")
@@ -763,6 +995,14 @@ exit "$rc"
                 data["state"] = "orphaned"
                 data["note"] = ("the daemon that started this job is gone; "
                                 "its outcome is whatever is in the job directory")
+            elif data.get("state") == "queued" and jid_is_dead(data, live):
+                # A queue lives in one daemon's memory and nowhere else, so a
+                # `queued` directory belonging to no live dispatcher is not
+                # waiting for anything. Saying "queued" would be a promise
+                # nothing is going to keep.
+                data["state"] = "orphaned"
+                data["note"] = ("the daemon that accepted this job is gone; "
+                                "it was never started and nothing ran")
             if with_output and data.get("dir"):
                 job = Job(id=str(data["id"]), task=str(data.get("task", "")),
                           dir=Path(str(data["dir"])))
@@ -773,8 +1013,108 @@ exit "$rc"
         with self._lock:
             running = [j.to_dict() for j in self._jobs.values()
                        if j.state == "running"]
-        return {"running": running, "jobs_dir": str(self.jobs_dir),
+            waiting = [p.job.to_dict() for p in self._queue]
+        return {"running": running, "queued": waiting,
+                "max_parallel": self.max_parallel,
+                "retention_days": self.retention_days,
+                "jobs_dir": str(self.jobs_dir),
                 "workspace": self.hypr.state()}
+
+    # -- `[dispatch] job_retention_days` ---------------------------------
+
+    def collect(self, now: float | None = None) -> dict[str, Any]:
+        """Delete job directories that are past the retention window.
+
+        These directories are the only record of what a dispatched agent did,
+        so the policy is narrow and stated here rather than inferred from the
+        code:
+
+        **A job is aged from when it stopped, not from when it started.** The
+        stamp is ``finished`` out of ``job.json``, falling back to ``started``
+        for a directory that has no finish recorded, and to the file's mtime if
+        the JSON is unreadable. Retention answers "how long is the *record*
+        kept", and a job that ran for six hours has a record that begins when
+        it ends.
+
+        **Nothing running or queued is ever collected, at any age.** Neither is
+        anything this dispatcher still holds. A job whose daemon died —
+        ``orphaned`` in ``luna jobs`` — *is* collectable once past the window:
+        it will never finish, and keeping it forever would mean one crash
+        pinning a directory for the life of the machine.
+
+        **Zero means never.** ``job_retention_days = 0`` collects nothing.
+        That is the footgun this method exists to disarm: read as a duration,
+        zero days would mean "delete everything", which is the one thing a user
+        typing the smallest allowed number cannot possibly want.
+
+        Each deletion gets its own audit entry and none of them carries an
+        ``undo``, because there is not one.
+        """
+        now = time.time() if now is None else now
+        days = self.retention_days
+        if days <= 0:
+            return {"collected": 0, "kept": 0, "freed_bytes": 0,
+                    "retention_days": days,
+                    "note": "retention is 0 or less; directories are never collected"}
+        cutoff = now - days * 86_400.0
+        with self._lock:
+            live = {jid: job for jid, job in self._jobs.items()}
+        collected, kept, freed = 0, 0, 0
+        for entry in sorted(self.jobs_dir.glob("*")):
+            if not entry.is_dir():
+                continue
+            verdict, stamp, state = _collectable(entry, live, cutoff)
+            if not verdict:
+                kept += 1
+                continue
+            size = _dir_bytes(entry)
+            try:
+                shutil.rmtree(entry)
+            except OSError as exc:
+                kept += 1
+                log.warning("could not collect a job directory",
+                            extra={"job_dir": str(entry), "detail": str(exc)})
+                continue
+            collected += 1
+            freed += size
+            with self._lock:
+                self._jobs.pop(entry.name, None)
+            self.audit.append(
+                "job.collected", ok=True, job_id=entry.name,
+                why=f"older than [dispatch] job_retention_days ({days}d)",
+                job_dir=str(entry), state=state, bytes=size,
+                age_days=round((now - stamp) / 86_400.0, 1))
+        if collected:
+            log.info("collected job directories",
+                     extra={"collected": collected, "kept": kept,
+                            "freed_bytes": freed, "retention_days": days})
+        return {"collected": collected, "kept": kept, "freed_bytes": freed,
+                "retention_days": days}
+
+    def start_gc(self, interval: float = config.JOB_GC_INTERVAL_S) -> None:
+        """Run :meth:`collect` on a timer, off the request path. Idempotent.
+
+        A thread rather than a hook on dispatch: the pass walks a directory and
+        must never be something a user waits for, and hanging it off dispatch
+        would mean the collection only happens on a machine that is already
+        busy. One pass on the way up, because a laptop that is suspended and
+        resumed daily would otherwise never reach the first tick.
+        """
+        if self._gc is not None and self._gc.is_alive():
+            return
+
+        def loop() -> None:
+            while True:
+                try:
+                    self.collect()
+                except Exception:  # noqa: BLE001 - the collector must not die
+                    log.exception("the job collector failed")
+                if self._closing.wait(interval):
+                    return
+
+        self._gc = threading.Thread(target=loop, daemon=True,
+                                    name="luna-job-gc")
+        self._gc.start()
 
     def close(self, join_timeout: float = 5.0) -> None:
         """Daemon shutdown. Dispatched jobs are deliberately left running.
@@ -782,6 +1122,14 @@ exit "$rc"
         Killing them would be the wrong default: a job is somebody's work in
         progress, the terminal is visible to the user, and the ledger entry is
         durable so a restarted daemon can still signal it if asked.
+
+        A *queued* job is the opposite case and gets the opposite treatment.
+        Nothing was spawned, the queue only ever existed in this process's
+        memory, and a `queued` directory left behind by a dead daemon is a job
+        that will never start however long anyone waits for it. So the queue is
+        emptied and each job is recorded as cancelled, with the reason. That is
+        also what stops the queue leaking: no waiting job, no watcher, nothing
+        holding a slot that will never be released.
 
         The *watchers* are a different matter. ``_watch`` wakes when the
         terminal exits and only then writes ``dispatch.finish``, so a watcher
@@ -793,15 +1141,44 @@ exit "$rc"
         not return for as long as the job lasts, and shutdown must not hang on
         somebody's hour-long task.
         """
+        # First, so a watcher that finishes during the drain below cannot
+        # admit a new job and start a watcher this call will never join.
+        self._closing.set()
         with self._lock:
             self._procs.clear()
-            watchers = [t for t in self._watchers if t.is_alive()]
+            self._admitting.clear()
+            dropped = list(self._queue)
+            self._queue.clear()
+            gc_thread = self._gc
+        for pending in dropped:
+            job = pending.job
+            job.state = "cancelled"
+            job.finished = time.time()
+            job.note = "the daemon stopped before this job was started"
+            self._write_job(job)
+            self.audit.append("dispatch.cancel", ok=True, job_id=job.id,
+                              why="lunad shut down with the job still queued",
+                              was="queued",
+                              queued_s=round(job.finished - job.started, 1),
+                              note="never admitted; no process existed")
+        # Re-read the list each pass rather than joining one snapshot. A
+        # watcher that was mid-`_admit_next` when `_closing` went up wins that
+        # race and starts one more job -- and one more watcher, appended after
+        # the snapshot was taken, which the snapshot loop would then never
+        # join. Under test that is a `dispatch.finish` written into a
+        # temporary tree teardown has already deleted, which recreates the
+        # tree: the stray `/tmp/luna-test-*` this suite has a CI check for.
         deadline = time.monotonic() + join_timeout
-        for thread in watchers:
+        while True:
+            with self._lock:
+                self._watchers = [t for t in self._watchers if t.is_alive()]
+                pending = list(self._watchers)
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            if not pending or remaining <= 0:
                 break
-            thread.join(remaining)
+            pending[0].join(remaining)
+        if gc_thread is not None:
+            gc_thread.join(max(0.0, deadline - time.monotonic()))
         with self._lock:
             self._watchers = [t for t in self._watchers if t.is_alive()]
 
@@ -814,3 +1191,59 @@ def jid_is_dead(data: dict[str, Any], live: dict[str, Any]) -> bool:
     if not isinstance(pid, int):
         return True
     return not safety.is_alive(pid)
+
+
+def _collectable(entry: Path, live: dict[str, Job],
+                 cutoff: float) -> tuple[bool, float, str]:
+    """May this job directory be deleted? Returns the verdict, stamp and state.
+
+    Read defensively on purpose: this is the one function in the daemon that
+    deletes something the user cannot get back, so every branch that cannot
+    establish the age of a directory keeps it.
+    """
+    job = live.get(entry.name)
+    if job is not None and job.state in ("running", "queued"):
+        return False, 0.0, job.state
+    manifest = entry / "job.json"
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("job.json is not an object")
+    except (OSError, ValueError):
+        # No readable manifest: this is a dispatch that died between mkdir and
+        # the first write, not a record of anything. It ages from the directory
+        # itself, and is still only collected past the window.
+        stamp = _mtime(entry)
+        return stamp < cutoff, stamp, "unknown"
+    state = str(data.get("state") or "unknown")
+    if state in ("running", "queued") and not jid_is_dead(data, live):
+        return False, 0.0, state
+    stamp = _float(data.get("finished")) or _float(data.get("started")) \
+        or _mtime(manifest)
+    return stamp < cutoff, stamp, state
+
+
+def _float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        # Unreadable is not old. Returning "now" keeps the directory.
+        return time.time()
+
+
+def _dir_bytes(path: Path) -> int:
+    total = 0
+    for item in path.rglob("*"):
+        try:
+            if item.is_file():
+                total += item.stat().st_size
+        except OSError:
+            continue
+    return total

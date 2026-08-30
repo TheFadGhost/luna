@@ -49,10 +49,18 @@ with what it was for and how it ended.
 
 Its properties, and their honest limits:
 
-- **Append-only.** Opened in append mode; never truncated, rewritten or
-  rotated. It grows without bound on purpose.
+- **Append-only.** Opened in append mode; never truncated and never edited in
+  place.
 - **Durable.** Each line is flushed and `fsync`'d before the call returns, so
   an action that happened is in the log even across a hard power loss.
+- **Bounded, but never quietly shorter.** Past `[audit] max_mb` the live file
+  is *renamed* to `audit.jsonl.1` and its siblings shift up; only the oldest of
+  `[audit] keep` is ever deleted, and that deletion is recorded as the first
+  entry of the new file, naming what was dropped. The rename happens between
+  two whole lines, after the previous line's `fsync`, so no record is ever cut
+  in half. `luna audit` reads the siblings as well. With the defaults that is
+  five files of 8 MB; `max_mb = 0` restores the old unbounded behaviour, and if
+  you are keeping this machine under scrutiny that is the setting to use.
 - **Honest about undo.** An inverse is recorded only where one genuinely
   exists and is known at the time. Nothing invents an undo for something
   irreversible, because a fabricated undo command invites you to run it.
