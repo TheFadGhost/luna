@@ -476,11 +476,17 @@ def signal_self(sig: int = signal.SIGTERM) -> None:
 
 def terminate(proc: subprocess.Popen, *, grace: float = 5.0,
               reason: str = "") -> bool:
-    """Stop a child Luna spawned: SIGTERM, wait, then SIGKILL.
+    """Stop a child Luna spawned: SIGTERM, wait, then SIGKILL, then wait again.
 
     Signals the child's process group when it leads one (everything Luna
     spawns does, via ``start_new_session=True``) so that the agent's own
     children go with it. Falls back to the single pid otherwise.
+
+    Returns whether the process was actually confirmed dead, not merely
+    signalled: SIGKILL cannot be blocked, but a process stuck in an
+    uninterruptible kernel sleep (disk or network I/O) can still outlive both
+    bounded waits. ``False`` in that case means exactly that — go on trying to
+    reap it (see :func:`reap_after`) rather than treating the pid as gone.
     """
     if proc.poll() is not None:
         return False
@@ -493,15 +499,26 @@ def terminate(proc: subprocess.Popen, *, grace: float = 5.0,
         raise lg.refuse(pid, why)
 
     _kill_best_effort(pid, signal.SIGTERM, reason)
+    if _wait_dead(proc, grace):
+        return True
+    _kill_best_effort(pid, signal.SIGKILL, reason + " (escalated)")
+    return _wait_dead(proc, grace)
+
+
+def _wait_dead(proc: subprocess.Popen, grace: float) -> bool:
+    """Poll for up to ``grace`` seconds, reaping the instant death is seen.
+
+    ``Popen.poll()`` is a ``waitpid(..., WNOHANG)`` under the hood, so the
+    call that notices the child died is the same call that reaps it — there
+    is no separate step where the confirmation and the reap could be pulled
+    apart and a window opened between them.
+    """
     deadline = time.monotonic() + max(0.0, grace)
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             return True
         time.sleep(0.05)
-    if proc.poll() is not None:
-        return True
-    _kill_best_effort(pid, signal.SIGKILL, reason + " (escalated)")
-    return True
+    return proc.poll() is not None
 
 
 def _kill_best_effort(pid: int, sig: int, reason: str) -> None:
@@ -561,7 +578,60 @@ def spawn(argv: list[str], *, kind: str = "child", job_id: str | None = None,
 
 
 def reap(proc: subprocess.Popen | None) -> None:
-    """Drop a finished child from the allowlist. Safe to call twice."""
+    """Drop a finished child from the allowlist. Safe to call twice.
+
+    This only edits the ledger. It does not wait, and does not reap: a caller
+    that has not already confirmed the child is dead (``terminate()``
+    returning True, or its own ``proc.wait()`` succeeding) wants
+    :func:`reap_after` instead, or the pid is dropped from the allowlist while
+    the OS process table entry is still occupied — safe (the firewall only
+    ever gets *more* conservative from that), but it leaves a zombie nobody is
+    ever going to collect.
+    """
     if proc is None:
         return
     ledger().forget(proc.pid)
+
+
+def reap_after(proc: subprocess.Popen | None, *, timeout: float | None = None) -> bool:
+    """Wait for ``proc`` to actually exit, then forget it. Never gives up.
+
+    ``proc.wait()``/``proc.poll()`` perform the ``waitpid`` that turns a dead
+    child from a zombie into nothing; ``reap()`` alone only edits the ledger
+    and — used on its own after a wait that may not have happened — is exactly
+    the "forgot about it, never actually collected it" bug this exists to
+    replace. A hung child (stuck in an uninterruptible kernel sleep, most
+    commonly) can outlive any bounded wait a caller is willing to block on, so
+    when ``timeout`` runs out the wait continues on a background thread rather
+    than being abandoned: this call returns ``False``, but the pid is
+    guaranteed to be reaped — and only then forgotten — eventually.
+
+    Returns whether the child was confirmed dead (and reaped) before
+    ``timeout`` elapsed. ``proc=None`` counts as already reaped.
+    """
+    if proc is None:
+        return True
+    if proc.poll() is not None:
+        reap(proc)
+        return True
+    if timeout is not None and timeout > 0:
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            pass
+        else:
+            reap(proc)
+            return True
+    threading.Thread(target=_reap_forever, args=(proc,), daemon=True,
+                     name=f"luna-reap-{proc.pid}").start()
+    return False
+
+
+def _reap_forever(proc: subprocess.Popen) -> None:
+    """The background half of :func:`reap_after`: wait with no deadline."""
+    try:
+        proc.wait()
+    except Exception:  # noqa: BLE001 - a reaper thread must never raise
+        log.exception("background reap failed", extra={"pid": proc.pid})
+        return
+    reap(proc)

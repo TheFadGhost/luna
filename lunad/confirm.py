@@ -574,8 +574,10 @@ class ConfirmBroker:
 
 
 def _reap_after(proc: subprocess.Popen) -> None:
-    try:
-        proc.wait(timeout=15)
-    except subprocess.TimeoutExpired:
-        pass
-    safety.reap(proc)
+    """Wait on the notify toast, then release the pid.
+
+    ``reap_after`` keeps waiting past its own bound rather than giving up:
+    without that, a ``notify-send`` that never exits leaked a zombie for the
+    rest of the daemon's life, once per confirmation prompt.
+    """
+    safety.reap_after(proc, timeout=15)
