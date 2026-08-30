@@ -911,6 +911,13 @@ def cmd_ambient(args: argparse.Namespace) -> int:
         if name == "crash":
             bits.append(f"{w.get('known')} dumps known")
             bits.append("diagnose on click" if w.get("diagnose") else "notify only")
+            # Said whichever way round it is, because "off" here is a
+            # decision and not an oversight: the desktop's own
+            # omarchy-crash-watch already announces these.
+            if w.get("desktop_already_watching"):
+                bits.append("omarchy-crash-watch is live"
+                            + (" — you will get two toasts" if w.get("enabled")
+                               else ""))
         elif name == "battery":
             pct = w.get("pct")
             bits.append(f"{pct}% {w.get('status') or ''}".strip()
