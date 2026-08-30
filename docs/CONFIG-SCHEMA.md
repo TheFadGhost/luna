@@ -94,6 +94,21 @@ job_retention_days = 14      # finished job directories older than this are coll
 max_mb = 8                   # rotate once the live log passes this; 0 = never
 keep   = 5                   # numbered siblings kept; the oldest is deleted
 
+# The three things she notices on her own. Ambient events NOTIFY;
+# they never speak -- speaking aloud is reserved for a job the user started.
+[ambient]
+enabled                = true   # master switch for all three hooks
+poll_seconds           = 60     # one tick; each hook is a stat(), not a fork
+crash                  = true   # a process on this machine dumped core
+crash_diagnose         = true   # the toast's one click dispatches the diagnosis
+battery                = false  # OFF: Omarchy already warns at 10%
+battery_low_pct        = 20     # above Omarchy's 10% toast
+battery_critical_pct   = 5      # below it, above UPower's 2% hibernate
+update                 = true   # an omarchy update landed and rewrote /usr/share
+# 'An update is available' is deliberately NOT checked here: that costs a
+# network sync (checkupdates), and Omarchy's own bar widget already polls it
+# every six hours and shows the answer.
+
 [ui]
 theme_follows_omarchy = true
 notify_on_finish = true
@@ -207,6 +222,39 @@ namespace is deliberately outside the user-facing contract.
 |---|---|---|
 | `max_mb` | `audit.AuditLog.append` | Live, checked after each line on the position the write already reached — so the decision costs no extra syscall and can never land between a line and its `fsync`. A rotated sibling is therefore one line *past* the ceiling, never short of it. `0` means never rotate, for the same reason `job_retention_days` has an off switch: this is evidence, and someone keeping a machine under scrutiny must be able to say "grow without bound" in the file rather than by patching the daemon. |
 | `keep` | `audit.AuditLog.append` | Live. The live file becomes `audit.jsonl.1`, each sibling shifts up one, and only `audit.jsonl.<keep>` is ever deleted — and that deletion is itself an entry, `audit.rotated`, written as the **first line of the new live file**, naming what was renamed and what was dropped. So the chain reads backwards from the live file and any gap in it explains itself. `luna audit` reads the siblings too, stopping at the first file that cannot hold anything the query asked for. Lowering `keep` from 8 to 5 leaves `.6` and `.7` on disk and rotation will never touch them again — they are still *read*, because history you stopped rotating is not the same as history that silently stopped existing. Delete them by hand if you want them gone. |
+
+### `[ambient]`
+
+Read by `ambient.Ambient` and its three watchers, live, on the next tick. This
+is the only table whose keys make `lunad` do something **nobody asked for**, so
+each one says what it costs and the one that duplicates the desktop is off.
+
+**The rule the whole table serves: an ambient event notifies, it never speaks.**
+That is not a setting and there is no key to change it. `lunad/ambient.py` does
+not import `lunad.speech`, `Ambient` refuses any delivery channel that is not a
+`Notifier`, and it refuses at construction any collaborator with a `.say()` —
+`tests/test_ambient.py::NeverSpeaksCase` fails if any of the three is weakened.
+Speaking aloud stays reserved for the completion of a job the user themselves
+started.
+
+| key | read by | effect |
+|---|---|---|
+| `enabled` | `ambient.Ambient.tick` | Live. `false` and the thread still ticks but every watcher is skipped, so turning it back on costs nothing and needs no restart. |
+| `poll_seconds` | `ambient.Ambient.interval` | Live, on the next wake. The floor is 5 s and the schema minimum enforces it; the default of 60 is already far below the noise floor — a tick that finds nothing is three `stat()`s and a 12-byte read, and the settings watcher this daemon has run since P2b stats its config file thirty times more often. Each hook has its own cadence on top: crash and battery every tick, `update` every 300 s. |
+| `crash` | `ambient.CrashWatcher` | Live. Watches `/var/lib/systemd/coredump` — one `stat()` per tick, and a `scandir` only when the mtime moves. It **never forks `coredumpctl`**: each dump's filename already carries the comm, uid, pid and microsecond. Only this user's dumps are reported. First run seeds silently, so a fresh daemon does not announce the fortnight of history tmpfiles keeps. A burst of more than `AMBIENT_CRASH_BURST` (3) in one tick coalesces into a single toast — this machine produces eight `foot` cores in a minute when a suite deletes a running script, and eight critical toasts for one incident is what gets a feature switched off. |
+| `crash_diagnose` | `ambient.CrashWatcher._diagnose` | Live. Puts the diagnosis one click away: the toast's single action is `luna ambient diagnose <pid>`, which dispatches an agent session pointed at the `diagnose-crash` skill. It is **not** automatic, and that is deliberate — a diagnosis is a real model call and a terminal window, and running one unasked on every core dump is Luna acting rather than noticing. `false` leaves the crash a plain notification. |
+| `battery` | `ambient.BatteryWatcher` | Live. **Defaults to `false`**, alone in this table, because Omarchy already owns this: `shell/plugins/services/battery/Service.qml` polls every 30 s and runs `omarchy-battery-low` at 10%, and UPower hibernates at 2%. A second toast about the same battery at the same moment is worse than none. Turn it on if you want an *earlier* warning than the desktop's. The battery is found by reading each `/sys/class/power_supply/*/type` for `Battery` rather than assumed — on this laptop it is `BAT1`, not `BAT0`, and it has no `charge_now` at all. |
+| `battery_low_pct` | `ambient.BatteryWatcher.thresholds` | Live. Fires once while discharging at or below this, and re-arms only on mains or on climbing back above it. Sits above Omarchy's 10% on purpose so the two do not land together. |
+| `battery_critical_pct` | `ambient.BatteryWatcher.thresholds` | Live. Below Omarchy's 10% and above UPower's 2% hibernate, so it is the last warning before the machine acts on its own. Clamped to `battery_low_pct` if set higher, because a critical above the low would make the low unreachable. |
+| `update` | `ambient.UpdateWatcher` | Live, every 300 s. Two `stat()`s and a 12-byte read: `/usr/share/omarchy/version` (contents **and** mtime) plus `/tmp/omarchy-update.log`. This is the hook that matters most — `omarchy update` is `pacman -Syu --overwrite '/usr/share/omarchy/*'`, which rewrites that whole tree, and it is exactly how a customisation gets silently reverted. The mtime is checked as well as the version string because a same-version reinstall clobbers just as thoroughly. A run that moved no package is reported at `low` urgency rather than not at all. |
+
+**"An update is available" is not here, on purpose.** That check is
+`omarchy-update-available`, which runs `checkupdates` and syncs a pacman
+database over the network. Omarchy's own `SystemUpdate.qml` bar widget already
+runs it on a six-hour timer and shows the result, so a second poller would cost
+the network and the battery to duplicate a light the user is already looking
+at. The half worth having is the half the bar does *not* show: that an update
+already landed and took `/usr/share/omarchy` with it.
 
 ### `[ui]`
 

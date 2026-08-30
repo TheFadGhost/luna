@@ -136,6 +136,48 @@ FORBIDDEN_JOBS_DIR = Path(_JOBS_GUARD.name) / "jobs"
 
 config.JOBS_DIR = FORBIDDEN_JOBS_DIR
 
+#: The ambient subsystem's four outward *inputs*, and its two outputs.
+#:
+#: This is the same class of bug as the notifier, pointing the other way. The
+#: names above are things lunad *writes to*; these are things it *reads*, and
+#: reading the real ones is just as bad. A `Daemon` built by a test starts an
+#: `Ambient`, and against the live paths its first tick would walk the user's
+#: actual coredumps and their actual `/usr/share/omarchy/version` -- so the
+#: suite's behaviour would depend on whether anything had crashed on the
+#: machine that morning, and a case that let one tick through would put a
+#: critical "quickshell crashed" toast on the user's screen carrying a two-week
+#: old dump.
+#:
+#: So all four point into one throwaway tree for the life of the test process.
+#: `COREDUMP_DIR` and `POWER_SUPPLY_DIR` are created empty, which is the state
+#: every watcher reads as "nothing here"; the two omarchy paths are left
+#: absent, which `UpdateWatcher` reads as "not an Omarchy machine".
+#:
+#: `AMBIENT_STATE_PATH` and `HUD_MESSAGE_FILE` are the outputs. The state file
+#: would otherwise mark the user's real coredumps as already-seen, which is a
+#: quiet way to make the live daemon miss the next one; the message file is the
+#: HUD pane the desktop is reading, so a test writing it would drop a caption
+#: on the user's screen with fixture text in it.
+_AMBIENT_DIR = Path(tempfile.mkdtemp(prefix="luna-tests-ambient-"))
+atexit.register(shutil.rmtree, _AMBIENT_DIR, True)
+
+FORBIDDEN_COREDUMP_DIR = _AMBIENT_DIR / "coredump"
+FORBIDDEN_POWER_SUPPLY_DIR = _AMBIENT_DIR / "power_supply"
+FORBIDDEN_OMARCHY_VERSION = _AMBIENT_DIR / "omarchy-version"
+FORBIDDEN_OMARCHY_UPDATE_LOG = _AMBIENT_DIR / "omarchy-update.log"
+FORBIDDEN_AMBIENT_STATE = _AMBIENT_DIR / "ambient.json"
+FORBIDDEN_HUD_MESSAGE = _STATE_DIR / "message"
+
+FORBIDDEN_COREDUMP_DIR.mkdir(parents=True, exist_ok=True)
+FORBIDDEN_POWER_SUPPLY_DIR.mkdir(parents=True, exist_ok=True)
+
+config.COREDUMP_DIR = FORBIDDEN_COREDUMP_DIR
+config.POWER_SUPPLY_DIR = FORBIDDEN_POWER_SUPPLY_DIR
+config.OMARCHY_VERSION_FILE = FORBIDDEN_OMARCHY_VERSION
+config.OMARCHY_UPDATE_LOG = FORBIDDEN_OMARCHY_UPDATE_LOG
+config.AMBIENT_STATE_PATH = FORBIDDEN_AMBIENT_STATE
+config.HUD_MESSAGE_FILE = FORBIDDEN_HUD_MESSAGE
+
 
 class FakeHyprland:
     """A compositor that answers without a compositor.

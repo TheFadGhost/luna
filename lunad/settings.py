@@ -287,6 +287,45 @@ SCHEMA: tuple[Section, ...] = (
         ),
     ),
     Section(
+        "ambient",
+        align=22,
+        header=(
+            "The three things she notices on her own. Ambient events NOTIFY;",
+            "they never speak -- speaking aloud is reserved for a job the "
+            "user started.",
+        ),
+        keys=(
+            Key("enabled", True, "bool",
+                comment="master switch for all three hooks"),
+            Key("poll_seconds", 60, "int", minimum=5, maximum=3600,
+                comment="one tick; each hook is a stat(), not a fork"),
+            Key("crash", True, "bool",
+                comment="a process on this machine dumped core"),
+            Key("crash_diagnose", True, "bool",
+                comment="the toast's one click dispatches the diagnosis"),
+            # OFF by default, and the only hook that is. Omarchy already
+            # notifies at 10% from its own bar service, and UPower hibernates
+            # at 2%. A second source nagging about the same battery at the
+            # same moment is worse than none, so this stays off until somebody
+            # decides they want an *earlier* warning than the desktop's.
+            Key("battery", False, "bool",
+                comment="OFF: Omarchy already warns at 10%"),
+            Key("battery_low_pct", 20, "int", minimum=1, maximum=100,
+                comment="above Omarchy's 10% toast"),
+            Key("battery_critical_pct", 5, "int", minimum=1, maximum=100,
+                comment="below it, above UPower's 2% hibernate"),
+            Key("update", True, "bool",
+                comment="an omarchy update landed and rewrote /usr/share"),
+        ),
+        footer=(
+            "'An update is available' is deliberately NOT checked here: that "
+            "costs a",
+            "network sync (checkupdates), and Omarchy's own bar widget "
+            "already polls it",
+            "every six hours and shows the answer.",
+        ),
+    ),
+    Section(
         "ui",
         keys=(
             Key("theme_follows_omarchy", True, "bool"),

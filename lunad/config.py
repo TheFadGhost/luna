@@ -60,6 +60,13 @@ SOCKET_PATH = RUNTIME_DIR / "luna.sock"
 # subscription. Beside the socket on purpose: same tmpfs, same lifetime.
 STATE_FILE = RUNTIME_DIR / "state"
 
+# The HUD pane's caption, a sibling of `state` in the same tmpfs directory.
+# One JSON object, written atomically, with a monotonically increasing `id`.
+# The contract is HANDOFF-hud.md and the writer is `ambient.HudWriter`; the
+# pane (~/.config/omarchy/plugins/ghost.lunahud) reads it through inotify, so
+# nothing polls and an absent file simply means there is nothing to show.
+HUD_MESSAGE_FILE = RUNTIME_DIR / "message"
+
 OMARCHY_DEFAULT_AGENT = HOME / ".config" / "omarchy" / "defaults" / "agent"
 
 # --- Jarvis: the app's own configuration home ------------------------------
@@ -366,6 +373,46 @@ LOG_BACKUP_COUNT = 5
 # --- Recall ---------------------------------------------------------------
 
 RECALL_LIMIT = 6                                   # tier-2 episodes per prompt
+
+# --- Ambient awareness ----------------------------------------------------
+#
+# The three things Luna notices without being asked. See lunad/ambient.py for
+# what each hook watches and why it is cheap; these are the outward names it
+# reads, and every one of them is redirected by tests/_support.py so the suite
+# can never see a real coredump, a real battery or the real /usr/share.
+
+#: systemd-coredump's store, `Storage=external` (the default here). 0755
+#: root:root, so an unprivileged daemon can list it; each filename carries the
+#: comm, uid, pid and microsecond, which is why the hook never forks
+#: coredumpctl.
+COREDUMP_DIR = Path("/var/lib/systemd/coredump")
+
+#: Read, not assumed: the battery on this laptop is BAT1 (not BAT0) and reports
+#: energy rather than charge, so the watcher finds it by `type == "Battery"`.
+POWER_SUPPLY_DIR = Path("/sys/class/power_supply")
+
+#: `omarchy update` is pacman with `--overwrite '/usr/share/omarchy/*'`, not a
+#: git pull, so there is no HEAD to fingerprint. This file's contents *and*
+#: mtime are the fingerprint: a same-version reinstall still clobbers the tree.
+OMARCHY_VERSION_FILE = Path("/usr/share/omarchy/version")
+
+#: `omarchy-update` wraps its whole run in `script` and logs here, on tmpfs.
+#: A run that changed no package still moves this mtime; a reboot removes it,
+#: so its absence proves nothing.
+OMARCHY_UPDATE_LOG = Path("/tmp/omarchy-update.log")
+
+#: What each watcher has already seen, so a daemon restart does not re-announce
+#: a fortnight of coredumps.
+AMBIENT_STATE_PATH = STATE_DIR / "ambient.json"
+
+AMBIENT_POLL_S = 60.0                 # `[ambient] poll_seconds`
+AMBIENT_UPDATE_EVERY_S = 300.0        # the update hook's own, slower cadence
+AMBIENT_BATTERY_LOW_PCT = 20          # above Omarchy's own 10% toast
+AMBIENT_BATTERY_CRITICAL_PCT = 5      # below it, above UPower's 2% hibernate
+AMBIENT_CRASH_BURST = 3               # more than this in one tick coalesces
+AMBIENT_RECENT_DUMPS = 64             # dump names remembered for de-duplication
+AMBIENT_HUD_TTL_S = 12.0              # seconds an ambient caption stays up
+AMBIENT_DIAGNOSE_TIMEOUT_S = 900.0    # ceiling on a dispatched crash diagnosis
 
 
 def ensure_dirs() -> None:
