@@ -861,6 +861,56 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ambient(args: argparse.Namespace) -> int:
+    """`luna ambient` — what she is watching; `... diagnose <pid>` — why.
+
+    The `diagnose` form is what the crash toast's single click runs, so it is
+    a real command rather than an internal hook: a notification the user can
+    also type is one they can retry after they have dismissed it.
+    """
+    if getattr(args, "amb_cmd", None) == "diagnose":
+        with Client(timeout=30) as client:
+            resp = client.call("ambient.diagnose", pid=args.pid,
+                               exe=args.exe or "", when=args.when or "")
+        if not resp.get("ok"):
+            return fail(resp)
+        if args.json:
+            print(json.dumps(resp, indent=2))
+            return 0
+        print(resp.get("announce") or f"diagnosing pid {args.pid}")
+        print(f"{DIM}job {resp.get('id')} — `luna jobs` for the answer{RESET}")
+        return 0
+
+    with Client(timeout=15) as client:
+        resp = client.call("ambient")
+    if not resp.get("ok"):
+        return fail(resp)
+    amb = resp.get("ambient") or {}
+    if args.json:
+        print(json.dumps(amb, indent=2))
+        return 0
+    on = "on" if amb.get("enabled") else "off"
+    print(f"{BOLD}ambient{RESET} {on}  "
+          f"{DIM}every {amb.get('poll_seconds')}s · "
+          f"{amb.get('ticks')} ticks · {amb.get('delivered')} delivered · "
+          f"never speaks{RESET}")
+    for name, w in (amb.get("watchers") or {}).items():
+        mark = "●" if w.get("enabled") else "○"
+        bits = [f"every {w.get('every_s'):.0f}s"]
+        if name == "crash":
+            bits.append(f"{w.get('known')} dumps known")
+            bits.append("diagnose on click" if w.get("diagnose") else "notify only")
+        elif name == "battery":
+            pct = w.get("pct")
+            bits.append(f"{pct}% {w.get('status') or ''}".strip()
+                        if pct is not None else "not read yet")
+            bits.append(f"low {w.get('low_pct')}% / crit {w.get('critical_pct')}%")
+        elif name == "update":
+            bits.append(f"omarchy {w.get('version') or 'unknown'}")
+        print(f"  {mark} {name:<8} {DIM}{' · '.join(bits)}{RESET}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     # `jarvis` and `luna` are the same client; argv[0] decides only the name
     # in the help text, because the app is Jarvis and the assistant inside it
@@ -1023,6 +1073,17 @@ def build_parser() -> argparse.ArgumentParser:
     cfask.add_argument("detail", nargs="*")
     cfask.add_argument("--timeout", type=float, default=120.0)
     cf.set_defaults(func=cmd_confirm, confirm_cmd="list")
+
+    am = sub.add_parser("ambient",
+                        help="the three things she notices on her own")
+    amsub = am.add_subparsers(dest="amb_cmd", required=False)
+    amdiag = amsub.add_parser(
+        "diagnose", help="work out why a process crashed (the crash toast's "
+                         "click action)")
+    amdiag.add_argument("pid", type=int, help="the pid that dumped core")
+    amdiag.add_argument("--exe", default="", help="the crashed command's name")
+    amdiag.add_argument("--when", default="", help="when it happened")
+    am.set_defaults(func=cmd_ambient)
 
     cn = sub.add_parser("cancel", help="cancel an in-flight request")
     cn.add_argument("target", nargs="?", default=None)

@@ -23,8 +23,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from . import (__version__, agent, audit as audit_mod, config, confirm,
-               consolidate, context as context_mod, dispatch,
+from . import (__version__, agent, ambient as ambient_mod, audit as audit_mod,
+               config, confirm, consolidate, context as context_mod, dispatch,
                log as luna_log, persona, presence as presence_mod, protocol,
                safety, session as sessions, settings as settings_mod, speech)
 from .memory import (Memory, MemoryCapExceeded, MemoryError as LunaMemoryError,
@@ -166,6 +166,18 @@ class Daemon:
         self.consolidator = consolidate.Consolidator(
             self.memory, adapter=lambda: self.adapter, audit=self.audit,
             settings=self.settings, on_spend=self._spend)
+        # Ambient awareness. Built last and deliberately given almost nothing:
+        # a Notifier, the audit log and the settings, and no reference to
+        # `self` at all. That is the "ambient never speaks" rule as wiring
+        # rather than as a comment -- there is no path from a watcher to
+        # `self.speech`, because the object that runs the watchers has never
+        # been shown the daemon. `Ambient.__init__` additionally refuses any
+        # collaborator with a `.say()`, so a later edit that passes one in
+        # fails at construction instead of talking six weeks later.
+        self.ambient = ambient_mod.Ambient(
+            notifier=ambient_mod.Notifier(), audit=self.audit,
+            settings=self.settings)
+        self.ambient.start()
         self.settings.on_change(self._settings_changed)
         self.settings.start_watching()
         log.info(
@@ -304,6 +316,7 @@ class Daemon:
                       "specialist": settings_mod.specialist_name(),
                       "secrets": settings_mod.secrets_status()},
             confirm=self.confirm.snapshot(),
+            ambient=self.ambient.snapshot(),
             dispatch=self.dispatcher.snapshot(),
             audit=self.audit.stats(),
             spawned={"tracked": len(safety.ledger()),
@@ -1019,6 +1032,48 @@ class Daemon:
         raise protocol.ProtocolError(
             f"unknown confirm action {what!r}; expected list, yes, no or ask")
 
+    def op_ambient(self, req: dict[str, Any]) -> dict[str, Any]:
+        """What the three hooks are watching, and what they have seen."""
+        return protocol.ok(req.get("id"), ambient=self.ambient.snapshot())
+
+    def op_ambient_diagnose(self, req: dict[str, Any]) -> dict[str, Any]:
+        """The crash toast's one click: hand the diagnosis to a real agent.
+
+        This is the one place an ambient event turns into work, and it is on
+        the *request* path — the user clicked, so this is a job they started,
+        which is exactly the distinction the ambient rule turns on. It still
+        does not speak: the dispatched job reports through `luna jobs` and the
+        ordinary `[ui] notify_on_finish` toast.
+
+        Nothing here trusts the toast. The pid arrives as a number from a
+        command line the daemon wrote itself, but it is re-validated anyway,
+        and it is never signalled or looked up in `/proc` — by the time anyone
+        clicks, the process is long dead and the pid may belong to somebody
+        else. It is a key into `coredumpctl`, nothing more.
+        """
+        raw = req.get("pid")
+        try:
+            pid = int(raw)
+        except (TypeError, ValueError):
+            raise protocol.ProtocolError(
+                "ambient.diagnose requires a numeric 'pid'") from None
+        if pid <= 0:
+            raise protocol.ProtocolError(f"{pid} is not a pid")
+        exe = str(req.get("exe") or "").strip()[:64]
+        when = str(req.get("when") or "").strip()[:64]
+        task = ambient_mod.diagnosis_task(pid, exe=exe, when=when)
+        job = self.dispatcher.dispatch(
+            task, "worker",
+            timeout=float(req.get("timeout")
+                          or config.AMBIENT_DIAGNOSE_TIMEOUT_S))
+        self.audit.append("ambient.diagnose", ok=True,
+                          why=f"the user asked why {exe or 'a process'} "
+                              f"(pid {pid}) crashed",
+                          pid=pid, comm=exe or None, job_id=job.id)
+        payload = job.to_dict()
+        payload["announce"] = self.dispatcher.announce(job)
+        return protocol.ok(req.get("id"), **payload)
+
     def op_shutdown(self, req: dict[str, Any]) -> dict[str, Any]:
         # Present so a supervisor or the CLI can stop the daemon cleanly; the
         # actual stop is scheduled after the response is flushed.
@@ -1048,6 +1103,8 @@ class Daemon:
             "peek": self.op_peek,
             "audit": self.op_audit,
             "spawned": self.op_spawned,
+            "ambient": self.op_ambient,
+            "ambient.diagnose": self.op_ambient_diagnose,
             "settings.get": self.op_settings_get,
             "settings.set": self.op_settings_set,
             "confirm": self.op_confirm,
@@ -1118,6 +1175,11 @@ class Daemon:
         # First, so the bar stops claiming she is here while the rest of the
         # shutdown (cancelling runs, draining speech) takes its time.
         self.presence.clear()
+        # Early, next to presence and for the same reason: the two files the
+        # desktop reads should stop claiming things before the slow half of the
+        # shutdown starts. `close()` also retracts an ambient caption from the
+        # HUD, but only one ambient put there.
+        self.ambient.close()
         self.settings.stop_watching()
         # Before the memory it writes into is closed, and bounded so a wedged
         # agent cannot hold the daemon's shutdown open.
