@@ -25,14 +25,25 @@ ROUTER = Path(__file__).resolve().parent.parent / "bin" / "luna-voice-router"
 
 def run_router(payload: bytes, runtime_dir: Path | None = None,
                timeout: float = 30.0) -> subprocess.CompletedProcess:
-    env = dict(os.environ)
-    if runtime_dir is not None:
-        # Points config.SOCKET_PATH somewhere with no daemon listening.
-        env["XDG_RUNTIME_DIR"] = str(runtime_dir)
-    return subprocess.run(
-        [sys.executable, str(ROUTER)], input=payload, env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
-        check=False)
+    # `XDG_DATA_HOME` and `XDG_CONFIG_HOME` are redirected even though these
+    # cases only care about the socket. The router keeps a breadcrumb log at
+    # `config.ROUTER_LOG`, which is under the data dir, and it writes one on
+    # every path including the failures this file exists to exercise. Left
+    # inheriting the real environment, a suite run appended ten lines of test
+    # noise to the user's own `~/.local/share/luna/voice-router.log` -- the
+    # exact class of leak `_support.py`'s outward guard exists to stop, just
+    # one the guard cannot see because it happens in a subprocess.
+    with tempfile.TemporaryDirectory(prefix="luna-router-") as tmp:
+        env = dict(os.environ)
+        env["XDG_DATA_HOME"] = str(Path(tmp) / "data")
+        env["XDG_CONFIG_HOME"] = str(Path(tmp) / "config")
+        if runtime_dir is not None:
+            # Points config.SOCKET_PATH somewhere with no daemon listening.
+            env["XDG_RUNTIME_DIR"] = str(runtime_dir)
+        return subprocess.run(
+            [sys.executable, str(ROUTER)], input=payload, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+            check=False)
 
 
 def run_isolated(payload: bytes, home: Path, config_body: str | None
