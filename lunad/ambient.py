@@ -1018,7 +1018,10 @@ class Ambient:
         if not self.enabled():
             return 0
         delivered = 0
-        dirty = False
+        # Whether any watcher actually looked. The write is gated twice: this
+        # skips the serialisation on a tick where nothing was due, and `_save`
+        # itself skips the write when what it would write has not changed.
+        ran = False
         for watcher in self.watchers:
             if not watcher.enabled():
                 continue
@@ -1035,10 +1038,10 @@ class Ambient:
                                   source=watcher.name,
                                   detail=f"{type(exc).__name__}: {exc}")
                 continue
-            dirty = True
+            ran = True
             for event in events:
                 delivered += 1 if self.deliver(event) else 0
-        if dirty:
+        if ran:
             self._save()
         self.delivered += delivered
         return delivered

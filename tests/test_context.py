@@ -221,6 +221,18 @@ class CaptureCase(TempMemoryCase):
         self.addCleanup(setattr, config, "GRIM_BIN", old)
         return str(path)
 
+    def recorded_argv(self) -> list[str]:
+        """grim's argv as *words*, not as one string.
+
+        Substring-matching the joined line is what made
+        `test_a_screen_look_asks_for_no_geometry` flaky: the only argument on
+        a screen capture is a path under a random `luna-look-XXXXXXXX`
+        temporary directory, and `mkdtemp` produced `luna-look-gsgctx43` --
+        which contains `-g` and failed a test about a flag that was never
+        passed. Splitting first asks the question the test means.
+        """
+        return self.argv_log.read_text().split()
+
     def test_a_window_look_asks_for_the_window_geometry(self) -> None:
         self.fake_grim()
         with answering(LIVE):
@@ -232,7 +244,7 @@ class CaptureCase(TempMemoryCase):
         self.fake_grim()
         with context.look("screen") as shot:
             self.assertTrue(shot.is_file())
-        self.assertNotIn("-g", self.argv_log.read_text())
+        self.assertNotIn("-g", self.recorded_argv())
 
     def test_a_window_with_no_geometry_falls_back_to_the_whole_screen(self) -> None:
         # A picture of everything answers the question; no picture does not.
@@ -240,7 +252,7 @@ class CaptureCase(TempMemoryCase):
         with answering({"class": "app", "title": "t"}):
             with context.look("window") as shot:
                 self.assertTrue(shot.is_file())
-        self.assertNotIn("-g", self.argv_log.read_text())
+        self.assertNotIn("-g", self.recorded_argv())
 
     def test_the_file_is_deleted_when_the_block_ends(self) -> None:
         self.fake_grim()
