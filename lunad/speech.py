@@ -472,6 +472,7 @@ class Speech:
         aplay: str | None = None,
         settings: Any = None,
         synth: Any = None,
+        on_activity: Any = None,
     ) -> None:
         # Kept as *overrides*, not as resolved values: with neither given,
         # `model` and `voice_config` are derived from `[voice] piper_voice`
@@ -488,6 +489,11 @@ class Speech:
         # can take without a network, and so that a test can never spend money.
         self._settings = settings
         self.synth = synth if synth is not None else synthesise
+        # Called with no arguments whenever an utterance starts, ends or is
+        # cancelled. The daemon uses it to publish `speaking` to the desktop.
+        # Best-effort by contract: a raising callback must never break speech,
+        # and a slow one would stall playback, so it must return promptly.
+        self._on_activity = on_activity
 
         self._proc: subprocess.Popen | None = None
         self._stdout: Any = None
@@ -615,6 +621,7 @@ class Speech:
             self._job = job
         threading.Thread(target=self._run_job, args=(job,), daemon=True,
                          name=f"luna-speak-{job.id}").start()
+        self._notify()
         if wait:
             job.done.wait(timeout)
             if job.error:
@@ -635,6 +642,28 @@ class Speech:
             payload["total_ms"] = int((time.monotonic() - job.started) * 1000)
         return payload
 
+    @property
+    def speaking(self) -> bool:
+        """Is an utterance in flight right now?
+
+        `status()` answers this too, but it also re-reads the voice settings
+        and builds a dict; this is the cheap read for a caller that only wants
+        the boolean, on a path that runs on every state change.
+        """
+        with self._lock:
+            job = self._job
+        return job is not None and not job.done.is_set()
+
+    def _notify(self) -> None:
+        """Tell the owner that speech activity changed. Never raises."""
+        cb = self._on_activity
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception:  # noqa: BLE001 - a watcher must not break speech
+            log.exception("speech activity callback failed")
+
     def cancel(self) -> bool:
         """Stop speaking now. Safe to call when nothing is speaking."""
         with self._lock:
@@ -652,6 +681,7 @@ class Speech:
             self._kill(player)
         if speaking:
             self.counters["cancelled"] += 1
+        self._notify()
         return speaking
 
     def status(self) -> dict[str, Any]:
@@ -709,6 +739,10 @@ class Speech:
                         self._player = None
                 self._last_used = time.monotonic()
                 job.done.set()
+        # Outside the playback lock and after `done` is set, so a callback that
+        # reads `speaking` sees the finished state and cannot deadlock against
+        # the next utterance waiting on the same lock.
+        self._notify()
 
     def _play(self, job: _Job) -> None:
         """Route the utterance to a provider, and catch it if it falls.

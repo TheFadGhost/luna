@@ -77,15 +77,39 @@ Requests, as built: `ping`, `ask`, `say`, `speak.cancel`, `session.reset`,
 `audit`, `spawned`, `cancel`, `shutdown`. `memory.read`/`memory.write` take an
 optional `namespace` (`luna` or `sol`); `memory.profile` is Luna's only —
 Sol's namespace is a working set for one job, not a model of a person.
-`subscribe`
-(for the bar widget's live state) is Phase 3. `listen_start` was dropped: the
-keybind talks to voxtype directly, so the daemon never needs to start a
-recording.
+`subscribe` (for the bar widget's live state) was dropped in favour of a state
+file — see below. `listen_start` was dropped too: the keybind talks to voxtype
+directly, so the daemon never needs to start a recording.
 
 `ask` takes `detach: true`, which acknowledges immediately and answers on a
 background thread. That exists for the voice router, which runs inside
 voxtype's `post_process_timeout_ms` and cannot wait for a reply it is not
 going to print.
+
+### Presence — `subscribe` was dropped, and why
+
+`subscribe` is **not** being built. The bar widget reads a file instead:
+`$XDG_RUNTIME_DIR/luna/state`, one bare ASCII word — `idle`, `thinking` or
+`speaking` — written atomically on every transition, and absent when lunad is
+not running.
+
+The reason is the one constraint the reply path has: **nothing a surface does
+may be able to slow an answer down.** A subscriber is a socket the daemon has
+to write to, and a socket has a buffer a stalled reader can fill; the moment
+`speaking` is published down a pipe nobody is draining, the blocked thread is
+the thread that was about to speak. A file has no reader-side backpressure at
+all. It also costs the widget nothing: Quickshell's `FileView` is inotify
+under the hood, so the bar polls nothing, and voxtype already publishes its
+own state the same way, so the desktop has one idiom rather than two.
+
+`listening` is deliberately not in that list. Luna does not own the
+microphone — voxtype does, and the daemon does not hear about a voice turn
+until the transcript arrives, which is after the listening is over. The widget
+reads voxtype's `$XDG_RUNTIME_DIR/voxtype/state` for that and composes the two.
+
+`lunad/presence.py` holds the writer and the contract. It cannot raise: it is
+called from the middle of answering a question, and a full disk is not a
+reason to fail an answer that was otherwise fine.
 
 ## 4. Memory — adapted from Hermes Agent (Nous Research, MIT)
 

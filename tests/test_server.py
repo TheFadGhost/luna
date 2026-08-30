@@ -14,7 +14,7 @@ import unittest
 import uuid
 from typing import Any
 
-from lunad import agent, dispatch, protocol
+from lunad import agent, config, dispatch, protocol
 from lunad.server import Daemon, LunaServer
 
 from ._support import FakeHyprland, TempMemoryCase
@@ -55,6 +55,11 @@ class MuteSpeech:
     def __init__(self) -> None:
         self.said: list[str] = []
         self.cancels = 0
+
+    # Part of the real interface: `Daemon._publish_state` reads it on every
+    # transition, and this double is never mid-utterance because nothing here
+    # takes any time to say.
+    speaking = False
 
     def say(self, text: str, wait: bool = False, timeout: float = 0.0):
         self.said.append(text)
@@ -115,6 +120,64 @@ class DaemonCase(TempMemoryCase):
                         dispatcher=dispatcher, **kw)
         self.addCleanup(daemon.close)
         return daemon
+
+
+class PresenceTests(DaemonCase):
+    """The daemon publishes what the bar reads.
+
+    `presence.py` owns the file format; this covers the wiring — that the
+    daemon publishes at all, that speech transitions reach it without anyone
+    calling anything by hand, and that shutting down leaves absence behind
+    rather than a stale word.
+    """
+
+    def daemon(self) -> Daemon:
+        d = self.build_daemon()
+        d.adapter = FakeAdapter()
+        return d
+
+    def test_a_live_daemon_publishes_idle(self):
+        d = self.daemon()
+        self.assertEqual(config.STATE_FILE.read_text(), "idle")
+        self.assertEqual(d.presence.path, config.STATE_FILE)
+
+    def test_speaking_is_published_by_speech_itself(self):
+        # Nothing in the test calls _publish_state: the point is that the
+        # Speech object reports its own transitions, so a reply that speaks
+        # cannot forget to say so.
+        d = self.daemon()
+        self.assertEqual(config.STATE_FILE.read_text(), "idle")
+        d.speech._job = _StuckJob()
+        d.speech._notify()
+        self.assertEqual(config.STATE_FILE.read_text(), "speaking")
+        d.speech._job.done.set()
+        d.speech._notify()
+        self.assertEqual(config.STATE_FILE.read_text(), "idle")
+
+    def test_thinking_wins_over_idle_while_a_run_is_open(self):
+        d = self.daemon()
+        run = d.runs.new("what time is it", "cli")
+        d._publish_state()
+        self.assertEqual(config.STATE_FILE.read_text(), "thinking")
+        d.runs.done(run)
+        d._publish_state()
+        self.assertEqual(config.STATE_FILE.read_text(), "idle")
+
+    def test_shutdown_removes_the_file(self):
+        d = self.daemon()
+        d.speech.close()
+        d.speech = MuteSpeech()
+        d.close()
+        # Absence is the "not running" signal the widget depends on. A stale
+        # word here would leave the bar claiming she is up forever.
+        self.assertFalse(config.STATE_FILE.exists())
+
+
+class _StuckJob:
+    """An utterance that has started and not finished."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
 
 
 class DispatchTests(DaemonCase):

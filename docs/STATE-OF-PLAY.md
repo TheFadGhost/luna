@@ -150,7 +150,8 @@ saves. It is kept for conversational continuity, not for money.
   `voxtype-osd` on the overlay layer, visible only while not idle.
 
 ## Next (Phase 3)
-1. Bar widget + `subscribe` for live state.
+1. ~~Bar widget + `subscribe` for live state.~~ Built — see below. `subscribe`
+   was dropped rather than built.
 2. Ambient hooks: crash, battery, `omarchy update`.
 3. Semantic recall. Tier 2 is FTS5 keyword only. If it lands, use a small ONNX
    model under `onnxruntime` alone — not sentence-transformers, and not
@@ -169,6 +170,38 @@ saves. It is kept for conversational continuity, not for money.
 
 Tier 3 and the consolidation pass were both on this list. They are done — see
 Phase 2d below.
+
+### Phase 3 — presence, and the bar widget (2026-08-30)
+
+- **`lunad/presence.py`.** The daemon publishes one bare ASCII word to
+  `$XDG_RUNTIME_DIR/luna/state` — `idle`, `thinking`, `speaking` — atomically,
+  on every transition, and removes the file when it stops. Absence means she
+  is not running.
+- **`subscribe` is dropped, not deferred.** A subscriber is a socket with a
+  buffer a stalled reader can fill, and the thread that would block on it is
+  the thread that was about to speak. A file has no reader-side backpressure,
+  costs the widget nothing (Quickshell's `FileView` is inotify), and is
+  already how voxtype publishes its own state on this machine. Recorded in
+  ARCHITECTURE.md §3.
+- **`Speech` reports its own transitions** through a new optional
+  `on_activity` callback, fired when an utterance starts, ends or is
+  cancelled. The daemon derives the published word from
+  `speech.speaking` and `len(self.runs)` rather than assigning it, so no
+  caller has to get the ordering right.
+- **`listening` is not lunad's to publish.** voxtype owns the microphone and
+  the daemon does not hear about a voice turn until the transcript arrives.
+  The bar module composes lunad's file with voxtype's own.
+- **Two bugs found and fixed on the way, both only visible against a real
+  process:**
+  - `Daemon.close()` cleared the state file and then cancelled speech, which
+    fired the activity callback, which republished `idle` — so every clean
+    stop left the bar showing a daemon that had exited. `Presence.clear()` is
+    now final.
+  - `serve()` constructed `LunaServer` outside the `try`, so a daemon that
+    came up and then failed to bind its socket was never closed. It now is.
+- The widget itself lives on the machine, not in this repository:
+  `~/.config/omarchy/bar/modules/luna.qml`, documented in
+  `~/.config/omarchy/CUSTOMISATIONS.md` §8a.12.
 
 ### Phase 2b — the codex adapter (2026-08-26)
 
