@@ -258,7 +258,7 @@ class JarvisApp(Gtk.Application):
         if key == "voice":
             return panes.voice_pane(b, self.player, self.set_status)
         if key == "listen":
-            return panes.listen_pane(b)
+            return panes.listen_pane(b, self.set_status)
         if key == "confirm":
             return panes.confirm_pane(b)
         if key == "memory":

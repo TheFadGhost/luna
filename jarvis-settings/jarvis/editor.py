@@ -14,9 +14,15 @@ What happens next:
      never the system of record.
   4. **Persist.** The file is always written. lunad hot-reloads it either way,
      so the file is the contract and the socket is the fast path.
+  5. **Write through, for `[listen]`.** Three of those keys are not lunad's at
+     all — they are voxtype's, in another process with another config file —
+     so the save is projected on to that file and voxtype is restarted. It is
+     the only step here that can fail after the config is safely on disk, and
+     the status line says so when it does rather than reporting a save that
+     changed nothing audible.
 
-The flush runs on a worker thread (a socket call may block for seconds) and
-comes back to GTK with GLib.idle_add.
+The flush runs on a worker thread (a socket call may block for seconds, and
+restarting voxtype longer still) and comes back to GTK with GLib.idle_add.
 """
 
 from __future__ import annotations
@@ -29,7 +35,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gio, GLib  # noqa: E402
 
-from . import client, config
+from . import client, config, voxtype
 from .tomledit import TomlEditError
 
 DEBOUNCE_MS = 350
@@ -101,10 +107,25 @@ class Editor:
             err = None
         except (config.ValidationError, TomlEditError, OSError) as exc:
             written, err = [], exc
+        through = None if err is not None else self._write_through(batch)
         self._last_self_write = time.time()
-        GLib.idle_add(self._done, batch, live, written, err)
+        GLib.idle_add(self._done, batch, live, written, err, through)
 
-    def _done(self, batch, live, written, err):
+    def _write_through(self, batch):
+        """Push `[listen]` on to voxtype's own file, if this save touched it.
+
+        Driven off the whole value set rather than off `batch`: `model` cannot
+        be projected without `provider`, and a save that changes only one of
+        them still has to land the pair correctly.
+        """
+        if not set(batch) & set(voxtype.WRITE_THROUGH_KEYS):
+            return None
+        try:
+            return voxtype.apply(self.values)
+        except voxtype.VoxtypeError as exc:
+            return voxtype.Applied(ok=False, detail=str(exc))
+
+    def _done(self, batch, live, written, err, through=None):
         if err is not None:
             self.on_status(f"NOT saved — {err}", "error")
             # The in-memory value is now a lie; put the file's truth back.
@@ -114,7 +135,10 @@ class Editor:
         names = ", ".join(k.rpartition(".")[2] for k in written)
         route = ("applied live via the socket and written to config.toml"
                  if live else "written to config.toml (daemon reloads it)")
-        self.on_status(f"Saved {names} — {route}", "ok")
+        text = f"Saved {names} — {route}"
+        if through is not None:
+            text += f" · voxtype: {through.detail}"
+        self.on_status(text, "ok" if through is None or through.ok else "error")
         self.on_applied(sorted(batch))
         return False
 

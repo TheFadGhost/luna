@@ -35,6 +35,96 @@ def run_router(payload: bytes, runtime_dir: Path | None = None,
         check=False)
 
 
+def run_isolated(payload: bytes, home: Path, config_body: str | None
+                 ) -> tuple[subprocess.CompletedProcess, str]:
+    """Run the router against a config, a log and a socket dir of our own.
+
+    All three XDG variables are redirected, not just the runtime one: the
+    router reads ``[listen] enabled`` out of ``$XDG_CONFIG_HOME/jarvis`` and
+    writes its breadcrumb under ``$XDG_DATA_HOME``, and a test that read the
+    user's own config would pass or fail depending on whether they happened to
+    have listening switched on.
+    """
+    conf, data, runtime = home / "config", home / "data", home / "runtime"
+    (conf / "jarvis").mkdir(parents=True, exist_ok=True)
+    runtime.mkdir(parents=True, exist_ok=True)
+    if config_body is not None:
+        (conf / "jarvis" / "config.toml").write_text(config_body,
+                                                     encoding="utf-8")
+    env = dict(os.environ)
+    env["XDG_CONFIG_HOME"] = str(conf)
+    env["XDG_DATA_HOME"] = str(data)
+    env["XDG_RUNTIME_DIR"] = str(runtime)
+    proc = subprocess.run(
+        [sys.executable, str(ROUTER)], input=payload, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+        check=False)
+    log = data / "luna" / "voice-router.log"
+    try:
+        return proc, log.read_text(encoding="utf-8")
+    except OSError:
+        return proc, ""
+
+
+class ListeningSwitchTests(unittest.TestCase):
+    """``[listen] enabled`` — the one key in that block that is not voxtype's.
+
+    voxtype owns the microphone and knows nothing about Luna, so "listening
+    off" cannot mean "do not record": the keybind still records. It means the
+    transcript is not handed to her, and voxtype's own ``fallback_on_empty``
+    then delivers it through the profile's ``output_mode = "clipboard"``. The
+    router is the only place that boundary exists, so it is the only place the
+    key could be honoured.
+
+    The evidence is the breadcrumb log, because the observable difference is
+    that a socket connection is *not* attempted, and "did not happen" has no
+    other trace.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="luna-listen-")
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name)
+
+    def test_off_means_the_transcript_is_not_sent(self):
+        proc, log = run_isolated(b"what is the battery at\n", self.home,
+                                 "[listen]\nenabled = false\n")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, b"")
+        self.assertIn("listening is off", log)
+
+    def test_on_means_it_is(self):
+        proc, log = run_isolated(b"what is the battery at\n", self.home,
+                                 "[listen]\nenabled = true\n")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, b"")
+        self.assertNotIn("listening is off", log)
+
+    def test_a_config_that_does_not_parse_fails_open(self):
+        # Every other failure path here ends with the transcript on the
+        # clipboard, which is recoverable. This one decides whether she is
+        # spoken to at all, and an unreadable file is not a reason to stop
+        # answering.
+        proc, log = run_isolated(b"hello", self.home, "[listen\nenabled = ")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, b"")
+        self.assertNotIn("listening is off", log)
+
+    def test_no_config_file_at_all_fails_open(self):
+        proc, log = run_isolated(b"hello", self.home, None)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, b"")
+        self.assertNotIn("listening is off", log)
+
+    def test_switching_it_off_still_says_nothing_on_stderr(self):
+        # voxtype captures our stderr into its own journal. Reading the config
+        # brings lunad's settings logger into the process, and a warning from
+        # it would land there on every single utterance.
+        proc, _log = run_isolated(b"hello", self.home,
+                                  "[listen]\nenabled = false\n")
+        self.assertEqual(proc.stderr, b"")
+
+
 class RouterTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="luna-router-")

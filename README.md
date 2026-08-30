@@ -52,11 +52,14 @@ in `~/.config/jarvis/config.toml` (0600, in a 0700 directory) — see
 `docs/CONFIG-SCHEMA.md` — and `lunad` watches it and hot-reloads, so a change
 to the voice, the model or the confirmation policy takes effect on the next
 request rather than on the next restart. That document's §Wiring table says
-what reads each key and when it lands. Every key `lunad` owns is now honoured;
-the only ones that are not are `[listen]`, and they cannot be — listening
-belongs to voxtype, in another process with its own config file, and those keys
-are a mirror of it. The table says so rather than leaving it to be discovered.
-Secrets never go in that file: the
+what reads each key and when it lands. Every key in the contract is now
+honoured, including `[listen]` — which `lunad` still does not read and never
+will, because listening belongs to voxtype in another process with its own
+config file. The settings app **writes those keys through** to that file and
+restarts voxtype, which reads its config only at start-up; two of the five had
+no voxtype equivalent and were wired where they actually belong instead, or
+left honestly read-only. The table says which is which rather than leaving it
+to be discovered. Secrets never go in that file: the
 OpenRouter key lives in `~/.config/jarvis/secrets.env` and reaches the daemon
 through a systemd drop-in.
 
@@ -121,7 +124,10 @@ one after a voxtype update.
 > **If you edit `~/.config/voxtype/config.toml`, restart voxtype.** The daemon
 > only reads its config at startup. Without a restart it logs
 > `Profile 'luna' not found in config, using default settings` and types your
-> question into whatever window has focus.
+> question into whatever window has focus. Changing the provider, model or
+> language in the Jarvis **Listening** pane does the restart for you — and
+> refuses the save outright if a recording is in flight, because no setting is
+> worth someone's dictation.
 
 ## Memory
 

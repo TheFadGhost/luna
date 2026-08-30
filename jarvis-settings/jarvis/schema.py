@@ -143,11 +143,22 @@ SPEC: tuple[Section, ...] = (
     ),
     Section(
         key="listen", title="Listening", pane="listen",
+        doc="Three of these are voxtype's, written through to its own config "
+            "file. Two are not, and say whose they are instead.",
         fields=(
-            Toggle("enabled", "Listen for speech", default=True),
-            Choice("provider", "Provider", default="openrouter",
-                   options=("openrouter", "local")),
-            Text("model", "STT model", default="fish-audio/transcribe-1",
+            Toggle("enabled", "Send what you say to her",
+                   "The keybind records either way — voxtype owns the "
+                   "microphone. Off, the transcript goes to the clipboard "
+                   "instead of to her. Takes effect at once.",
+                   default=True),
+            Choice("provider", "Provider",
+                   "Written through as voxtype's [whisper] mode, and voxtype "
+                   "is restarted so it reads it.",
+                   default="openrouter", options=("openrouter", "local")),
+            Text("model", "STT model",
+                 "An OpenRouter model id for the remote provider; a whisper "
+                 "model name such as base.en for the local one.",
+                 default="fish-audio/transcribe-1",
                  placeholder="fish-audio/transcribe-1"),
             Text("language", "Language", "ISO code passed to the transcriber.",
                  default="en", placeholder="en", allow_empty=False),
