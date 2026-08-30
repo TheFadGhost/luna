@@ -431,7 +431,8 @@ def synthesise(text: str, *, model: str, voice: str, api_key: str,
 class _Job:
     __slots__ = ("id", "sentences", "text", "cancelled", "done", "started",
                  "error", "played_bytes", "first_audio", "provider",
-                 "fell_back", "voice", "sample_rate", "cfg", "speed")
+                 "fell_back", "voice", "sample_rate", "cfg", "speed",
+                 "abandon_remote")
 
     def __init__(self, sentences: list[str], text: str,
                  cfg: dict[str, Any] | None = None) -> None:
@@ -453,6 +454,15 @@ class _Job:
         # Reported rather than swallowed: silent degradation is how a broken
         # voice goes unnoticed for a week.
         self.fell_back: str = ""
+        # Set when `_play_remote` gives up on OpenRouter mid-utterance and
+        # falls back to piper. Deliberately separate from `cancelled`: that
+        # flag means "the user barged in, stop everything" and `_play_piper`
+        # checks it to bail out immediately — which would silently swallow
+        # the very fallback this is meant to let happen. This one only tells
+        # `produce()` (the background OpenRouter requester) to stop asking for
+        # sentences piper is about to speak instead, so the user is not billed
+        # for audio nobody will ever hear.
+        self.abandon_remote = False
 
 
 class Speech:
@@ -497,6 +507,11 @@ class Speech:
 
         self._proc: subprocess.Popen | None = None
         self._stdout: Any = None
+        # A piper worker mid cold-load: spawned but not yet READY. Tracked
+        # separately from `_proc`, which only ever holds a *usable* worker,
+        # so that `cancel()` has something to kill without waiting for the
+        # load to finish — see `_ensure_worker`.
+        self._loading_proc: subprocess.Popen | None = None
         self._sample_rate: int | None = None
         # Which piper voice the running worker actually holds. A worker is one
         # loaded ONNX model and cannot be re-pointed, so a change to
@@ -665,20 +680,33 @@ class Speech:
             log.exception("speech activity callback failed")
 
     def cancel(self) -> bool:
-        """Stop speaking now. Safe to call when nothing is speaking."""
+        """Stop speaking now. Safe to call when nothing is speaking.
+
+        Barge-in is the most latency-sensitive kill in the daemon, so this
+        must never wait behind a piper cold-load: ``self._lock`` is only ever
+        held here for the instant it takes to read the four fields below, not
+        for the duration of anything slow. If a load is in flight
+        (``_loading_proc``), it is killed too — a barge-in that arrives before
+        piper ever reported READY has no cooperative "stop" to ask for, so
+        aborting the load outright is the only way to actually stop promptly.
+        """
         with self._lock:
             job, player, proc = self._job, self._player, self._proc
+            loading = self._loading_proc
             # "Was anything actually speaking" is decided before we interrupt,
             # so the counter measures barge-ins and not the no-op cancel that
             # every say() issues on its way in.
             speaking = (job is not None and not job.done.is_set()) or (
-                player is not None and player.poll() is None)
+                player is not None and player.poll() is None) or (
+                loading is not None and loading.poll() is None)
             if job is not None:
                 job.cancelled = True
         if proc is not None and proc.poll() is None:
             self._send(proc, {"op": "cancel"})
         if player is not None and player.poll() is None:
             self._kill(player)
+        if loading is not None and loading.poll() is None:
+            self._kill(loading)
         if speaking:
             self.counters["cancelled"] += 1
         self._notify()
@@ -790,9 +818,10 @@ class Speech:
             for index, sentence in enumerate(job.sentences):
                 with ready:
                     # Stay at most one sentence ahead of playback.
-                    while not job.cancelled and index - playing[0] > 1:
+                    while (not job.cancelled and not job.abandon_remote
+                          and index - playing[0] > 1):
                         ready.wait(0.05)
-                if job.cancelled:
+                if job.cancelled or job.abandon_remote:
                     break
                 try:
                     outcome: Any = self.synth(
@@ -831,7 +860,23 @@ class Speech:
                     return []
                 if isinstance(outcome, RemoteSpeechFailed) or outcome is None:
                     job.fell_back = str(outcome or "no audio")
-                    return job.sentences[index:]
+                    remaining = job.sentences[index:]
+                    # piper is about to speak `remaining` instead. Without
+                    # this, `produce()` keeps requesting — and OpenRouter TTS
+                    # is the one service in this project that costs money —
+                    # audio for sentences nobody will ever hear. The one
+                    # request already in flight, if any, cannot be
+                    # interrupted mid-call; everything after it now will
+                    # never be requested at all.
+                    if not job.abandon_remote:
+                        job.abandon_remote = True
+                        log.warning(
+                            "stopping the OpenRouter producer after a "
+                            "fallback to piper; %d sentence(s) will not be "
+                            "requested", len(remaining),
+                            extra={"job": job.id, "index": index,
+                                  "reason": job.fell_back[:200]})
+                    return remaining
                 wav: Wav = outcome
                 if player is not None and current is not None and not wav.matches(current):
                     # A format change cannot be spliced into a running aplay.
@@ -862,7 +907,16 @@ class Speech:
     # -- piper -----------------------------------------------------------
 
     def _play_piper(self, job: _Job, sentences: list[str]) -> None:
-        proc, stdout = self._ensure_worker()
+        try:
+            proc, stdout = self._ensure_worker()
+        except SpeechUnavailable:
+            # A barge-in that arrived mid cold-load has no cooperative "stop"
+            # to send yet (no READY worker exists), so `cancel()` aborts the
+            # load outright and this call fails as a side effect. That is a
+            # cancel, not a TTS error, and must not be reported as one.
+            if job.cancelled:
+                return
+            raise
         rate = self._sample_rate or read_sample_rate(self.voice_config)
         job.sample_rate = job.sample_rate or rate
 
@@ -956,6 +1010,25 @@ class Speech:
     # -- worker lifecycle ------------------------------------------------
 
     def _ensure_worker(self) -> tuple[subprocess.Popen, Any]:
+        """Return a ready-to-use piper worker, spawning and loading one if
+        needed.
+
+        The cold load — the spawn, and then ``_read_header_timeout``'s wait of
+        up to ``config.SPEECH_START_TIMEOUT_S`` (60s) for READY — used to run
+        entirely inside ``self._lock``, which ``cancel()`` and ``status()``
+        also take. A barge-in arriving mid-load would then block for the rest
+        of the load: exactly backwards for the most latency-sensitive kill in
+        the daemon. So the lock here only ever guards a state *check* or a
+        state *transition*, never the slow work in between: the spawn and the
+        wait for READY happen with the lock released, and the in-progress
+        ``Popen`` is parked in ``self._loading_proc`` — checked and killable by
+        ``cancel()`` — for exactly that stretch.
+
+        Playback only ever calls this from the single thread ``_speak_lock``
+        serialises (see ``_run_job``), so there is never a second *load*
+        racing this one; the only concurrent callers are ``cancel()`` and
+        ``status()``, which this is written to never block.
+        """
         wanted = self.piper_voice()
         # Outside the lock: _unload takes it, and a worker holding the wrong
         # model has to go before the branch below can decide it is reusable.
@@ -979,33 +1052,55 @@ class Speech:
             if not ok:
                 raise SpeechUnavailable(f"cannot start piper — {detail}")
 
-            argv = [str(self.python), str(config.PIPER_WORKER),
-                    str(self.model), str(self.voice_config)]
-            started = time.monotonic()
-            try:
-                # Registered in the signal ledger by the same call that forks
-                # it, so the idle unload and the barge-in have a pid they can
-                # prove is theirs. Not durable: piper dies with the daemon.
-                proc = safety.spawn(
-                    argv, kind="tts-worker", durable=False, note="piper worker",
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE, cwd=str(config.PROJECT_DIR))
-            except OSError as exc:
-                raise SpeechUnavailable(f"could not start piper: {exc}") from exc
+        # -- the slow part: spawn and wait for READY, lock released ------
+        argv = [str(self.python), str(config.PIPER_WORKER),
+                str(self.model), str(self.voice_config)]
+        started = time.monotonic()
+        try:
+            # Registered in the signal ledger by the same call that forks
+            # it, so the idle unload and the barge-in have a pid they can
+            # prove is theirs. Not durable: piper dies with the daemon.
+            proc = safety.spawn(
+                argv, kind="tts-worker", durable=False, note="piper worker",
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, cwd=str(config.PROJECT_DIR))
+        except OSError as exc:
+            raise SpeechUnavailable(f"could not start piper: {exc}") from exc
 
-            threading.Thread(target=_drain_stderr, args=(proc,), daemon=True,
-                             name="luna-piper-stderr").start()
-            ready = _read_header_timeout(proc.stdout,
-                                         config.SPEECH_START_TIMEOUT_S)
-            if ready is None or not ready.startswith("READY"):
+        with self._lock:
+            if self._closed:
+                # close() ran while the spawn above was in flight. Nobody is
+                # going to use this worker; do not let it outlive the daemon
+                # thinking it did.
                 self._kill(proc)
-                raise SpeechUnavailable(
-                    "the piper worker did not report READY "
-                    f"(got {ready!r}); check `luna log`")
-            try:
-                meta = json.loads(ready[len("READY "):] or "{}")
-            except json.JSONDecodeError:
-                meta = {}
+                raise SpeechUnavailable("speech worker is shut down")
+            self._loading_proc = proc
+
+        threading.Thread(target=_drain_stderr, args=(proc,), daemon=True,
+                         name="luna-piper-stderr").start()
+        ready = _read_header_timeout(proc.stdout, config.SPEECH_START_TIMEOUT_S)
+
+        with self._lock:
+            self._loading_proc = None
+
+        if ready is None or not ready.startswith("READY"):
+            self._kill(proc)
+            # A barge-in that killed this proc mid-load looks the same here
+            # as piper actually failing to start: the pipe just closed early
+            # either way. `_play_piper` tells the two apart by `job.cancelled`
+            # and does not report a cancelled load as an error.
+            raise SpeechUnavailable(
+                "the piper worker did not report READY "
+                f"(got {ready!r}); check `luna log`")
+        try:
+            meta = json.loads(ready[len("READY "):] or "{}")
+        except json.JSONDecodeError:
+            meta = {}
+
+        with self._lock:
+            if self._closed:
+                self._kill(proc)
+                raise SpeechUnavailable("speech worker is shut down")
             self._sample_rate = (meta.get("sample_rate")
                                  or read_sample_rate(self.voice_config))
             self._load_ms = int((time.monotonic() - started) * 1000)

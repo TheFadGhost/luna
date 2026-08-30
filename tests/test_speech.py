@@ -10,10 +10,15 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
-from lunad import config, speech
+from lunad import config, safety, speech
+
+from ._support import TempMemoryCase
 
 PH = config.SPEECH_PLACEHOLDER
 
@@ -224,6 +229,118 @@ class WorkerGuardTests(unittest.TestCase):
         self.assertFalse(st["loaded"])
         self.assertFalse(st["speaking"])
         self.assertEqual(st["counters"]["said"], 0)
+
+
+class BargeInDuringLoadTests(TempMemoryCase):
+    """Barge-in must not wait behind piper's cold load.
+
+    ``_ensure_worker`` used to hold ``self._lock`` for the whole cold load —
+    spawn plus up to ``SPEECH_START_TIMEOUT_S`` waiting for READY — and
+    ``cancel()``/``status()`` took the same lock. A real piper worker is not
+    used here (that is the hand-verified part, per the module docstring): a
+    genuine, harmless, long-lived process (``sleep 30``) stands in for it, so
+    the ledger/firewall behave normally, while its stdout never produces a
+    READY line — simulating a worker that is still loading.
+    """
+
+    def _speech(self) -> speech.Speech:
+        obj = speech.Speech(settings=self.settings, idle_unload_s=3600)
+        self.addCleanup(obj.close)
+        # Bypass the file-existence gate: the fake spawn below never touches
+        # `self.model`/`self.voice_config`, so their real presence on this
+        # machine must not decide whether the test can run.
+        obj.available = lambda: (True, "faked for this test")
+        return obj
+
+    def _spawn_stub_worker(self):
+        """Patch `speech.safety.spawn` to hand back a real `sleep 30`.
+
+        The daemon's own `argv` (python + PIPER_WORKER + model + config) is
+        discarded; what the caller gets back is a real, ledger-registered
+        process that will never write a READY line on its own — exactly a
+        cold load stuck mid-flight.
+        """
+        real_spawn = safety.spawn
+        spawned: list = []
+
+        def fake_spawn(argv, **kw):
+            proc = real_spawn(["sleep", "30"], **kw)
+            spawned.append(proc)
+            return proc
+
+        patcher = unittest.mock.patch.object(speech.safety, "spawn", fake_spawn)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        def cleanup():
+            for proc in spawned:
+                if proc.poll() is None:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:  # noqa: BLE001 - best-effort test cleanup
+                        pass
+                for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                    if pipe is not None:
+                        pipe.close()
+        self.addCleanup(cleanup)
+        return spawned
+
+    def _start_load(self, obj: speech.Speech):
+        started = threading.Event()
+        finished = threading.Event()
+        outcome: list[BaseException | None] = []
+
+        def load():
+            started.set()
+            try:
+                obj._ensure_worker()
+            except BaseException as exc:  # noqa: BLE001 - captured, not raised
+                outcome.append(exc)
+            else:
+                outcome.append(None)
+            finished.set()
+
+        thread = threading.Thread(target=load, daemon=True)
+        thread.start()
+        self.assertTrue(started.wait(2.0), "the load thread never started")
+        # A brief, generous grace period for the load to actually reach the
+        # point of blocking on READY (spawn a real process, register it,
+        # start reading its stdout) before this thread acts on it.
+        time.sleep(0.2)
+        return finished, outcome
+
+    def test_cancel_does_not_wait_behind_a_cold_load(self):
+        obj = self._speech()
+        self._spawn_stub_worker()
+        finished, outcome = self._start_load(obj)
+
+        before = time.monotonic()
+        speaking = obj.cancel()
+        elapsed = time.monotonic() - before
+
+        self.assertLess(elapsed, 2.0,
+                        "cancel() must not block behind the cold load")
+        self.assertTrue(speaking, "a load in progress counts as speaking")
+        # The cancel above must have actually aborted the load (killed the
+        # in-progress worker), not merely returned before it was done.
+        self.assertTrue(finished.wait(5.0), "the load never noticed the cancel")
+        self.assertIsInstance(outcome[0], speech.SpeechUnavailable)
+
+    def test_status_does_not_wait_behind_a_cold_load(self):
+        obj = self._speech()
+        self._spawn_stub_worker()
+        finished, _outcome = self._start_load(obj)
+        self.addCleanup(finished.wait, 5.0)   # let the load's own kill happen
+        self.addCleanup(obj.cancel)
+
+        before = time.monotonic()
+        st = obj.status()
+        elapsed = time.monotonic() - before
+
+        self.assertLess(elapsed, 2.0,
+                        "status() must not block behind the cold load")
+        self.assertFalse(st["loaded"], "no usable worker exists yet")
 
 
 if __name__ == "__main__":
