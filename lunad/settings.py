@@ -134,10 +134,25 @@ SCHEMA: tuple[Section, ...] = (
             Key("name", "Luna", "str",
                 comment="display name + how she refers to herself"),
             Key("specialist", "Sol", "str", comment="the delegate persona"),
-            Key("agent", "claude", "str", choices=("claude", "codex"),
+            # codex, not claude. Luna's brain is `codex` running
+            # `gpt-5.6-luna`: it has a shell, web access and native vision, and
+            # the ask path now runs with all three switched on. This key is the
+            # one that decides — deliberately here and NOT in
+            # ~/.config/omarchy/defaults/agent, which is the whole desktop's
+            # default agent and is read by things that are not Luna. Changing
+            # that file to change her brain would have been a change to
+            # everyone else's.
+            Key("agent", "codex", "str", choices=("claude", "codex"),
                 comment="claude | codex   (falls back to "
                         "~/.config/omarchy/defaults/agent)"),
-            Key("model", "", "str", comment='"" = agent default'),
+            # Still "", and still meaning "the agent's own default" — which for
+            # codex is `gpt-5.6-luna` (config.CODEX_ASK_MODEL) and for claude is
+            # whatever claude picks. A model slug is not portable between
+            # agents, so pinning one here would be wrong the moment `agent`
+            # changed; the default belongs to the adapter, and this key is the
+            # override for someone who wants a different one.
+            Key("model", "", "str",
+                comment='"" = agent default (codex: gpt-5.6-luna)'),
         ),
     ),
     Section(

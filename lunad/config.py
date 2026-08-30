@@ -17,6 +17,13 @@ PROJECT_DIR = PKG_DIR.parent                       # ~/Work/luna
 DATA_DIR = PROJECT_DIR / "data"                    # shipped, read-only assets
 PERSONA_PATH = DATA_DIR / "persona.md"
 
+# Luna's own CLI, by absolute path. She is told about it in her system prompt
+# and runs it from her own shell, and the shell she gets is lunad's — a systemd
+# --user environment whose PATH need not contain ~/.local/bin. A bare `luna`
+# in the prompt would work from the user's terminal and fail from hers, which
+# is the worst of the two failures because it only shows up at runtime.
+LUNA_CLI = PROJECT_DIR / "bin" / "luna"
+
 
 def _xdg(var: str, default: Path) -> Path:
     raw = os.environ.get(var)
@@ -202,15 +209,49 @@ DEFAULT_MODEL = None                               # None -> agent's own default
 
 # --- Codex adapter --------------------------------------------------------
 #
-# codex has no `--tools ""`, so the sandbox *is* the tool policy. A
-# conversational ask has no business writing to the disk, so it runs read-only;
-# a dispatched job is real work and gets what Omarchy itself gives codex.
+# codex has no `--tools ""`, so the sandbox *is* the tool policy.
 #
 # Values: "read-only", "workspace-write", "danger-full-access", or "bypass"
 # (which means --dangerously-bypass-approvals-and-sandbox, not a sandbox mode).
+#
+# CHANGED: the ask path was "read-only", and with it Luna's system prompt said
+# she had no tools at all. That was true and it was the wrong trade. Asked to
+# check a version she answered that she could not; asked what was on screen she
+# gave advice about starting the daemon. A resident assistant that cannot look
+# at the machine she lives on is a chatbot with a persona file.
+#
+# "bypass" rather than "danger-full-access", for two reasons that are about the
+# mechanism and not about how much access she should have (the answer to that
+# is: all of it — the user chose full autonomy and the audit log is the
+# backstop):
+#
+#   * `codex exec resume` accepts no `-s`. Under a sandbox *mode* the policy has
+#     to be re-stated as `-c sandbox_mode=…` on every resumed turn, and a
+#     mode-vs-flag mismatch between turn one and turn two is exactly the kind of
+#     thing that is discovered in production. `--dangerously-bypass-approvals-
+#     and-sandbox` is accepted identically by `exec` and by `exec resume`.
+#   * It also turns approvals off. `danger-full-access` removes the sandbox but
+#     leaves the approval policy in place, and an approval request in a headless
+#     turn is not a prompt anybody can answer — it is a hung ask.
+#
+# The dispatch path has run this way since Phase 2 and is unchanged.
 
-CODEX_ASK_SANDBOX = "read-only"
+CODEX_ASK_SANDBOX = "bypass"
 CODEX_DISPATCH_SANDBOX = "bypass"
+
+# The two model slugs, both verified present in ~/.codex/models_cache.json.
+#
+# They are constants here rather than settings because they are not a
+# preference: `[assistant] model` exists for someone who wants to override the
+# conversational model, and leaving it "" means "whatever the agent's own
+# default is", which for codex-as-Luna is this. Naming a default per *adapter*
+# rather than per *assistant* is what keeps `[assistant] model = ""` correct
+# when the agent is claude, where a gpt-5.6 slug would be nonsense.
+#
+# Luna thinks; Sol works. Sol is the coding-agent model and it is what every
+# dispatched session — specialist or anonymous worker — is given.
+CODEX_ASK_MODEL = "gpt-5.6-luna"
+CODEX_DISPATCH_MODEL = "gpt-5.6-sol"
 
 # codex's analogue of claude's --safe-mode: do not load the user's own
 # ~/.codex/config.toml or their execpolicy .rules into Luna's turns. Luna must
@@ -253,6 +294,27 @@ LUNA_APP_ID = "org.omarchy.luna"
 
 TERMINAL_BIN = "foot"                              # Omarchy's terminal
 HYPRCTL_BIN = "hyprctl"
+
+# --- What Luna can see of the desktop (lunad/context.py) -------------------
+#
+# Two different reads of the same compositor, with two different budgets.
+#
+# The focused-window line rides on *every* ask, so it is bounded hard: one
+# `hyprctl -j activewindow`, a second at the outside, and any failure at all
+# means the ask goes out without it. A context line is worth a few tokens; it
+# is not worth a question that does not get answered.
+#
+# `hyprctl -j activewindow` is a *query*. `hyprctl dispatch` on this machine
+# (Hyprland 0.56.2, Lua config) evaluates its arguments as Lua and is a
+# different and much sharper proposition — see dispatch.py. Nothing here
+# dispatches.
+#
+# The screenshot is only ever taken when a look was actually asked for, never
+# ambiently, and the file is deleted after the call whatever happens.
+
+GRIM_BIN = "grim"                                  # the screenshot tool here
+WINDOW_CONTEXT_TIMEOUT_S = 1.0                     # per ask, hard
+SCREENSHOT_TIMEOUT_S = 10.0                        # grim on a 1900x1016 window
 
 DISPATCH_TIMEOUT_S = 3600.0                        # a real job, not an ask
 DISPATCH_LINGER_S = 8.0                            # window stays up after exit

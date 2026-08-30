@@ -42,7 +42,69 @@ manner — particularly its ban on opening with agreement or praise — the
 specification wins.
 """
 
+# What she can actually do, stated as fact.
+#
+# This block used to open "You are running headless with no tools. You cannot
+# read files, run commands, or inspect the machine right now." That was true
+# when the ask path ran read-only with tools suppressed, and it produced
+# exactly the behaviour you would predict: asked to look up a version she said
+# she could not, and asked what was on the screen she recommended starting the
+# daemon properly — advice that was both wrong and unprompted, because nothing
+# in her prompt had ever told her the machinery she is part of exists.
+#
+# She now runs with a real shell and full access. The notes below are the only
+# place she learns that, and the only place she learns the two commands that
+# turn her from an assistant who answers into one who acts. Every path is
+# absolute: her shell is lunad's, and lunad's PATH is systemd's.
 _CLOSING = """\
+Operating notes for this exchange:
+
+- You have a shell on this machine and you are expected to use it. You can read
+  and write files, run commands, and reach the web. Do not say you are unable
+  to check something you could check in one command; go and look, then answer.
+  If a question turns on a version number, a file's contents, or what is
+  actually running, the answer is the one you verified, not the one you
+  remember.
+- Delegate real work instead of doing it in the conversation. From your shell:
+
+      {cli} dispatch --to sol "<the task, stated in full>"
+
+  That hands the job to {specialist} in his own terminal with his own memory,
+  and returns immediately with a job id. `{cli} dispatch "<task>"` without
+  `--to` gives it to an anonymous worker instead. `{cli} jobs` lists what is
+  running and what it produced; `{cli} peek` shows the workspace.
+- When to delegate: anything with real depth, anything that will take more than
+  a couple of minutes, anything that needs to read a lot before it can answer.
+  Small things you finish in one step you do yourself — dispatching a
+  one-command job wastes a terminal and the user's time. When you do delegate,
+  say who you enrolled and why, in one line, and then stop; you are told when
+  the job finishes and the result is written into your memory, so do not sit
+  and poll for it.
+- You can see the screen when you ask to:
+
+      {cli} look "<question about what is on screen>"
+
+  It captures the focused window and answers the question. The user may also
+  hand you a screenshot directly, in which case it is already attached to their
+  message and you can simply read it. Nothing is captured unless a look was
+  asked for, so if you need to see something, ask for it or run the command.
+- Reply in plain prose for a terminal. No markdown headings, no bullet lists
+  unless the answer genuinely is a list. Short.
+- The memory below is yours. Treat it as things you know, not as a document
+  someone handed you. If something in it looks wrong, say so.
+"""
+
+# The same notes for a brain that genuinely has no tools on the ask path —
+# `claude` still runs `--tools ""` there, and `codex` would too if
+# `CODEX_ASK_SANDBOX` were put back to "read-only".
+#
+# Kept because the alternative is worse in both directions. A prompt that
+# promises a shell to a model that has none produces an assistant who says she
+# will go and check and then invents the answer, which is the failure mode this
+# whole change exists to remove; the fix is not to delete the honest text but
+# to make sure exactly one of the two is true at a time. Which one is chosen by
+# the adapter, not by a constant here: see `BaseAdapter.ask_has_tools`.
+_CLOSING_NO_TOOLS = """\
 Operating notes for this exchange:
 
 - You are running headless with no tools. You cannot read files, run commands,
@@ -53,6 +115,16 @@ Operating notes for this exchange:
 - The memory below is yours. Treat it as things you know, not as a document
   someone handed you. If something in it looks wrong, say so.
 """
+
+
+def operating_notes(tools: bool = True, cli: str | None = None,
+                    specialist: str | None = None) -> str:
+    """The closing block, matched to what the answering agent can actually do."""
+    if not tools:
+        return _CLOSING_NO_TOOLS
+    return _CLOSING.format(
+        cli=cli or config.LUNA_CLI,
+        specialist=specialist or settings_mod.specialist_name())
 
 
 def load_spec(path: Path = config.PERSONA_PATH) -> str:
@@ -70,6 +142,9 @@ def build_system_prompt(
     tier1_block: str,
     spec: str | None = None,
     name: str | None = None,
+    cli: str | None = None,
+    specialist: str | None = None,
+    tools: bool = True,
 ) -> str:
     """Compose the cacheable prefix: persona + tier-1 memory. Nothing volatile.
 
@@ -81,7 +156,10 @@ def build_system_prompt(
     parts = [_PREAMBLE.format(name=who),
              f"## {who} — persona specification\n", spec or load_spec()]
     parts.append("## Curated memory (tier 1, always loaded)\n\n" + tier1_block.strip())
-    parts.append(_CLOSING)
+    # `cli`, `specialist` and `tools` are settings-shaped but stable: all three
+    # are part of the cacheable prefix, and changing one invalidates the cache
+    # exactly once, which is the same trade her own name already makes.
+    parts.append(operating_notes(tools=tools, cli=cli, specialist=specialist))
     return "\n\n".join(p.strip() for p in parts if p.strip()) + "\n"
 
 
@@ -231,18 +309,27 @@ def build_dispatch_system_prompt(to: str = "worker", spec: str | None = None,
 
 
 def build_user_message(prompt: str, recall_block: str = "",
-                       surface: str = "cli") -> str:
+                       surface: str = "cli", context_line: str = "") -> str:
     """Wrap the user's message with anything retrieved for *this* turn.
 
     Recall goes first and the question last, so the model reads the context
     before the request rather than having to hold the request in mind while it
     reads. The surface is named because a spoken answer has to be shorter than
     a typed one and Luna has no other way to know which she is giving.
+
+    ``context_line`` is what the desktop looks like at this instant — see
+    :mod:`lunad.context`. It belongs *here* and nowhere else. It changes every
+    time the user alt-tabs, so in the system prompt it would invalidate the
+    cacheable prefix on every single ask, which is the same mistake tier-2
+    recall made and cost measurably (ARCHITECTURE.md §4). In the user message
+    it costs its own twenty tokens and nothing else.
     """
     parts: list[str] = []
     if recall_block.strip():
         parts.append("## Recalled context (tier 2, retrieved for this message)\n\n"
                      + recall_block.strip())
+    if context_line.strip():
+        parts.append("## The desktop right now\n\n" + context_line.strip())
     if surface == "voice":
         parts.append(
             "This message was spoken aloud and your answer will be read back "

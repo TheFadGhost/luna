@@ -1,9 +1,11 @@
 """Agent invocation. ARCHITECTURE.md section 6.
 
 lunad never talks to a model API directly. It shells out to whichever headless
-agent CLI the desktop is configured for, reading the choice from
-``~/.config/omarchy/defaults/agent`` so Luna follows the same default as the
-rest of Omarchy rather than inventing her own.
+agent CLI it is configured for. The choice is `[assistant] agent` in Luna's own
+config, falling back to ``~/.config/omarchy/defaults/agent`` when that key is
+empty. The fallback is the fallback and not the source of truth: that file is
+the *desktop's* default agent and several other things read it, so Luna picking
+her own brain must not mean editing it out from under them.
 
 Two adapters are real: ``claude`` (Claude Code 2.1.241) and ``codex``
 (codex-cli 0.149.1). Both were verified against the binaries actually installed
@@ -37,7 +39,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from . import config, safety
 
@@ -151,6 +153,16 @@ class AgentReply:
 
 class BaseAdapter:
     name = "base"
+
+    #: Whether a conversational ask through this adapter can actually run
+    #: commands. Read by the server so Luna's operating notes describe the
+    #: machine she is on rather than the machine she used to be on: a prompt
+    #: that promises a shell to an agent invoked with the tools switched off
+    #: produces an assistant who says she will check and then guesses, and a
+    #: prompt that denies a shell to an agent that has one produces an
+    #: assistant who refuses work she could have done in a single command.
+    #: Both were observed. See persona.operating_notes.
+    ask_has_tools = False
 
     def binary(self) -> str:
         raise NotImplementedError
@@ -315,6 +327,13 @@ class ClaudeAdapter(BaseAdapter):
     """
 
     name = "claude"
+
+    # `--tools ""` above. Unchanged, and the reason Luna's default brain is no
+    # longer this adapter: a resident assistant that cannot look at the machine
+    # she lives on is a chatbot with a persona file. Switching
+    # `[assistant] agent` back to claude is still supported and still works —
+    # her operating notes simply tell the truth about what she can do.
+    ask_has_tools = False
 
     _CANDIDATES = [
         Path.home() / ".local/share/mise/installs/claude/latest/claude",
@@ -560,8 +579,24 @@ class CodexAdapter(BaseAdapter):
     #: Luna never touches.
     PROFILE_NAME = "luna"
 
-    def __init__(self, model: str | None = config.DEFAULT_MODEL) -> None:
-        self.model = model
+    def __init__(self, model: str | None = None) -> None:
+        # Read late from `config`, not bound as a signature default: a default
+        # is fixed at import, and `CODEX_ASK_MODEL` is exactly the sort of name
+        # a test wants to move. `""` means the same as None here — the config
+        # contract says an empty `[assistant] model` is "the agent's own
+        # default", and for codex-as-Luna that default is a real slug rather
+        # than whatever codex would have picked.
+        self.model = model or config.CODEX_ASK_MODEL
+
+    @property
+    def ask_has_tools(self) -> bool:
+        """codex has no `--tools ""`; the sandbox *is* the tool policy.
+
+        So this is not a constant, it is a reading of `CODEX_ASK_SANDBOX`:
+        under "read-only" she genuinely cannot run anything that changes the
+        machine, and her prompt must not claim otherwise.
+        """
+        return config.CODEX_ASK_SANDBOX != "read-only"
 
     def binary(self) -> str:
         # LUNA_CODEX_BIN, not LUNA_AGENT_BIN: dispatch may run codex while the
@@ -627,6 +662,7 @@ class CodexAdapter(BaseAdapter):
         output_file: str | None = None,
         sandbox: str | None = None,
         mode: str = "ask",
+        images: Sequence[str] = (),
     ) -> list[str]:
         """The argv for one turn. The prompt is *not* here — it goes on stdin.
 
@@ -668,6 +704,17 @@ class CodexAdapter(BaseAdapter):
         chosen_model = model or self.model
         if chosen_model:
             argv += ["-m", chosen_model]
+        # Last, and deliberately last. `-i/--image <FILE>...` is variadic: clap
+        # keeps eating tokens until it meets one that looks like a flag, so an
+        # image list in the middle of the command line would swallow whatever
+        # followed it. At the end there is nothing left to swallow. One `-i`
+        # per file rather than one `-i` with many, for the same reason.
+        #
+        # gpt-5.6-luna has vision natively and `codex exec -i` attaches the
+        # image to the turn. There is no second model here and no HTTP call:
+        # OpenRouter is for text-to-speech and nothing else.
+        for image in images:
+            argv += ["-i", str(image)]
         return argv
 
     def dispatch_argv(self, job_dir: str, system_file: str,
@@ -689,6 +736,14 @@ class CodexAdapter(BaseAdapter):
         argv += ["-C", job_dir, "--add-dir", job_dir]
         for extra in add_dirs:
             argv += ["--add-dir", extra]
+        # Sol's model, not Luna's, and not the caller's. `self.model` is the
+        # conversational slug and belongs to the ask path; a dispatched session
+        # is a coding agent doing coding-agent work, and the two are different
+        # models on purpose. Read from `config` at script-generation time so a
+        # change to the constant reaches the next job rather than the next
+        # daemon restart.
+        if config.CODEX_DISPATCH_MODEL:
+            argv += ["-m", config.CODEX_DISPATCH_MODEL]
         argv += ["-c", f'"{config.CODEX_PERSONA_KEY}=$(cat {system_file})"']
         return argv
 
@@ -703,6 +758,7 @@ class CodexAdapter(BaseAdapter):
         resume: str | None = None,
         timeout: float = config.AGENT_TIMEOUT_S,
         run: "AgentRun | None" = None,
+        images: Sequence[str] = (),
         **_: Any,
     ) -> AgentReply:
         # `session_id` is accepted and ignored, on purpose. claude lets the
@@ -716,7 +772,7 @@ class CodexAdapter(BaseAdapter):
         os.close(fd)
         try:
             argv = self.build_argv(system_prompt, model=model, resume=resume,
-                                   output_file=out_path)
+                                   output_file=out_path, images=images)
             stdout, stderr, rc, wall_ms = self._spawn_and_wait(
                 argv, timeout=timeout, run=run, stdin_data=prompt)
             try:

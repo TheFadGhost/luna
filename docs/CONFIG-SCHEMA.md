@@ -26,8 +26,8 @@ default and its fallback ever disagree again.
 [assistant]
 name         = "Luna"        # display name + how she refers to herself
 specialist   = "Sol"         # the delegate persona
-agent        = "claude"      # claude | codex   (falls back to ~/.config/omarchy/defaults/agent)
-model        = ""            # "" = agent default
+agent        = "codex"       # claude | codex   (falls back to ~/.config/omarchy/defaults/agent)
+model        = ""            # "" = agent default (codex: gpt-5.6-luna)
 
 [voice]
 enabled      = true
