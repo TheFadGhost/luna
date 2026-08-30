@@ -327,6 +327,17 @@ def cmd_status(args: argparse.Namespace) -> int:
           f"{spawned.get('refusals', 0)} refusal(s) · "
           f"audit {aud.get('size_bytes', 0)} bytes")
 
+    amb = resp.get("ambient") or {}
+    if amb:
+        # One line, and it says "notify" out loud: the whole contract of this
+        # subsystem is that it never speaks, and a status that did not say so
+        # would leave the user guessing what she is allowed to do unprompted.
+        watching = [n for n, w in (amb.get("watchers") or {}).items()
+                    if w.get("enabled")]
+        print(f"  ambient  {'watching ' + ', '.join(watching) if watching else 'nothing enabled'}"
+              f" — notify only, never speaks · "
+              f"{amb.get('delivered', 0)} event(s) since start")
+
     se = resp.get("sessions") or {}
     c = se.get("counters", {})
     print(f"  sessions {len(se.get('live', []))} live · "
