@@ -27,7 +27,7 @@ from .theme import COLUMN, RHYTHM, SPACE
 
 
 def label(text, css=("rowlabel",), wrap=False, xalign=0.0, selectable=False,
-          measure=None):
+          measure=None, pin=False):
     """One label. `measure` is a line length in characters, not pixels —
     typographic measure is counted in characters, and stating it here keeps
     every wrapping string in the app on one of the COLUMN measures."""
@@ -36,6 +36,15 @@ def label(text, css=("rowlabel",), wrap=False, xalign=0.0, selectable=False,
     if wrap:
         lb.set_wrap_mode(2)          # Pango.WrapMode.WORD_CHAR
         lb.set_max_width_chars(COLUMN["doc"] if measure is None else measure)
+        # A label whose halign is FILL takes the whole allocation and lays
+        # its text out across it, so max-width-chars caps nothing: the
+        # measure only holds once the label asks for its natural width.
+        lb.set_halign(Gtk.Align.START)
+        if pin:
+            # Both bounds, so the label can neither grow past its column nor
+            # shrink out of it: a read-back value that outgrew the control
+            # column dragged that whole row's grid out of line.
+            lb.set_width_chars(COLUMN["doc"] if measure is None else measure)
     lb.set_selectable(selectable)
     for c in css:
         lb.add_css_class(c)
@@ -143,7 +152,11 @@ def row(title, doc, *controls, trail=None):
     box = rowbox(SPACE["panelPadding"])
     left = column(SPACE["labelGap"] // 2)
     left.set_hexpand(True)
-    left.append(label(title))
+    # Both strings wrap. A label that cannot wrap sets a minimum width for
+    # its whole pane, and a GtkStack is horizontally homogeneous by default,
+    # so one long name on one pane silently widened all seven past the
+    # window and clipped the control column off the right-hand edge.
+    left.append(label(title, wrap=True))
     if doc:
         left.append(label(doc, css=("rowdoc",), wrap=True))
     box.append(left)

@@ -23,6 +23,32 @@ from .widgets import (TriToggle, act, clear, column, group, head, label,
                       state_note)
 
 
+def _face_factory(cap):
+    """A list-item factory whose label ellipsizes at `cap` characters.
+
+    GTK sizes a dropdown's closed face to its longest option, so one long
+    voice name was reaching past the control column and dragging that row's
+    control out of the line every other row keeps. The popup list gets the
+    untruncated text; the closed face is a summary, and the row's own helper
+    line already spells the value out.
+    """
+    factory = Gtk.SignalListItemFactory()
+
+    def setup(_f, item):
+        lb = Gtk.Label(xalign=0.0)
+        if cap:
+            lb.set_ellipsize(3)          # Pango.EllipsizeMode.END
+            lb.set_max_width_chars(cap)
+        item.set_child(lb)
+
+    def bind(_f, item):
+        item.get_child().set_text(item.get_item().get_string())
+
+    factory.connect("setup", setup)
+    factory.connect("bind", bind)
+    return factory
+
+
 class Binder:
     """Builds bound controls and keeps them in step with the Editor."""
 
@@ -123,6 +149,8 @@ class Binder:
     def _dropdown(self, dotted, options, value, width, labeller=str):
         options = list(options)
         dd = Gtk.DropDown.new_from_strings([labeller(o) for o in options])
+        dd.set_factory(_face_factory(COLUMN["face"]))
+        dd.set_list_factory(_face_factory(0))
         dd.set_size_request(width, -1)
         try:
             dd.set_selected(options.index(value))
@@ -452,7 +480,20 @@ def voice_pane(b, player, on_status):
         "saved, and take effect again the moment it is switched back on.",
         css=("rowdoc",), wrap=True, measure=COLUMN["note"])
 
-    gated = []
+    n = len(voices.available())
+    out_rows = [b.bound_row("voice.provider"), b.bound_row("voice.model")]
+    pick_rows = [b.bound_row("voice.voice", extra=(prev_a,)),
+                 b.bound_row("voice.voice_male", extra=(prev_b,)),
+                 row("Live check",
+                     "Speaks one sentence through lunad's say op.", live)]
+    deliver_rows = [b.bound_row("voice.fallback"),
+                    b.bound_row("voice.piper_voice"),
+                    b.bound_row("voice.speed", width=COLUMN["narrow"]),
+                    b.bound_row("voice.max_spoken_chars",
+                                width=COLUMN["narrow"])]
+    # The rows go inert, not the groups: a dimmed section heading would say
+    # the section had stopped existing, when what has stopped is the setting.
+    gated = out_rows + pick_rows + deliver_rows
 
     def gate(sw, _p=None):
         on = sw.get_active()
@@ -460,27 +501,11 @@ def voice_pane(b, player, on_status):
         for w in gated:
             w.set_sensitive(on)
 
-    n = len(voices.available())
     output = group("Output",
                    b.bound_row("voice.enabled", ctl=enabled_ctl),
-                   off_note,
-                   b.bound_row("voice.provider"),
-                   b.bound_row("voice.model"))
-    picks = group(f"Voice — {n} samples in ~/Music/luna-voices",
-                  b.bound_row("voice.voice", extra=(prev_a,)),
-                  b.bound_row("voice.voice_male", extra=(prev_b,)),
-                  row("Live check",
-                      "Speaks one sentence through lunad's say op.", live))
-    delivery = group("Fallback and delivery",
-                     b.bound_row("voice.fallback"),
-                     b.bound_row("voice.piper_voice"),
-                     b.bound_row("voice.speed", width=COLUMN["narrow"]),
-                     b.bound_row("voice.max_spoken_chars",
-                                 width=COLUMN["narrow"]))
-    # Every row of the pane except the enabled switch's own row.
-    gated.extend([output.get_last_child(),
-                  output.get_last_child().get_prev_sibling(),
-                  picks, delivery])
+                   off_note, *out_rows)
+    picks = group(f"Voice — {n} samples in ~/Music/luna-voices", *pick_rows)
+    delivery = group("Fallback and delivery", *deliver_rows)
     enabled_ctl.connect("notify::active", gate)
     gate(enabled_ctl)
 
@@ -611,7 +636,9 @@ def confirm_pane(b):
     tri_rows, other_rows = [], []
     answers = {}
 
-    summary = label("", css=("rowdoc",), wrap=True, measure=COLUMN["note"])
+    # Full contrast, body size: the count of classes that run unattended is
+    # the headline fact of this pane, and outranks the static legend above it.
+    summary = label("", css=("rowlabel",), wrap=True, measure=COLUMN["note"])
 
     def restate():
         loose = sorted(k for k, v in answers.items() if v == "never")
@@ -797,7 +824,7 @@ def jobs_pane(b):
             task = (m.get("task") or "(no task recorded)").strip()
             if len(task) > 96:
                 task = task[:93] + "..."
-            left.append(label(task))
+            left.append(label(task, wrap=True))
             meta = " · ".join(str(x) for x in (
                 m.get("id"), m.get("to") or "worker",
                 state.job_age(m),
@@ -853,7 +880,7 @@ def about_pane(b, on_start):
     fetching = {"busy": False}
 
     def kv(k, v, css=("value",)):
-        return row(k, "", label(v, css=css, wrap=True,
+        return row(k, "", label(v, css=css, wrap=True, pin=True,
                                 measure=COLUMN["value"]))
 
     def render(st, up, unit, error):
@@ -884,13 +911,15 @@ def about_pane(b, on_start):
                               "config.toml and lunad hot-reloads it")
                         if sup is False else "not probed yet"))
         present, where = state.key_present()
-        lines.append(kv("API key", ("present in " + where) if present
-                        else "not found — " + where))
-        keynote = label(
-            "The key itself is never read, never shown and never written to "
-            "config.toml.", css=("rowdoc",), wrap=True,
-            measure=COLUMN["note"])
-        lines.append(keynote)
+        # The value stays one word, and the location moves to the note under
+        # it: a path is longer than the column every other value shares, and
+        # one long read-back was pulling this row's grid out of line.
+        lines.append(kv("API key", "present" if present else "not found",
+                        css=("value",) if present else ("locked-value",)))
+        lines.append(label(
+            f"{where}. The key itself is never read, never shown and never "
+            "written to config.toml.", css=("rowdoc",), wrap=True,
+            measure=COLUMN["note"]))
 
     def rebuild():
         if fetching["busy"]:

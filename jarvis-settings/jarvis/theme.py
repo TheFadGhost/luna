@@ -64,10 +64,11 @@ COLUMN = {
     "narrow": 140,      # a number or short code — same left edge, less width
     "trail": 120,       # state notes and per-row actions
     "doc": 48,          # chars — helper-text measure inside the label column
-    "value": 36,        # chars — a read-back value inside the control column
+    "value": 33,        # chars — a read-back value inside the control column
+    "face": 28,         # chars — a dropdown's closed face, before the arrow
     "state": 16,        # chars — the trailing note, at caption size
     "lede": 72,         # chars — pane description measure (prose, 65–75ch)
-    "note": 96,         # chars — full-width explanatory paragraphs
+    "note": 74,         # chars — full-width explanatory paragraphs
 }
 
 # Vertical rhythm. Every value is a multiple of a SPACE token above, so the
@@ -227,8 +228,8 @@ def css_for(c: dict) -> str:
     }}
     .navrow:hover, .navrow:selected {{ background: transparent; }}
     .navrow label {{ font-size: {f['body']}px;
-                     color: alpha({fg}, 0.52); }}
-    .navrow:hover label {{ color: alpha({fg}, 0.82); }}
+                     color: alpha({fg}, {d['label']}); }}
+    .navrow:hover label {{ color: alpha({fg}, 0.85); }}
     .navrow:selected label {{ color: {fg}; font-weight: bold; }}
     .navrow:focus-visible {{
         outline-style: solid;
@@ -287,6 +288,10 @@ def css_for(c: dict) -> str:
                       background: transparent;
                       border-color: alpha({fg}, {d['hairline']}); }}
     entry > text > placeholder {{ color: alpha({fg}, {d['label']}); }}
+    /* An insensitive entry has to look insensitive. `label:disabled` cannot
+       reach the text: what an entry actually renders is a `text` node. */
+    text:disabled {{ color: alpha({fg}, {d['faint']}); }}
+    text:disabled selection {{ background-color: transparent; }}
 
     spinbutton {{
         background: alpha({fg}, 0.07);
@@ -304,6 +309,8 @@ def css_for(c: dict) -> str:
     spinbutton button:hover label {{ color: {fg}; }}
     spinbutton:disabled {{ border-color: alpha({fg}, {d['hairline']});
                            background: transparent; }}
+    /* The steppers are icons, not labels, so they need dimming of their own. */
+    spinbutton:disabled button {{ opacity: 0.35; }}
 
     dropdown > button {{
         background: alpha({fg}, 0.07);
@@ -315,6 +322,7 @@ def css_for(c: dict) -> str:
         color: {fg};
     }}
     dropdown > button:hover {{ border-color: alpha({fg}, 0.55); }}
+    dropdown label {{ font-size: {f['bodySmall']}px; }}
     dropdown:disabled > button {{ border-color: alpha({fg}, {d['hairline']});
                                   background: transparent; }}
     popover contents {{
@@ -382,12 +390,14 @@ def css_for(c: dict) -> str:
         border-radius: 0;
         padding: {s['labelGap']}px {s['md']}px;
         min-height: 0;
-        box-shadow: inset 0 -1px 0 0 alpha({fg}, {d['hairline']});
+        /* The unpicked options keep a visible baseline: without one the
+           three words read as a sentence rather than as a control. */
+        box-shadow: inset 0 -1px 0 0 alpha({fg}, {d['faint']});
     }}
     .seg label {{ font-size: {f['bodySmall']}px;
                   color: alpha({fg}, {d['label']}); }}
     .seg:hover {{ background: transparent;
-                  box-shadow: inset 0 -1px 0 0 alpha({fg}, {d['faint']}); }}
+                  box-shadow: inset 0 -1px 0 0 alpha({fg}, 0.55); }}
     .seg:hover label {{ color: {fg}; }}
     .seg:checked {{ box-shadow: inset 0 -{BORDER}px 0 0 alpha({fg}, 0.85); }}
     .seg:checked label {{ color: {fg}; font-weight: bold; }}
