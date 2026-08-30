@@ -171,7 +171,7 @@ SCHEMA: tuple[Section, ...] = (
                 comment="openrouter | local"),
             Key("model", "fish-audio/transcribe-1", "str"),
             Key("language", "en", "str"),
-            Key("keybind", "SUPER + ALT + L", "str"),
+            Key("keybind", "F10", "str"),
         ),
     ),
     Section(

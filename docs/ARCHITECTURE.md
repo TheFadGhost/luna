@@ -166,7 +166,7 @@ post_process_timeout_ms = 2000
 output_mode = "clipboard"
 ```
 
-Keybind: **SUPER+ALT+L** runs `voxtype record toggle --profile luna`,
+Keybind: **F10** runs `voxtype record toggle --profile luna`,
 verified free against `hyprctl binds` and added to the user-owned
 `~/.config/hypr/bindings.lua` so it survives `omarchy update`.
 **F9 and SUPER+CTRL+X keep working exactly as today** - no shared mode flag, no
@@ -609,7 +609,7 @@ reports whether a key exists and where it came from, never the key.
 | Phase | Ships | Verifiable by |
 |---|---|---|
 | P0 | `lunad` + socket + CLI + memory tiers 1-2 + persona. Text only. | `luna ask "..."` returns an opinionated answer that cites remembered context. |
-| P1 | **DONE.** piper TTS out, voxtype routing in, session reuse, cost fix. | SUPER+ALT+L, speak, she answers aloud. Plain dictation still types — regression-tested. |
+| P1 | **DONE.** piper TTS out, voxtype routing in, session reuse, cost fix. | F10, speak, she answers aloud. Plain dictation (F9) still types — regression-tested. |
 | P2 | **DONE.** Workspace dispatch + Sol + audit log + PID firewall. | `luna dispatch "..."` runs in the `luna` special workspace and reports back; `luna spawned --check <foreign pid>` refuses. |
 | P2b | **DONE.** Jarvis: config file + hot reload, OpenRouter TTS with piper fallback, confirmation policy, name as a setting. | Edit `~/.config/jarvis/config.toml`, do not restart, hear the change. |
 | P3 | Bar widget, ambient hooks (crash/battery/update), semantic recall + decay. | Crash a process, she explains it unprompted. |

@@ -151,10 +151,10 @@ SPEC: tuple[Section, ...] = (
                  placeholder="fish-audio/transcribe-1"),
             Text("language", "Language", "ISO code passed to the transcriber.",
                  default="en", placeholder="en", allow_empty=False),
-            Text("keybind", "Push-to-talk keybind",
-                 "Owned by ~/.config/hypr/bindings.lua. Shown here, edited "
-                 "there.",
-                 default="SUPER + ALT + L", readonly=True),
+            Text("keybind", "Talk-to-Luna keybind",
+                 "Tap to start listening, tap again to send. Owned by "
+                 "~/.config/hypr/bindings.lua. Shown here, edited there.",
+                 default="F10", readonly=True),
         ),
     ),
     Section(
