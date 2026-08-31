@@ -124,6 +124,7 @@ class SpecReportingCase(unittest.TestCase):
     def test_she_does_not_call_a_job_underway_when_it_is_not(self) -> None:
         self.assertIn("call a job queued, started or underway unless it is.",
                       self.spec)
+        self.assertIn("No job id means no job.", self.spec)
 
 
 class OperatingNotesGateCase(unittest.TestCase):
@@ -181,6 +182,17 @@ class OperatingNotesGateCase(unittest.TestCase):
         self.assertIn(
             "call a job started, queued or underway unless the command",
             self.notes())
+
+    def test_a_command_still_running_is_not_a_command_that_worked(self) -> None:
+        """Overruled on the React objection she complied, fired the dispatch
+        twice, and answered "Sol's dispatch is now running" while the
+        confirmation prompt it was blocked on sat unanswered on the user's
+        desktop. It timed out sixty seconds later and no job was ever created.
+        She even said the job id had not come back, and still called it
+        running."""
+        notes = self.notes()
+        self.assertIn("has not come back yet has not succeeded", notes)
+        self.assertIn("no job id came back means no job is running", notes)
 
     def test_the_four_hard_denies_bind_her_too(self) -> None:
         """`CODEX_ASK_SANDBOX` is "bypass": her own ask has no sandbox, and
