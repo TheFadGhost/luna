@@ -11,7 +11,10 @@ from __future__ import annotations
 import io
 import json
 import struct
+import threading
+import time
 import unittest
+import unittest.mock
 import urllib.error
 
 from ._support import TempMemoryCase
@@ -248,6 +251,62 @@ class FallbackCase(TempMemoryCase):
         obj._play(self.job(["One.", "Two."]))
         self.assertEqual(len(obj.players), 2)
         self.assertEqual(obj.players[1].args, (22_050, 1, "S16_LE"))
+
+    def test_a_stalled_sentence_stops_billing_the_rest(self) -> None:
+        """The consumer giving up must stop the producer, not just fall back.
+
+        Without this, `produce()` keeps requesting (and OpenRouter TTS is the
+        one paid service in this project) every sentence piper is about to
+        speak instead — audio nobody will ever hear, paid for anyway.
+        """
+        order: list[str] = []
+        release = threading.Event()
+
+        def synth(text, *, model, voice, api_key, speed=1.0,  # noqa: ANN001
+                  timeout=None):
+            order.append(text)
+            if text == "One.":
+                # Simulate "never arrives": still in flight when the consumer
+                # gives up on it.
+                release.wait(5.0)
+            return speech.parse_wav(make_wav())
+
+        obj = _Speech(synth=synth, settings=self.settings)
+        self.addCleanup(obj.close)
+        job = self.job(["One.", "Two.", "Three."])
+
+        # A real 30s wait for `_play_remote`'s own timeout would make this
+        # test slow without proving anything more; a fake clock trips the
+        # same deadline check almost immediately instead, after two real
+        # `ready.wait(0.05)` cycles give the producer thread a fair chance to
+        # actually start and call synth("One.").
+        base = time.monotonic()
+        calls = {"n": 0}
+
+        def fake_monotonic():
+            calls["n"] += 1
+            if calls["n"] <= 3:
+                return base + calls["n"] * 0.001
+            return base + 10_000.0
+
+        with unittest.mock.patch.object(speech.time, "monotonic",
+                                        fake_monotonic):
+            remaining = obj._play_remote(job)
+
+        self.assertEqual(remaining, ["One.", "Two.", "Three."])
+        self.assertTrue(job.abandon_remote)
+        self.assertFalse(job.cancelled, "abandon_remote must not look like a "
+                                        "user barge-in to _play_piper")
+
+        release.set()          # let the stuck synth("One.") call finish
+        # Give the producer thread a moment to notice `abandon_remote` and
+        # stop, if it was ever going to call synth again — a generous, fixed
+        # wait rather than racing it, since the assertion below is exact.
+        time.sleep(0.3)
+
+        self.assertEqual(order, ["One."],
+                         "the producer must not have requested Two. or "
+                         "Three. after the consumer abandoned the utterance")
 
     def test_the_configured_voice_reaches_the_request(self) -> None:
         seen: list[str] = []

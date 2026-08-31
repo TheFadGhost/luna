@@ -345,13 +345,14 @@ class Job:
 
 
 def _reap_notify(proc: subprocess.Popen) -> None:
-    """Wait on the toast so it never becomes a zombie, then release the pid."""
+    """Wait on the toast so it never becomes a zombie, then release the pid.
+
+    ``reap_after`` keeps waiting in the background past its own 15s bound
+    rather than giving up: a ``notify-send`` that never exits must not leak a
+    permanent zombie for the rest of the daemon's life.
+    """
     try:
-        proc.wait(timeout=15)
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        safety.reap(proc)
+        safety.reap_after(proc, timeout=15)
     except Exception:  # noqa: BLE001 - reaping a toast must not raise
         pass
 
@@ -641,79 +642,87 @@ class Dispatcher:
         the job is marked ``failed`` and written to disk first, because from
         the queue there is no caller left to raise at and the record is the
         only thing that will be read afterwards.
+
+        The ``_admitting`` reservation is released in a ``finally`` around the
+        whole body: it used to be released only on the ``OSError`` branch and
+        the success path, so anything else raised by ``spawn`` (or by the
+        bookkeeping after it) left the job id in ``_admitting`` forever,
+        shrinking ``max_parallel`` by one until the daemon restarted.
         """
         job = pending.job
         task, job_id, to = job.task, job.id, job.to
         job_dir = job.dir
-
-        # Best effort: without the rule the job still runs, it just opens the
-        # window where the user is looking. Say so rather than failing.
-        placed = True
         try:
-            rule = self.hypr.ensure_workspace_rule()
-        except DispatchUnavailable as exc:
-            placed = False
-            rule = f"unavailable: {exc}"
-            log.warning("workspace rule not installed; the window will open on "
-                        "the active workspace", extra={"detail": str(exc)})
+            # Best effort: without the rule the job still runs, it just opens
+            # the window where the user is looking. Say so rather than failing.
+            placed = True
+            try:
+                rule = self.hypr.ensure_workspace_rule()
+            except DispatchUnavailable as exc:
+                placed = False
+                rule = f"unavailable: {exc}"
+                log.warning("workspace rule not installed; the window will "
+                            "open on the active workspace",
+                            extra={"detail": str(exc)})
 
-        argv = [self.terminal, "--app-id", self.app_id,
-                "--title", f"luna job {job_id} → {to}",
-                "--", "/bin/bash", str(job_dir / "run.sh")]
-        try:
-            proc = self.spawn(argv, kind="dispatch", job_id=job_id, durable=True,
-                              note=f"dispatch to {to}: {task[:80]}",
-                              stdin=subprocess.DEVNULL,
-                              stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL,
-                              cwd=str(job_dir))
-        except OSError as exc:
-            job.state = "failed"
-            job.note = f"could not start {self.terminal}: {exc}"
-            job.finished = time.time()
+            argv = [self.terminal, "--app-id", self.app_id,
+                    "--title", f"luna job {job_id} → {to}",
+                    "--", "/bin/bash", str(job_dir / "run.sh")]
+            try:
+                proc = self.spawn(argv, kind="dispatch", job_id=job_id,
+                                  durable=True,
+                                  note=f"dispatch to {to}: {task[:80]}",
+                                  stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL,
+                                  cwd=str(job_dir))
+            except OSError as exc:
+                job.state = "failed"
+                job.note = f"could not start {self.terminal}: {exc}"
+                job.finished = time.time()
+                self._write_job(job)
+                self.audit.append("dispatch.failed", ok=False, job_id=job_id,
+                                  why=task[:200], reason=str(exc))
+                raise DispatchUnavailable(job.note) from exc
+
+            job.pid = proc.pid
+            job.admitted = time.time()
+            job.state = "running"
+            job.note = ("in special workspace" if placed
+                        else "workspace rule unavailable; window is on the "
+                             "active workspace")
+            with self._lock:
+                self._jobs[job_id] = job
+                self._procs[job_id] = proc
+            self._write_job(job)
+
+            waited = round(job.admitted - job.started, 1)
+            self.audit.append(
+                "dispatch.spawn", ok=True, job_id=job_id, to=to, pid=proc.pid,
+                why=task[:500], cmd=argv, job_dir=str(job_dir),
+                workspace=f"special:{self.hypr.workspace}", rule=rule,
+                # Only when it actually waited. A `queued_s: 0.0` on every job
+                # would be noise on the line a reader is scanning for the pid.
+                queued_s=waited if waited >= 0.1 else None,
+                confirmed=pending.confirmed,
+                undo={"what": "stop the dispatched job",
+                      "cmd": ["luna", "jobs", "--cancel", job_id],
+                      "valid_while": "the job is still running"})
+            log.info("dispatched", extra={"job_id": job_id, "to": to,
+                                          "pid": proc.pid, "placed": placed,
+                                          "queued_s": waited})
+
+            watcher = threading.Thread(
+                target=self._watch, args=(job, proc, pending.timeout),
+                daemon=True, name=f"luna-job-{job_id}")
+            with self._lock:
+                self._watchers = [t for t in self._watchers if t.is_alive()]
+                self._watchers.append(watcher)
+            watcher.start()
+            return job
+        finally:
             with self._lock:
                 self._admitting.discard(job_id)
-            self._write_job(job)
-            self.audit.append("dispatch.failed", ok=False, job_id=job_id,
-                              why=task[:200], reason=str(exc))
-            raise DispatchUnavailable(job.note) from exc
-
-        job.pid = proc.pid
-        job.admitted = time.time()
-        job.state = "running"
-        job.note = ("in special workspace" if placed
-                    else "workspace rule unavailable; window is on the active "
-                         "workspace")
-        with self._lock:
-            self._jobs[job_id] = job
-            self._procs[job_id] = proc
-            self._admitting.discard(job_id)
-        self._write_job(job)
-
-        waited = round(job.admitted - job.started, 1)
-        self.audit.append(
-            "dispatch.spawn", ok=True, job_id=job_id, to=to, pid=proc.pid,
-            why=task[:500], cmd=argv, job_dir=str(job_dir),
-            workspace=f"special:{self.hypr.workspace}", rule=rule,
-            # Only when it actually waited. A `queued_s: 0.0` on every job
-            # would be noise on the line a reader is scanning for the pid.
-            queued_s=waited if waited >= 0.1 else None,
-            confirmed=pending.confirmed,
-            undo={"what": "stop the dispatched job",
-                  "cmd": ["luna", "jobs", "--cancel", job_id],
-                  "valid_while": "the job is still running"})
-        log.info("dispatched", extra={"job_id": job_id, "to": to,
-                                      "pid": proc.pid, "placed": placed,
-                                      "queued_s": waited})
-
-        watcher = threading.Thread(
-            target=self._watch, args=(job, proc, pending.timeout),
-            daemon=True, name=f"luna-job-{job_id}")
-        with self._lock:
-            self._watchers = [t for t in self._watchers if t.is_alive()]
-            self._watchers.append(watcher)
-        watcher.start()
-        return job
 
     # -- the admission gate, `[dispatch] max_parallel` --------------------
 
@@ -831,7 +840,13 @@ exit "$rc"
             except safety.SignalRefused:
                 log.exception("refused to terminate an overrunning job")
         finally:
-            safety.reap(proc)
+            # `proc.wait()` above already reaped it on the ordinary path. On
+            # the timeout path `terminate()` may or may not have confirmed
+            # death (a wedged terminal can outlive even SIGKILL's bounded
+            # wait), so this has to keep trying rather than just forgetting a
+            # pid that might still be a zombie — `reap_after` does, in the
+            # background, for as long as it takes.
+            safety.reap_after(proc, timeout=5.0)
 
         job.finished = time.time()
         job.exit_code = self._exit_code(job, proc)
@@ -852,7 +867,17 @@ exit "$rc"
         # The slot is free before the toast is sent: notifying is best-effort
         # and can take a moment, and the next job should not wait on a desktop
         # nicety. Nothing is admitted once close() has begun.
-        self._admit_next()
+        #
+        # Guarded: admitting the next job can itself raise (a queued job's own
+        # `_start` failing in a way `_admit_next` does not already catch), and
+        # that must not abort the bookkeeping for *this* job — the finish
+        # audit entry is already written above, but the toast below is still
+        # this job's, not the next one's.
+        try:
+            self._admit_next()
+        except Exception:  # noqa: BLE001 - this job's own finish must still fire
+            log.exception("failed to admit the next queued job",
+                          extra={"job_id": job.id})
         self.notify_finished(job)
 
     # -- `[ui] notify_on_finish` -----------------------------------------

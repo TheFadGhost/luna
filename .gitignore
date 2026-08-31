@@ -12,3 +12,11 @@ secrets*
 .envrc
 *.key
 *.pem
+
+# Models are user state, not source. `python3 -m lunad.embed fetch` puts the
+# 86 MB embedding model in ~/.local/share/luna/models/, outside the tree
+# entirely — these patterns exist for the day somebody fetches into the repo
+# by accident, because an 86 MB blob is very hard to take back out of git.
+*.onnx
+models/
+vocab.txt

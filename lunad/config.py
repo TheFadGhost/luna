@@ -17,6 +17,13 @@ PROJECT_DIR = PKG_DIR.parent                       # ~/Work/luna
 DATA_DIR = PROJECT_DIR / "data"                    # shipped, read-only assets
 PERSONA_PATH = DATA_DIR / "persona.md"
 
+# Luna's own CLI, by absolute path. She is told about it in her system prompt
+# and runs it from her own shell, and the shell she gets is lunad's — a systemd
+# --user environment whose PATH need not contain ~/.local/bin. A bare `luna`
+# in the prompt would work from the user's terminal and fail from hers, which
+# is the worst of the two failures because it only shows up at runtime.
+LUNA_CLI = PROJECT_DIR / "bin" / "luna"
+
 
 def _xdg(var: str, default: Path) -> Path:
     raw = os.environ.get(var)
@@ -52,6 +59,13 @@ SOCKET_PATH = RUNTIME_DIR / "luna.sock"
 # lunad/presence.py for the contract and for why it is a file and not a
 # subscription. Beside the socket on purpose: same tmpfs, same lifetime.
 STATE_FILE = RUNTIME_DIR / "state"
+
+# The HUD pane's caption, a sibling of `state` in the same tmpfs directory.
+# One JSON object, written atomically, with a monotonically increasing `id`.
+# The contract is HANDOFF-hud.md and the writer is `ambient.HudWriter`; the
+# pane (~/.config/omarchy/plugins/ghost.lunahud) reads it through inotify, so
+# nothing polls and an absent file simply means there is nothing to show.
+HUD_MESSAGE_FILE = RUNTIME_DIR / "message"
 
 OMARCHY_DEFAULT_AGENT = HOME / ".config" / "omarchy" / "defaults" / "agent"
 
@@ -202,15 +216,49 @@ DEFAULT_MODEL = None                               # None -> agent's own default
 
 # --- Codex adapter --------------------------------------------------------
 #
-# codex has no `--tools ""`, so the sandbox *is* the tool policy. A
-# conversational ask has no business writing to the disk, so it runs read-only;
-# a dispatched job is real work and gets what Omarchy itself gives codex.
+# codex has no `--tools ""`, so the sandbox *is* the tool policy.
 #
 # Values: "read-only", "workspace-write", "danger-full-access", or "bypass"
 # (which means --dangerously-bypass-approvals-and-sandbox, not a sandbox mode).
+#
+# CHANGED: the ask path was "read-only", and with it Luna's system prompt said
+# she had no tools at all. That was true and it was the wrong trade. Asked to
+# check a version she answered that she could not; asked what was on screen she
+# gave advice about starting the daemon. A resident assistant that cannot look
+# at the machine she lives on is a chatbot with a persona file.
+#
+# "bypass" rather than "danger-full-access", for two reasons that are about the
+# mechanism and not about how much access she should have (the answer to that
+# is: all of it — the user chose full autonomy and the audit log is the
+# backstop):
+#
+#   * `codex exec resume` accepts no `-s`. Under a sandbox *mode* the policy has
+#     to be re-stated as `-c sandbox_mode=…` on every resumed turn, and a
+#     mode-vs-flag mismatch between turn one and turn two is exactly the kind of
+#     thing that is discovered in production. `--dangerously-bypass-approvals-
+#     and-sandbox` is accepted identically by `exec` and by `exec resume`.
+#   * It also turns approvals off. `danger-full-access` removes the sandbox but
+#     leaves the approval policy in place, and an approval request in a headless
+#     turn is not a prompt anybody can answer — it is a hung ask.
+#
+# The dispatch path has run this way since Phase 2 and is unchanged.
 
-CODEX_ASK_SANDBOX = "read-only"
+CODEX_ASK_SANDBOX = "bypass"
 CODEX_DISPATCH_SANDBOX = "bypass"
+
+# The two model slugs, both verified present in ~/.codex/models_cache.json.
+#
+# They are constants here rather than settings because they are not a
+# preference: `[assistant] model` exists for someone who wants to override the
+# conversational model, and leaving it "" means "whatever the agent's own
+# default is", which for codex-as-Luna is this. Naming a default per *adapter*
+# rather than per *assistant* is what keeps `[assistant] model = ""` correct
+# when the agent is claude, where a gpt-5.6 slug would be nonsense.
+#
+# Luna thinks; Sol works. Sol is the coding-agent model and it is what every
+# dispatched session — specialist or anonymous worker — is given.
+CODEX_ASK_MODEL = "gpt-5.6-luna"
+CODEX_DISPATCH_MODEL = "gpt-5.6-sol"
 
 # codex's analogue of claude's --safe-mode: do not load the user's own
 # ~/.codex/config.toml or their execpolicy .rules into Luna's turns. Luna must
@@ -253,6 +301,27 @@ LUNA_APP_ID = "org.omarchy.luna"
 
 TERMINAL_BIN = "foot"                              # Omarchy's terminal
 HYPRCTL_BIN = "hyprctl"
+
+# --- What Luna can see of the desktop (lunad/context.py) -------------------
+#
+# Two different reads of the same compositor, with two different budgets.
+#
+# The focused-window line rides on *every* ask, so it is bounded hard: one
+# `hyprctl -j activewindow`, a second at the outside, and any failure at all
+# means the ask goes out without it. A context line is worth a few tokens; it
+# is not worth a question that does not get answered.
+#
+# `hyprctl -j activewindow` is a *query*. `hyprctl dispatch` on this machine
+# (Hyprland 0.56.2, Lua config) evaluates its arguments as Lua and is a
+# different and much sharper proposition — see dispatch.py. Nothing here
+# dispatches.
+#
+# The screenshot is only ever taken when a look was actually asked for, never
+# ambiently, and the file is deleted after the call whatever happens.
+
+GRIM_BIN = "grim"                                  # the screenshot tool here
+WINDOW_CONTEXT_TIMEOUT_S = 1.0                     # per ask, hard
+SCREENSHOT_TIMEOUT_S = 10.0                        # grim on a 1900x1016 window
 
 DISPATCH_TIMEOUT_S = 3600.0                        # a real job, not an ask
 DISPATCH_LINGER_S = 8.0                            # window stays up after exit
@@ -304,6 +373,57 @@ LOG_BACKUP_COUNT = 5
 # --- Recall ---------------------------------------------------------------
 
 RECALL_LIMIT = 6                                   # tier-2 episodes per prompt
+
+# --- Ambient awareness ----------------------------------------------------
+#
+# The three things Luna notices without being asked. See lunad/ambient.py for
+# what each hook watches and why it is cheap; these are the outward names it
+# reads, and every one of them is redirected by tests/_support.py so the suite
+# can never see a real coredump, a real battery or the real /usr/share.
+
+#: systemd-coredump's store, `Storage=external` (the default here). 0755
+#: root:root, so an unprivileged daemon can list it; each filename carries the
+#: comm, uid, pid and microsecond, which is why the hook never forks
+#: coredumpctl.
+COREDUMP_DIR = Path("/var/lib/systemd/coredump")
+
+#: Read, not assumed: the battery on this laptop is BAT1 (not BAT0) and reports
+#: energy rather than charge, so the watcher finds it by `type == "Battery"`.
+POWER_SUPPLY_DIR = Path("/sys/class/power_supply")
+
+#: `omarchy update` is pacman with `--overwrite '/usr/share/omarchy/*'`, not a
+#: git pull, so there is no HEAD to fingerprint. This file's contents *and*
+#: mtime are the fingerprint: a same-version reinstall still clobbers the tree.
+OMARCHY_VERSION_FILE = Path("/usr/share/omarchy/version")
+
+#: `omarchy-update` wraps its whole run in `script` and logs here, on tmpfs.
+#: A run that changed no package still moves this mtime; a reboot removes it,
+#: so its absence proves nothing.
+OMARCHY_UPDATE_LOG = Path("/tmp/omarchy-update.log")
+
+#: Omarchy ships its own crash announcer, `omarchy-crash-watch.service`, which
+#: streams the coredump MESSAGE_ID out of the journal and toasts
+#: "Process crashed: <comm>" with a click that runs `omarchy-agent-crash`
+#: against the same diagnose-crash skill. These two paths are exactly the
+#: condition that unit's own `ConditionPathExists=!` checks, so Luna can tell
+#: whether the desktop is already watching without forking `systemctl`.
+OMARCHY_CRASH_WATCH_UNIT = Path("/usr/lib/systemd/user/omarchy-crash-watch.service")
+OMARCHY_CRASH_TOGGLE_OFF = (
+    _xdg("XDG_STATE_HOME", HOME / ".local" / "state")
+    / "omarchy" / "toggles" / "crash-capture-off")
+
+#: What each watcher has already seen, so a daemon restart does not re-announce
+#: a fortnight of coredumps.
+AMBIENT_STATE_PATH = STATE_DIR / "ambient.json"
+
+AMBIENT_POLL_S = 60.0                 # `[ambient] poll_seconds`
+AMBIENT_UPDATE_EVERY_S = 300.0        # the update hook's own, slower cadence
+AMBIENT_BATTERY_LOW_PCT = 20          # above Omarchy's own 10% toast
+AMBIENT_BATTERY_CRITICAL_PCT = 5      # below it, above UPower's 2% hibernate
+AMBIENT_CRASH_BURST = 3               # more than this in one tick coalesces
+AMBIENT_RECENT_DUMPS = 64             # dump names remembered for de-duplication
+AMBIENT_HUD_TTL_S = 12.0              # seconds an ambient caption stays up
+AMBIENT_DIAGNOSE_TIMEOUT_S = 900.0    # ceiling on a dispatched crash diagnosis
 
 
 def ensure_dirs() -> None:

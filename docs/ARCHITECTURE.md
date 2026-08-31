@@ -3,8 +3,13 @@
 A resident personal assistant for Omarchy. Not a chatbot: a supervised daemon
 with a voice, a memory that compounds, and the run of the desktop.
 
-Status: Phases 0, 1 and 2 built and running, memory complete to all three
-tiers. Phase 3 is design.
+Status: Phases 0 through 2f built and running. Memory is complete to all
+three tiers, semantic recall included. Phase 3 is substantially built — bar
+widget, ambient hooks, semantic recall and the barge-in keybind are all live.
+What is left of it is worker fan-out as something Luna *decides* to do rather
+than something the admission gate merely allows, and wiring the `[ambient]`
+settings into the Jarvis GUI (Settings → jarvis-settings has no pane for them
+yet; see `docs/STATE-OF-PLAY.md`).
 Where reality contradicted the design, the design text has been corrected
 in place and the correction is marked **CORRECTED**.
 
@@ -14,7 +19,7 @@ in place and the correction is marked **CORRECTED**.
 
 | Constraint | Consequence |
 |---|---|
-| Ryzen 5 4500U, 7.1 GB RAM, no GPU/NPU | No local LLM as the brain. Cloud agent does the thinking. Only small models run locally (STT ~200 MB, TTS ~60 MB, embeddings ~90 MB). |
+| Ryzen 5 4500U, 7.1 GB RAM, no GPU/NPU | No local LLM as the brain. Cloud agent does the thinking. Only small models run locally (STT ~200 MB, TTS ~60 MB, embeddings ~90 MB — all *file* sizes; resident cost is 2-4× that, which is why each is unloaded when idle). |
 | ~3-4 GB RAM free in practice | Every resident process is budgeted. Total Luna footprint target: < 400 MB. |
 | Other Claude sessions run concurrently | Luna must never restart omarchy-shell, never kill agent processes she didn't spawn. |
 | `omarchy update` clobbers /usr/share/omarchy | Everything Luna owns lives under ~/.config, ~/.local, ~/Work/luna. |
@@ -60,7 +65,7 @@ allowlist. Nothing else in the package may deliver a signal (section 7).
 |---|---|---|---|
 | `lunad` | Python, systemd user unit | ~40 MB | Supervisor. Owns socket, queue, memory, state. Never calls an LLM directly for long jobs. |
 | piper worker | venv python, lazy + idle-unload | ~330 MB while loaded, 0 when idle | Spawned by `lunad`, so `lunad`'s cgroup reads ~470 MB while speaking and ~13 MB otherwise. Estimate of ~60 MB was WRONG. |
-| embeddings | sentence-transformers / ONNX | ~90 MB | Loaded lazily, unloaded after 5 min idle. |
+| embeddings | all-MiniLM-L6-v2 / onnxruntime | 86 MB file, 181 MB resident | Loaded lazily, unloaded after 5 min idle. Absent by default; see §4. |
 | voxtype | already running | ~208 MB | Untouched. We only add a post_process hook. |
 | agent session | foot + claude or codex | ~150-300 MB | Transient, only while working. Which CLI comes from `defaults/agent`; the runner script is written by that agent's adapter (section 6a). |
 
@@ -72,12 +77,20 @@ Every surface (voice, palette, hooks, CLI, bar widget) is a client. The daemon
 is the only thing that touches memory or spawns agents. This is what stops the
 system becoming four half-integrations that each grew their own state.
 
-Requests, as built: `ping`, `ask`, `say`, `speak.cancel`, `session.reset`,
+Requests, as built — this list is re-derived from `LunaServer.dispatch`'s own
+table in `lunad/server.py`, not carried forward from an earlier one: `ping`,
+`ask`, `look`, `say`, `speak.cancel`, `session.reset`, `codex.profile`,
 `status`, `memory.{read,write,search,profile,consolidate}`, `dispatch`,
-`jobs`, `peek`, `audit`, `spawned`, `cancel`, `shutdown`.
+`jobs`, `peek`, `audit`, `spawned`, `ambient`, `ambient.diagnose`,
+`settings.get`, `settings.set`, `confirm`, `cancel`, `shutdown`.
 `memory.read`/`memory.write` take an optional `namespace` (`luna` or `sol`);
 `memory.profile` and `memory.consolidate` are Luna's only — Sol's namespace is
 a working set for one job, not a model of a person.
+`look` takes an optional `scope` (§6b); `codex.profile` writes
+`~/.codex/luna.config.toml` for `luna codex-profile` (§6a); `ambient` /
+`ambient.diagnose` back `luna ambient` and the crash toast's one click (§7c);
+`settings.get` / `settings.set` back the whole config contract (§7b);
+`confirm` carries `list`, `yes`, `no` and the tool-side `ask` gate (§7a).
 `subscribe` (for the bar widget's live state) was dropped in favour of a state
 file — see below. `listen_start` was dropped too: the keybind talks to voxtype
 directly, so the daemon never needs to start a recording.
@@ -126,18 +139,188 @@ rather than truncate**. Overflow forces consolidation instead of letting the
 file rot into an unreadable log. Injected once, frozen at session start, so the
 KV-cache prefix stays valid for the whole session.
 
-### Tier 2 — episodic (searched on demand)
+### Tier 2 — episodic (searched on demand) — BUILT
 `~/.local/share/luna/memory/episodes.db` — SQLite.
 - `episodes` table: every exchange, with timestamp, surface, salience score.
 - FTS5 index for keyword recall ("what did we decide about the bar widget").
+- `episode_vectors` table: one 384-float BLOB per episode, for paraphrase
+  recall ("how much charge is left" against an episode that says "battery").
 - a `meta` side table, holding the consolidation watermark and nothing else.
-- `sqlite-vec` + a local 90 MB embedding model for semantic recall. **Still
-  Phase 3** — tier 2 is FTS5 keyword search only today.
 
 **This is our addition, not Hermes'.** Hermes has no native semantic retrieval;
 it outsources that to Honcho (Postgres + pgvector + a second LLM + a paid
 service). That is not viable here, and a local embedding index is strictly
 better than nothing.
+
+#### Why both halves exist
+
+FTS5 alone has a precision problem and a recall problem, and they were fixed
+in that order because the second fix is only safe once the first is in place.
+
+*Precision, fixed first.* A pure-OR query over every non-stopword token let
+the filler sentence "so anyway do you think I should do something about this"
+match **14 of 19** episodes in the real database, six of them on a single
+incidental word. `_content_tokens` now drops a large closed-class stopword
+list and refuses a query with no reasonably rare survivor at all; `search`
+requires every token in the same row (AND) before it will widen to OR; and
+`recall_block` refuses any hit whose **coverage** — the fraction of the
+query's content tokens actually present — is below 0.5. That query now
+matches **0 of 19**.
+
+*Recall, fixed second, and FTS5 structurally cannot do it.* "how much charge
+is left" retrieved **0 of 19** episodes while two of them were about the
+battery. "charge" and "battery" share no token and no stemmer relates them.
+Dictated and spoken input paraphrases constantly, so this is the common case,
+not an edge one.
+
+#### The embedding index
+
+`sentence-transformers/all-MiniLM-L6-v2` — Apache-2.0, compatible with this
+project's MIT licence and credited in the README — 384 dimensions, mean
+pooling, 86 MB of fp32 ONNX, run under **`onnxruntime` alone**: not
+sentence-transformers, not VoiceMem, and **not `sqlite-vec`**. With episodes
+in the hundreds-to-thousands a brute-force cosine over one float32 matrix is
+microseconds, so a native SQLite extension would be a build dependency, a
+packaging problem and an `omarchy update` hazard bought for nothing
+measurable. Vectors are BLOBs in the database that already exists.
+
+No new pip dependency either. The WordPiece tokenizer is ~100 deterministic
+lines of standard library over the model's own `vocab.txt` — `BertTokenizer`
+with the settings `tokenizer_config.json` actually declares — verified against
+published sentence-transformers reference pairs ("a man is eating food" /
+"a man is eating a piece of bread" = 0.755, "that is a happy person" / "today
+is a sunny day" = 0.257). The `tokenizers` package is a Rust wheel and is not
+installed.
+
+Same two-role shape as piper (§5), for the same reason: onnxruntime and numpy
+live only in `~/Work/luna/.venv` and lunad is stock system python. So
+`lunad/embed.py` is *imported* by the daemon as a stdlib subprocess manager
+and *executed as a script* by `config.VENV_PYTHON` as the worker that holds
+the model. Its package imports are guarded so the script half runs without
+them.
+
+#### How a paraphrase gets past the coverage floor without lowering it
+
+The floor stays at 0.5 and means the same thing on both sides: how much of
+what was asked about is actually in this episode. The lexical half measures it
+as a token ratio; the semantic half maps cosine onto the same line through two
+measured anchor points, and each episode keeps the **better** of its two
+readings.
+
+| cosine | coverage | why that anchor |
+|---|---|---|
+| ≤ 0.15 | 0.0 | not a neighbour; contributes nothing at all |
+| 0.29 | 0.5 | exactly the floor — see below |
+| ≥ 0.70 | 1.0 | saturated |
+
+0.29 sits in a gap that was measured rather than chosen. Over 13 labelled
+queries against the real 19-episode database — 8 with known-relevant
+episodes, 5 contentful-but-unrelated controls — the lowest true positive
+scored **0.311** and the highest false positive **0.269**, that FP being
+"what is on my screen right now?" answering "what terminal do I use", which is
+a near-miss rather than nonsense. The gap is narrow because the corpus is
+small; re-measure once tier 2 holds thousands of episodes.
+
+**A known rough edge, not fixed.** On the real database, "what terminal do I
+use" also injects episode 5 — four hundred repetitions of the word "word" —
+at coverage 0.50, because it OR-matched one of the query's two tokens. That is
+pre-existing *lexical* behaviour, unaffected by semantic recall (its cosine is
+0.00, so the embedding half contributes nothing to it). It is the strongest
+argument for eventually requiring some semantic agreement before an
+OR-widened hit is injected at all, but that would tighten recall for everyone
+and wants its own measurement rather than a reflexive tightening.
+
+Only the **user's turn** is embedded, not the whole exchange. Measured both
+ways: including Luna's reply recovers exactly one case out of thirteen and
+costs a false positive of the same magnitude, because her replies share a
+great deal of boilerplate with each other. It is also the wrong division of
+labour — FTS5 already indexes both sides, so making the vector cover the
+asker's phrasing gives the union two halves that fail differently.
+
+`search()` sorts in three tiers: coverage, then a hit that contains the words
+ahead of one that merely means the same, then the old `bm25` lifted by decayed
+salience. The middle tier is not a nicety: BM25's IDF collapses toward zero on
+a small corpus, so comparing it directly against a cosine would let a
+paraphrase outrank a literal keyword hit purely because the two numbers are on
+incomparable scales.
+
+#### Nothing may slow down an answer
+
+Recall happens on the ask path, so the discipline is `presence.py`'s.
+
+- **The first question after a restart never waits for the model.** A cold
+  `search` kicks an asynchronous warm-up and returns "no opinion" immediately;
+  the ask is answered on FTS5 alone. Cold start is 0.4 s and is never paid by
+  a question.
+- Once warm, every request carries a hard 250 ms timeout. Measured warm search
+  is **5.8 ms median, 6.8 ms p95** over the real database, including SQLite.
+- Nothing raises. A missing model, a broken venv, a wedged worker or a
+  malformed reply all come back as `{}`, and a failed spawn is *latched* so a
+  hopeless fork is not attempted once per question for the life of the daemon.
+- A content-free query searches neither index. The filler gate runs before
+  both, so the precision fix above cannot be undone by the semantic path, and
+  no model is ever asked about "so anyway do you think I should…".
+
+#### Cost, measured on this machine
+
+| | |
+|---|---|
+| model on disk | 86 MB (+ 226 KB of vocab) |
+| worker resident while loaded | **181 MB** steady, 198–296 MB peak during a backfill |
+| daemon-side cost | nil — the parent is stdlib and a pipe |
+| cold start to first query | 0.40 s, off the ask path |
+| warm query | 5.8 ms median, 6.8 ms p95, 250 ms hard ceiling |
+| per-episode indexing | 28 ms of one core (real corpus), 102 ms worst case |
+| per-episode storage | 1.5 KB |
+
+181 MB is more than the "~90 MB" this document budgeted, and the 90 MB was
+always the *file*, not the process — exactly as with piper, whose 61 MB voice
+costs 331 MB resident. onnxruntime and numpy are 48 MB before a model is
+loaded. Two things keep it honest: the CPU arena allocator is **disabled**
+(left on it never returns memory and a batched backfill permanently set the
+worker at 486 MB), and the worker is **unloaded after 5 minutes idle**, same
+policy as speech.
+
+#### Backfill
+
+Existing episodes have no vectors, and embedding them must never block an
+answer. A background thread, started lazily by the first semantic query, warms
+the worker, hands it the vectors it lacks, and then embeds what is missing in
+batches of four.
+
+- **Resumable by construction.** "What still needs embedding" is an anti-join
+  against `episode_vectors`, and each batch is committed before the next
+  starts. A kill at any point costs at most one batch; there is no cursor to
+  keep consistent and nothing to reset.
+- **Batches are small on purpose.** Batching buys nothing here — 102 ms per
+  episode at batch 1 against 126 ms at batch 32 — and costs memory linearly,
+  198 MB peak against 573 MB, because attention scales with batch × sequence².
+- **Power-aware.** Above 64 outstanding episodes it waits for mains: a
+  first-ever index over thousands is minutes of sustained full-core work for a
+  result nobody is waiting on. Catching up the handful recorded since the last
+  session runs anywhere, and a machine that reports no battery counts as
+  mains. `python3 -m lunad.embed backfill --force` overrides it.
+- The thread exits when it is done rather than looping, so it cannot hold the
+  model against the idle unload it is meant to respect.
+
+#### A fresh clone has no model
+
+Nothing downloads itself behind a question. `Embedder.available()` is false,
+semantic recall is silently off, FTS5 answers alone, and every test in the
+suite is in exactly that state — `tests/_support` points `config.VENV_PYTHON`
+at a path that cannot resolve and `Embedder.python()` reads it late, so the
+suite can neither fork a worker nor load onnxruntime.
+
+```
+python3 -m lunad.embed status      # is it there, is it on, is it warm
+python3 -m lunad.embed fetch       # ~86 MB, sha256-pinned, into ~/.local/share/luna/models/
+python3 -m lunad.embed backfill    # index old episodes now instead of in the background
+```
+
+`fetch` pins the sha256 of both files and only renames a download into place
+once it matches: a silently different model is a silently different index, and
+that would look like recall slowly getting worse rather than like anything
+breaking.
 
 ### Tier 3 — derived profile — BUILT
 `~/.local/share/luna/memory/profile.json` — regenerated from tier 2, never
@@ -478,15 +661,54 @@ Luna announces who she enrolled and why, in one line. The line is composed in
 and an API call would not get made. She does not delegate what she could finish
 in one step.
 
+### Self-dispatch — BUILT
+
+She delegates by doing it, not by offering to. `luna dispatch` already
+existed, was already audited, and already returns immediately — so Luna runs
+it herself, from her own shell, in the same turn: `luna dispatch --to sol
+"<task>"` by absolute path, because her shell is `lunad`'s and `lunad` is a
+systemd `--user` service whose `PATH` need not contain `~/.local/bin`. A bare
+`luna` would have worked when tested from the user's own terminal and failed
+from hers — the gap only shows up run from inside the daemon.
+
+**It has to work from inside a live ask, and that was verified rather than
+assumed.** `ReentrancyCase` stands up a real Unix socket, has the adapter open
+a second connection from inside `ask`, and reads the dispatch reply back while
+the outer request is still open. Nothing deadlocks:
+`ThreadingUnixStreamServer`, `daemon_threads`, and no lock held around
+`Daemon.dispatch`.
+
+**The result has to come back, or delegation is disappearance.** The toast
+already existed; the memory did not — a finding sat in `jobs/<id>/output.txt`
+where Luna would never read it, so a delegated job that succeeded was
+forgotten the moment it finished and the same question a week later
+dispatched the same job again. `ReportingDispatcher` (`lunad/server.py`), a
+subclass rather than a change to `dispatch.py` — the dispatcher owns
+terminals, pids and exit codes, not memory — writes a finished job into tier 2
+as an ordinary exchange: the task as the user's side, the output as hers. It
+is then retrieved by the ordinary recall path, with nobody having to name a
+job id.
+
+Dispatched jobs run `gpt-5.6-sol`, not whatever codex would otherwise have
+picked, and the Daemon hands its own agent name to the Dispatcher — without
+that, a self-dispatch from a codex-brained Luna would have been written in
+claude's flags, `~/.config/omarchy/defaults/agent`'s default, and every job
+would have quietly failed in the hidden workspace.
+
 ### How a job actually runs — BUILT, and not as designed
 
 `luna dispatch "..."` writes a job directory under
 `~/.local/share/luna/jobs/<id>/` (`task.txt`, `system.txt`, `run.sh`,
 `output.txt`, `stderr.txt`, `exit`, `job.json`), spawns `foot` running
-`run.sh`, and watches the pid. `run.sh` runs the configured agent with
-`--permission-mode bypassPermissions --tools default --safe-mode`, wrapped in
-`timeout`, piped through `tee`. `luna jobs` lists them newest first, from disk,
-so the list survives a daemon restart; `luna peek` toggles the workspace.
+`run.sh`, and watches the pid. `run.sh` runs whichever agent adapter is
+active, full autonomy either way — on codex (the default, §6a) that is
+`--dangerously-bypass-approvals-and-sandbox`; on claude it is
+`--permission-mode bypassPermissions --tools default --safe-mode` — wrapped in
+`timeout`, piped through `tee`. **Dispatch does not hard-code either agent's
+flags**: the runner script asks the active adapter for its own command line,
+which is what let the brain move from claude to codex (§6a) without touching
+this path. `luna jobs` lists them newest first, from disk, so the list
+survives a daemon restart; `luna peek` toggles the workspace.
 
 Four things the design got wrong, corrected here:
 
@@ -596,10 +818,54 @@ The two CLIs share almost nothing, and the differences are the design:
 | headless entry | `claude -p <prompt>` | `codex exec -` (prompt on stdin) |
 | system prompt | `--append-system-prompt` | **no such flag** — `-c developer_instructions=` |
 | machine output | `--output-format json`, one object | `--json`, JSONL events |
-| tool policy | `--tools ""` | the sandbox: `-s read-only` |
+| tool policy | `--tools ""` | the sandbox *is* the tool policy — see below |
 | user config off | `--safe-mode` | `--ignore-user-config --ignore-rules` |
 | session id | caller chooses, `--session-id` | codex assigns, read from `thread.started` |
 | cost | dollars, metered | none — ChatGPT subscription |
+
+**`[assistant] agent` now defaults to `codex`.** `~/.config/omarchy/defaults/
+agent` is not touched — it is the whole desktop's default and other things
+read it, so it stays the fallback rather than the source of truth — but
+Luna's own default is `codex`, model `gpt-5.6-luna` (`config.CODEX_ASK_MODEL`,
+an adapter default and deliberately not `[assistant] model`: a slug is not
+portable between agents, and pinning it in the config would be wrong the
+instant someone set `agent = "claude"`). Dispatched jobs, specialist or
+anonymous worker alike, run `gpt-5.6-sol` (`config.CODEX_DISPATCH_MODEL`) —
+Luna thinks, Sol works, and the model follows the role.
+
+### She has real tools on the ask path, and did not used to
+
+`CODEX_ASK_SANDBOX` was `"read-only"` and persona.py's closing text told the
+model so: *"You are running headless with no tools. You cannot read files, run
+commands, or inspect the machine right now."* Both were true and both were the
+wrong trade — asked for a version she said she could not check it; asked what
+was on screen she suggested starting the daemon, which was bad advice she had
+no way of knowing was bad, because nothing in her prompt said the daemon she
+runs inside has a dispatcher, a CLI and a pair of eyes. It is now `"bypass"`,
+same as the dispatch path, and the persona's closing text was rewritten to
+name the shell, files and the web instead of denying them. `claude`'s ask path
+still passes `--tools ""` and keeps the honest "no tools" text, chosen per
+adapter through `BaseAdapter.ask_has_tools` — deleting it there would only have
+moved the same lie one agent to the left.
+
+**`"bypass"` rather than `"danger-full-access"`, and the choice is about the
+mechanism, not about how much access she should have** — the user chose full
+autonomy and the audit log is the backstop for that regardless. Two reasons,
+both about how codex's flags actually behave (verified against 0.149.1
+`--help`, not assumed):
+
+- `codex exec resume` accepts no `-s`. Under a sandbox *mode* the policy has to
+  be restated as `-c sandbox_mode=…` on every resumed turn, and turn one and
+  turn two ending up under different policies is exactly the kind of mismatch
+  that is discovered in production, not in review.
+  `--dangerously-bypass-approvals-and-sandbox` is accepted identically by
+  `exec` and by `exec resume`, so there is nothing to keep in step across a
+  resume.
+- `danger-full-access` removes the sandbox but leaves the *approval* policy in
+  place, and an approval request in a headless turn is not a prompt anyone can
+  answer — it is a hung ask. `bypass` turns approvals off along with the
+  sandbox, which a headless daemon needs regardless of how permissive the
+  sandbox mode is.
 
 **The missing system-prompt flag is the whole problem.** Luna's persona and her
 frozen tier-1 block have to reach the model somehow. codex takes `-c key=value`
@@ -615,6 +881,38 @@ outright under `--strict-config`.
 is `None` and tokens are reported instead, because tokens are what was spent.
 The daemon only ever adds a truthy `cost_usd`, so a subscription reply moves
 the money counter by nothing, which is the truth.
+
+## 6b. Sight — `lunad/context.py` — BUILT
+
+Two reads of the same compositor, sharing one module because the second needs
+the first's geometry.
+
+**The focused-window line rides on every ask.** `hyprctl -j activewindow`
+gives one line — app-id, class, title, workspace — and it goes in the **user
+message**, never the system prompt. The system prompt is the cacheable
+prefix and must stay byte-identical between turns; a line that changes every
+time the user alt-tabs would invalidate it on every single ask, which is
+exactly the mistake tier-2 recall made (§4, "Prompt cost and the cacheable
+prefix") and exactly the cure. It costs about twenty tokens and cannot cost an
+answer: one query, a one-second ceiling, and every failure — no compositor, no
+focused window, `hyprctl` missing or hanging, output that is not JSON —
+degrades to `""` and the ask goes out without it.
+
+**`luna look "<question>"` is the explicit path, and only it takes a
+photograph.** `grim -g <geometry>` (geometry read from Hyprland's `at`/`size`)
+captures the focused window into a `mkdtemp()`, which is removed in a
+`finally` regardless of whether the call raised — an agent call that failed
+must not leave a picture of the user's screen behind on disk. The image
+reaches the model through `codex exec -i`, which `gpt-5.6-luna` reads
+natively: no second model, no vision service, and no OpenRouter call —
+OpenRouter is for text-to-speech and nothing else (§5a), and a test greps the
+module to keep it that way. Nothing is captured unless a look was actually
+asked for; an ordinary ask photographs nothing, on purpose, and there is a
+test that fails loudly if that ever stops being true. `BaseAdapter
+.accepts_images` lets a look through an agent that cannot take one say so,
+rather than silently dropping the image and answering from the window title
+alone — which is everything a model needs to confidently narrate a screen
+nobody looked at.
 
 ## 7. Safety under full autonomy — BUILT
 
@@ -658,6 +956,23 @@ every child is spawned through `safety.spawn`. The one deliberate exception is
 `signal_self`, the daemon stopping itself — `may_signal` refuses `getpid()`
 precisely so self-termination cannot be reached by accident.
 
+**`terminate()` used to return `True` right after sending `SIGKILL`, without
+checking the process actually died** — a process stuck in an uninterruptible
+kernel sleep survives `SIGKILL` too, and the caller had no way to know. It now
+confirms death with a bounded poll after each signal (`Popen.poll()` is a
+`waitpid(WNOHANG)` under the hood, so the check that notices death is the same
+call that reaps it — no window for a pid to slip through between "confirmed
+dead" and "reaped") and returns `False`, honestly, when even that cannot
+confirm it. `reap()` itself only ever edited the ledger; it never waited, and
+every "wait once, give up silently" call site was treating it as if it also
+reaped the child. `reap_after()` does an actual bounded wait and, if that is
+not enough, keeps trying on a background thread rather than abandoning the
+child as a permanent zombie — the fix for a bug where a hung `notify-send` or
+a wedged dispatched terminal leaked one zombie per occurrence, forever, until
+a restart. The pid-firewall invariant is unchanged by this: the fix only moves
+*when* the real reap happens, never what `may_signal()` checks, and a recycled
+pid is still caught by the start-time comparison even in the worst ordering.
+
 ### Audit log — `lunad/audit.py`
 
 `~/.local/share/luna/audit.jsonl`. Opened `"a"`, fsync'd per line, never
@@ -694,12 +1009,31 @@ second explicit instruction required. Judgement, not a prompt. This is persona,
 not code — the code enforces the pid boundary, not the other four.
 
 ### What is *not* enforced by code
-A dispatched session runs with `bypassPermissions` and real tools. It could
-write anywhere the user can. Sol's namespace isolation is enforced in `lunad`'s
+A dispatched session runs full-autonomy and real tools — `bypassPermissions`
+on claude, `--dangerously-bypass-approvals-and-sandbox` on codex (§6a) — either
+way, unsandboxed. It could write anywhere the user can. Sol's namespace
+isolation is enforced in `lunad`'s
 own memory API (`SolMemory.file` refuses `LUNA.md` and `USER.md` by name) and
 stated in his system prompt; it is not a filesystem sandbox, and this document
 says so rather than implying otherwise. The audit log is what makes that
 tolerable.
+
+**Open question: her own `ask` path has no code gate at all, dispatch has a
+thin one.** `CODEX_ASK_SANDBOX` is `"bypass"` (§6a), so a turn on her own ask
+path runs with no sandbox and a real shell. `op_ask`/`_ask` in `server.py`
+never calls `confirm.hard_denials`, `confirm.classify` or `confirm.gate` — the
+four hard denies bind that path only because `persona.py`'s `_CLOSING` states
+them as text the model is asked to obey. A dispatch is different in kind, not
+just in degree: `Dispatcher.spawn` (`dispatch.py`) runs `confirm.gate` against
+the task string *before* a job exists, so a task whose text trips
+`restart_omarchy_shell`, `delete_customisations` or `rm_rf_outside_own_dirs`
+is refused before anything is spawned — a real, if text-pattern and therefore
+evadable, code gate. Nothing equivalent exists for a command she decides to
+run herself mid-conversation; the daemon has no hook into what her own shell
+tool executes turn to turn, the way it does have a single task string to
+classify before a dispatch. The user chose full autonomy deliberately, and the
+audit log is the backstop for both paths regardless of which is gated — this
+is recorded as an open question, not an argument for changing it.
 
 ## 7a. Confirmation — `lunad/confirm.py` — BUILT
 
@@ -791,6 +1125,78 @@ machine — lunad accepts `VOXTYPE_WHISPER_API_KEY` as a fallback so nothing had
 to be copied out of a file that belongs to another program. `secrets_status()`
 reports whether a key exists and where it came from, never the key.
 
+## 7c. Ambient — `lunad/ambient.py` — BUILT
+
+Until this, Luna only ever existed when addressed: every path in the daemon
+starts with a request arriving on the socket. This is the first that starts
+with the machine instead — three hooks, and one rule that outranks all of
+them.
+
+**The rule: an ambient event notifies, it never speaks.** In the user's own
+words: *"I prefer notify only, unless I spoke to it first and it was coming
+back with an answer to a task that I gave beforehand."* A coredump, a flat
+battery and an `omarchy update` are none of those — they happened *to* the
+machine while the user was doing something else, and a voice interrupting
+that is exactly the failure mode they asked to avoid. This is enforced, not
+commented: `ambient.py` does not import `lunad.speech` and never will;
+`Ambient` only delivers through a `Notifier`, type-checked at construction, so
+a plain callable is refused; and `_assert_mute` walks everything hung off the
+`Ambient` object at construction and refuses any collaborator with a `.say()`
+or `.speak()` method. `tests/test_ambient.py::NeverSpeaksCase` walks the live
+object graph for a reachable speaker and fails if any of the three is ever
+weakened.
+
+**Three hooks, two of them off by default because the desktop already does
+the job:**
+
+- **Crash** (`[ambient] crash`, default **off**). `omarchy-crash-watch.service`
+  ships with Omarchy, is enabled, and already streams the coredump
+  `MESSAGE_ID` out of the journal — event-driven, no polling — dedupes crash
+  loops on a 60 s window, and toasts with a click that runs the same
+  `diagnose-crash` skill. It knows the signal name and the full executable
+  path, which a core *filename* does not, so it is strictly better at the
+  job. Luna's hook is kept for what the desktop's cannot do: the crash lands
+  in her **audit log** and the diagnosis in her **job list**, under her own
+  confirmation policy, and for anyone who has switched Omarchy's watcher off.
+  When it is on: one `stat()` on `/var/lib/systemd/coredump` per tick, a
+  `scandir` only when the mtime moves, and it never forks `coredumpctl`. The
+  toast's one click runs `luna ambient diagnose <pid>`, which dispatches an
+  agent session against the `diagnose-crash` skill — not automatic, because a
+  diagnosis is a real model call and a terminal window, and running one
+  unasked on every core dump would be Luna acting rather than noticing.
+- **Battery** (`[ambient] battery`, default **off**). Omarchy's own
+  `shell/plugins/services/battery/Service.qml` already polls every 30 s and
+  warns at 10%, with UPower hibernating at 2%; a second toast about the same
+  battery at the same moment is worse than none. The battery is found by
+  reading each `/sys/class/power_supply/*/type` for `Battery` rather than
+  assumed — on this laptop it is `BAT1`, not `BAT0`, with no `charge_now` at
+  all. Turning it on gets an *earlier* warning, deliberately either side of
+  Omarchy's own (20% / 5% against Omarchy's 10% and UPower's 2%).
+- **Update** (`[ambient] update`, default **on** — the one hook nothing else
+  on this machine watches). `omarchy update` is `pacman -Syu --overwrite
+  '/usr/share/omarchy/*'`, which rewrites that whole tree — exactly how a
+  customisation gets silently reverted. Two `stat()`s and a 12-byte read of
+  `/usr/share/omarchy/version` (contents *and* mtime, because a same-version
+  reinstall clobbers just as thoroughly) plus `/tmp/omarchy-update.log`.
+  Whether an update is merely *available* is deliberately not checked here —
+  that costs a `checkupdates` network sync, and Omarchy's own bar widget
+  already polls it every six hours and shows the answer.
+
+State persists in `~/.local/share/luna/ambient.json` so a restart does not
+re-announce a fortnight of coredumps, and every watcher seeds silently on its
+first run. Nothing in this module may raise into the daemon — the same
+contract as `presence.py`, for the same reason.
+
+**The HUD pane's message-file contract is implemented here.** The click-through
+Quickshell overlay itself lives on the machine, not in this repository —
+`~/.config/omarchy/plugins/ghost.lunahud/`, documented in
+`~/.config/omarchy/CUSTOMISATIONS.md` §8a.14 the same way the bar widget is
+referenced in `docs/STATE-OF-PLAY.md`. Its contract, `HANDOFF-hud.md`, is one
+JSON object atomically written to `$XDG_RUNTIME_DIR/luna/message` (sibling of
+`presence.py`'s `state` file) with a monotonically increasing `id`, which is
+what makes a message *new* to the reader; `ambient.py` is what publishes into
+it now, on the same notify-never-speak channel as the toasts.
+
 ## 8. Build phases
 
 | Phase | Ships | Verifiable by |
@@ -800,6 +1206,9 @@ reports whether a key exists and where it came from, never the key.
 | P2 | **DONE.** Workspace dispatch + Sol + audit log + PID firewall. | `luna dispatch "..."` runs in the `luna` special workspace and reports back; `luna spawned --check <foreign pid>` refuses. |
 | P2b | **DONE.** Jarvis: config file + hot reload, OpenRouter TTS with piper fallback, confirmation policy, name as a setting. | Edit `~/.config/jarvis/config.toml`, do not restart, hear the change. |
 | P2d | **DONE.** Tier 3 (the derived profile) and the tier-1 consolidation pass, wiring `[memory] consolidate_every_turns`. | `luna memory profile --rebuild` prints facts drawn from real episodes; a pass shows in `luna status` with what it cost. `luna memory consolidate [--dry-run]` runs one on demand, or shows what one would do without doing it. |
-| P3 | Bar widget, ambient hooks (crash/battery/update), semantic recall. | Crash a process, she explains it unprompted. |
+| — | **DONE.** The brain moved from claude to codex (`gpt-5.6-luna`), with real tools on the ask path — §6a. | `luna ask "what's my kernel version"` runs the command instead of declining. |
+| — | **DONE.** Sight (`luna look`, the focused-window context line) and self-dispatch (she runs `luna dispatch` on herself and the result comes back as memory) — §6, §6b. | `luna look "what's on screen"` describes the focused window; ask her to delegate something and the finding surfaces unprompted later. |
+| P3 | **DONE.** Bar widget (§3), ambient hooks — crash/battery/update, §7c — semantic recall (§4) and the `SUPER+F10` hush keybind. | Crash a process, she explains it unprompted (only if `[ambient] crash` is turned on — Omarchy's own watcher covers it by default). |
+| — | **Not built.** Worker fan-out as something Luna *plans* rather than something the admission gate merely allows; the `[ambient]` keys have no pane yet in the Jarvis GUI. | See `docs/STATE-OF-PLAY.md` §Next. |
 
 Each phase is independently useful and independently revertible.

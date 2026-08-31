@@ -99,6 +99,80 @@ class ProtocolTests(unittest.TestCase):
             protocol.decode(b"x" * (protocol.MAX_LINE_BYTES + 1))
 
 
+class _BoundedProbe:
+    """A file-like object standing in for ``rfile`` that records exactly what
+    ``readline(size)`` was asked for and always honours the cap — the way a
+    real buffered socket stream does — so a caller that forgot to bound its
+    own reads is caught here rather than only by the end result.
+    """
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._pos = 0
+        self.sizes_requested: list[Any] = []
+
+    def readline(self, size: int = -1) -> bytes:
+        self.sizes_requested.append(size)
+        if not isinstance(size, int) or size < 0:
+            raise AssertionError(
+                f"read_line must always pass a bounded size, got {size!r}")
+        # A real `readline(size)` stops at the first newline *within* the
+        # size-bounded window, not just at `size` bytes flat.
+        window = self._data[self._pos:self._pos + size]
+        nl = window.find(b"\n")
+        chunk = window[:nl + 1] if nl != -1 else window
+        self._pos += len(chunk)
+        return chunk
+
+
+class ReadLineTests(unittest.TestCase):
+    """``protocol.read_line``: the fix for the unbounded ``rfile.readline()``
+    in ``_Handler.handle()`` (server.py — see HANDOFF-core.md for the one-line
+    change that call site still needs).
+
+    ``decode()`` already rejected an oversized request, but only after the
+    whole line had been buffered — a client sending gigabytes with no newline
+    grew the daemon's memory by exactly that much first. These prove the read
+    itself is bounded, not just the rejection at the end.
+    """
+
+    def test_a_normal_line_is_returned_whole(self) -> None:
+        rfile = _BoundedProbe(b'{"op": "ping"}\n{"op": "next"}\n')
+        self.assertEqual(protocol.read_line(rfile), b'{"op": "ping"}\n')
+
+    def test_a_line_landing_exactly_on_the_limit_still_reads_its_newline(self):
+        line = b"a" * protocol.MAX_LINE_BYTES + b"\n"
+        rfile = _BoundedProbe(line)
+        self.assertEqual(protocol.read_line(rfile), line)
+
+    def test_an_oversized_line_with_no_newline_is_rejected(self) -> None:
+        # A client that never stops sending: three times the limit, and no
+        # newline anywhere in it.
+        huge = b"x" * (protocol.MAX_LINE_BYTES * 3)
+        rfile = _BoundedProbe(huge)
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.read_line(rfile)
+
+        # Bounded *while reading*: nothing close to the 3x-oversized input was
+        # ever pulled off the stream, and no single request for more than the
+        # line limit (plus one, so a line landing exactly on it still reads
+        # its own newline) was ever made.
+        self.assertLess(rfile._pos, protocol.MAX_LINE_BYTES * 2,
+                        "read_line buffered close to the whole oversized "
+                        "line before giving up")
+        for size in rfile.sizes_requested:
+            self.assertLessEqual(size, protocol.MAX_LINE_BYTES + 1)
+
+    def test_a_smaller_explicit_limit_is_honoured(self) -> None:
+        rfile = _BoundedProbe(b"abcdefghij\n")
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.read_line(rfile, max_bytes=5)
+        self.assertLessEqual(rfile._pos, 6)
+
+    def test_an_empty_stream_reads_as_an_empty_line(self) -> None:
+        self.assertEqual(protocol.read_line(_BoundedProbe(b"")), b"")
+
+
 class DaemonCase(TempMemoryCase):
     """A Daemon wired to temp state and a fake compositor.
 

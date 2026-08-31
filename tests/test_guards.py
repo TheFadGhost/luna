@@ -24,12 +24,17 @@ import shutil
 import unittest
 from pathlib import Path
 
-from ._support import (FORBIDDEN_APLAY, FORBIDDEN_HYPRCTL,
+from ._support import (FORBIDDEN_AMBIENT_STATE, FORBIDDEN_APLAY,
+                       FORBIDDEN_COREDUMP_DIR, FORBIDDEN_CRASH_TOGGLE_OFF,
+                       FORBIDDEN_CRASH_WATCH_UNIT, FORBIDDEN_GRIM,
+                       FORBIDDEN_HUD_MESSAGE, FORBIDDEN_HYPRCTL,
                        FORBIDDEN_JOBS_DIR, FORBIDDEN_NOTIFIER,
-                       FORBIDDEN_PYTHON, FORBIDDEN_STATE_FILE,
-                       FORBIDDEN_TERMINAL, FakeHyprland, TempMemoryCase)
+                       FORBIDDEN_OMARCHY_UPDATE_LOG, FORBIDDEN_OMARCHY_VERSION,
+                       FORBIDDEN_POWER_SUPPLY_DIR, FORBIDDEN_PYTHON,
+                       FORBIDDEN_STATE_FILE, FORBIDDEN_TERMINAL, FakeHyprland,
+                       TempMemoryCase)
 
-from lunad import config, confirm, dispatch, presence, speech
+from lunad import ambient, config, confirm, context, dispatch, presence, speech
 
 #: Every ``config`` name that reaches the outside world, and what it would do
 #: to the machine running the suite if it were the real thing.
@@ -39,6 +44,7 @@ DISARMED = {
     "APLAY_BIN": (FORBIDDEN_APLAY, "plays audio out of the user's speakers"),
     "HYPRCTL_BIN": (FORBIDDEN_HYPRCTL, "moves the user's workspaces"),
     "VENV_PYTHON": (FORBIDDEN_PYTHON, "forks a real 331 MB piper worker"),
+    "GRIM_BIN": (FORBIDDEN_GRIM, "photographs the user's screen"),
 }
 
 
@@ -140,6 +146,34 @@ class ConstructionCase(TempMemoryCase):
         self.assertEqual(d.notify_bin, "/bin/true")
 
 
+class SightCase(unittest.TestCase):
+    """Nothing in the suite may look at the machine it is running on.
+
+    Worse than the terminal and the notifier, because grim *is* installed here:
+    an unstubbed default would not fail, it would succeed, and the evidence
+    would be a PNG of whatever the person running the suite had open.
+    """
+
+    def test_a_look_cannot_photograph_the_users_screen(self) -> None:
+        with self.assertRaises(context.LookUnavailable) as caught:
+            with context.look("screen"):
+                self.fail("a screenshot was actually taken")
+        self.assertIn(FORBIDDEN_GRIM, str(caught.exception))
+
+    def test_the_compositor_is_not_queried_either(self) -> None:
+        # config.HYPRCTL_BIN is already a sentinel; this is the assertion that
+        # context.py reads it late rather than binding it, and that a
+        # compositor it cannot reach is "no context line" and never an
+        # exception on the ask path.
+        self.assertIsNone(context.focused_window())
+        self.assertEqual(context.context_line(), "")
+
+    def test_vision_reports_itself_unavailable(self) -> None:
+        ok, detail = context.available()
+        self.assertFalse(ok)
+        self.assertIn(FORBIDDEN_GRIM, detail)
+
+
 class PresenceFileCase(unittest.TestCase):
     """The state file the bar watches is not the user's.
 
@@ -160,6 +194,97 @@ class PresenceFileCase(unittest.TestCase):
         params = inspect.signature(presence.Presence.__init__).parameters
         self.assertIsNone(params["path"].default)
         self.assertEqual(presence.Presence().path, FORBIDDEN_STATE_FILE)
+
+
+class AmbientPathCase(TempMemoryCase):
+    """The ambient hooks must not see the real machine, in either direction.
+
+    Two directions, because ambient is the first subsystem in this package
+    that *reads* the outside world rather than only writing to it, and reading
+    the real thing is just as bad as writing it. Building a `Daemon` starts an
+    `Ambient`; against the live paths its first tick would walk the user's
+    actual coredumps and their actual `/usr/share/omarchy/version`, so the
+    suite would pass or fail depending on whether anything had crashed that
+    morning -- and a case that let one tick through would put a critical
+    "quickshell crashed" toast on the user's screen about a two-week-old dump.
+
+    The outputs matter for a subtler reason. `AMBIENT_STATE_PATH` records what
+    has already been seen; a test writing the real one would mark the user's
+    coredumps as old news and make the *live* daemon miss the next real crash.
+    """
+
+    INPUTS = {
+        "COREDUMP_DIR": (FORBIDDEN_COREDUMP_DIR,
+                         "walks the user's real core dumps"),
+        "POWER_SUPPLY_DIR": (FORBIDDEN_POWER_SUPPLY_DIR,
+                             "reads the user's real battery"),
+        "OMARCHY_VERSION_FILE": (FORBIDDEN_OMARCHY_VERSION,
+                                 "reads the live /usr/share/omarchy"),
+        "OMARCHY_UPDATE_LOG": (FORBIDDEN_OMARCHY_UPDATE_LOG,
+                               "reads the live update log"),
+        "OMARCHY_CRASH_WATCH_UNIT": (
+            FORBIDDEN_CRASH_WATCH_UNIT,
+            "makes the answer depend on whether this machine runs Omarchy"),
+        "OMARCHY_CRASH_TOGGLE_OFF": (
+            FORBIDDEN_CRASH_TOGGLE_OFF,
+            "makes the answer depend on the tester's own toggle"),
+    }
+    OUTPUTS = {
+        "AMBIENT_STATE_PATH": (FORBIDDEN_AMBIENT_STATE,
+                               "makes the live daemon miss the next crash"),
+        "HUD_MESSAGE_FILE": (FORBIDDEN_HUD_MESSAGE,
+                             "drops a caption on the user's HUD pane"),
+    }
+
+    def test_every_ambient_path_is_redirected(self) -> None:
+        for name, (sentinel, harm) in {**self.INPUTS, **self.OUTPUTS}.items():
+            with self.subTest(name=name):
+                self.assertEqual(getattr(config, name), sentinel,
+                                 f"config.{name} is live; it {harm}")
+                self.assertFalse(str(sentinel).startswith("/var"), name)
+                self.assertFalse(str(sentinel).startswith("/sys"), name)
+                self.assertFalse(str(sentinel).startswith("/usr"), name)
+                self.assertFalse(str(sentinel).startswith(str(Path.home())),
+                                 name)
+
+    def test_the_watchers_read_their_paths_late(self) -> None:
+        # Same regression as every other name in this file: a path captured in
+        # a signature default is fixed at import and the redirect above can
+        # never reach it.
+        for func, names in ((ambient.CrashWatcher.__init__, ("directory",)),
+                            (ambient.BatteryWatcher.__init__, ("directory",)),
+                            (ambient.UpdateWatcher.__init__,
+                             ("version", "log_path")),
+                            (ambient.HudWriter.__init__, ("path",))):
+            params = inspect.signature(func).parameters
+            for name in names:
+                with self.subTest(func=func.__qualname__, param=name):
+                    self.assertIsNone(params[name].default,
+                                      f"{func.__qualname__}({name}=...) is "
+                                      "bound at import")
+        self.assertEqual(ambient.CrashWatcher({}).directory,
+                         FORBIDDEN_COREDUMP_DIR)
+        self.assertEqual(ambient.BatteryWatcher({}).directory,
+                         FORBIDDEN_POWER_SUPPLY_DIR)
+        self.assertEqual(ambient.UpdateWatcher({}).version_file,
+                         FORBIDDEN_OMARCHY_VERSION)
+        self.assertEqual(ambient.HudWriter().path, FORBIDDEN_HUD_MESSAGE)
+
+    def test_a_default_ambient_is_pointed_at_the_throwaway_state(self) -> None:
+        amb = ambient.Ambient(notifier=ambient.Notifier(), audit=self.audit,
+                              settings=self.settings)
+        self.addCleanup(amb.close)
+        self.assertEqual(amb._state_path, FORBIDDEN_AMBIENT_STATE)
+        self.assertEqual(amb.notifier.notify_bin, FORBIDDEN_NOTIFIER)
+
+    def test_a_tick_against_the_sentinels_finds_and_sends_nothing(self) -> None:
+        """The live-fire version: real watchers, real delivery, no desktop."""
+        amb = ambient.Ambient(notifier=ambient.Notifier(), audit=self.audit,
+                              settings=self.settings,
+                              state_path=self.root / "ambient.json")
+        self.addCleanup(amb.close)
+        self.assertEqual(amb.tick(now=0.0), 0)
+        self.assertEqual(amb.tick(now=10_000.0), 0)
 
 
 class LiveFireCase(TempMemoryCase):

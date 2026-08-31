@@ -4,13 +4,17 @@
 A thin, dependency-free socket client. It holds no state and knows nothing
 about memory or agents: everything happens in the daemon, which is the whole
 point of the socket (ARCHITECTURE.md section 3).
+
+What it *does* own is how any of that looks in a terminal. The rules are in
+``lunad/render.py`` and the short version is: alignment instead of boxes,
+weight instead of colour, one colour and it means something is wrong, and
+nothing but bytes when stdout is not a terminal.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import socket
 import sys
 import uuid
@@ -18,11 +22,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lunad import config  # noqa: E402
+from lunad import config, render  # noqa: E402
 
-BOLD, DIM, RESET = "\033[1m", "\033[2m", "\033[0m"
-if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
-    BOLD = DIM = RESET = ""
+#: Decided once, at start-up, from the real stdout: colour, width, alphabet.
+#: Every renderer below takes it as an argument or reads it here, so a test can
+#: replace it with a fixed one and assert on exact columns.
+S = render.Style.detect()
+
+#: A reply larger than this is a daemon that has lost its mind, not an answer.
+#: The same ceiling the GUI client uses.
+MAX_REPLY_BYTES = 8 << 20
 
 NOT_RUNNING = f"""\
 luna: the daemon is not running (no listener on {config.SOCKET_PATH}).
@@ -58,26 +67,88 @@ class Client:
         return self
 
     def __exit__(self, *exc: object) -> None:
+        # Closing a buffered writer flushes it, and flushing to a peer that
+        # has gone raises. Unguarded, that turns the clean exit `call()` just
+        # arranged back into the traceback it was avoiding — the failure is
+        # already reported, and there is nothing left to say about a socket
+        # nobody is reading.
         if self.fh:
-            self.fh.close()
+            try:
+                self.fh.close()
+            except OSError:
+                pass
         if self.sock:
-            self.sock.close()
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _died(detail: str, sample: bytes = b"") -> "None":
+        """Every way the far end can fail ends here, and ends the same way.
+
+        A client for a daemon that can be killed mid-sentence has to treat a
+        half-written reply as an ordinary outcome, because it is one:
+        `systemctl restart lunad` while a request is in flight produces a
+        non-empty line with no newline on it, which the EOF guard does not
+        catch and `json.loads` turns into a traceback. A traceback is the one
+        answer that tells the user nothing about what happened — this file
+        prints prose everywhere else, and it is not going to make an exception
+        for the case where something actually went wrong.
+        """
+        sys.stderr.write(f"luna: {detail}.\n")
+        if sample:
+            text = sample.decode("utf-8", "replace").replace("\n", " ")
+            sys.stderr.write(f"  it said: {render.fit(text, 100, S)}\n")
+        sys.stderr.write("  what happened is in `luna log` and "
+                         "`systemctl --user status lunad`.\n")
+        raise SystemExit(70)  # EX_SOFTWARE
 
     def call(self, op: str, **payload: object) -> dict:
         assert self.fh is not None
         request = {"op": op, "id": uuid.uuid4().hex[:12], **payload}
-        self.fh.write((json.dumps(request) + "\n").encode())
-        self.fh.flush()
-        line = self.fh.readline()
+        try:
+            self.fh.write((json.dumps(request) + "\n").encode())
+            self.fh.flush()
+        except socket.timeout:
+            raise
+        except OSError as exc:
+            self._died(f"the daemon went away while the {op} request was "
+                       f"being sent ({exc})")
+        # Bounded: `readline()` on a socket with no ceiling is a promise to
+        # buffer whatever arrives, and the one thing that could send an
+        # unbounded line is the process that has just started misbehaving.
+        try:
+            line = self.fh.readline(MAX_REPLY_BYTES + 1)
+        except socket.timeout:
+            raise
+        except OSError as exc:
+            self._died(f"the connection broke while the {op} reply was being "
+                       f"read ({exc})")
         if not line:
-            sys.stderr.write("luna: the daemon closed the connection mid-request. "
-                             "Check `luna log`.\n")
-            raise SystemExit(70)
-        return json.loads(line)
+            self._died(f"the daemon closed the connection during {op} without "
+                       f"answering")
+        if not line.endswith(b"\n"):
+            if len(line) > MAX_REPLY_BYTES:
+                self._died(f"the daemon's {op} reply is over "
+                           f"{render.human_bytes(MAX_REPLY_BYTES)} and was not "
+                           f"read")
+            self._died(f"the daemon stopped writing partway through its {op} "
+                       f"reply — it was killed or it crashed mid-sentence",
+                       sample=line[:160])
+        try:
+            reply = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._died(f"the daemon's {op} reply could not be read as JSON "
+                       f"({exc})", sample=line[:160])
+        if not isinstance(reply, dict):
+            self._died(f"the daemon's {op} reply was {type(reply).__name__}, "
+                       f"not an object")
+        return reply
 
 
 def fail(resp: dict) -> int:
-    sys.stderr.write(f"luna: {resp.get('error', 'Error')}: "
+    sys.stderr.write(f"luna: {S.alert(resp.get('error', 'Error'))}: "
                      f"{resp.get('message', '(no detail)')}\n")
     for key in ("usage_pct", "overflow", "returncode", "stderr", "sample"):
         if key in resp:
@@ -85,13 +156,49 @@ def fail(resp: dict) -> int:
     return 1
 
 
+def _from_stdin(words: list[str], verb: str, example: str) -> str | None:
+    """The words on the command line, or the pipe — but never the keyboard.
+
+    With neither, this used to sit on `stdin.read()` and wait for a terminal
+    that is not sending anything, which from the outside is indistinguishable
+    from a daemon that has hung. `isatty` is the whole difference between a
+    pipe with nothing in it yet and a person who typed the command wrong, and
+    the person gets told rather than blocked.
+    """
+    text = " ".join(words).strip()
+    if text:
+        return text
+    if sys.stdin.isatty():
+        sys.stderr.write(f"luna: nothing to {verb}.\n"
+                         f"  {example}\n"
+                         f"  ... | luna {verb}   reads it from the pipe\n")
+        return None
+    text = sys.stdin.read().strip()
+    if not text:
+        sys.stderr.write(f"luna: nothing to {verb} — the pipe was empty.\n")
+        return None
+    return text
+
+
 # --------------------------------------------------------------------------
 
 
+def _meta(*parts: object) -> None:
+    """The dim provenance line: model, latency, cost. Always stderr.
+
+    stderr because it is *about* the answer rather than part of it, so
+    `luna ask ... > file` gets the reply and the person still sees what it
+    cost.
+    """
+    bits = render.join(S, parts)
+    if bits:
+        sys.stdout.flush()          # or the footer overtakes what it follows
+        sys.stderr.write(f"{S.dim('[' + bits + ']')}\n")
+
+
 def cmd_ask(args: argparse.Namespace) -> int:
-    prompt = " ".join(args.prompt).strip() or sys.stdin.read().strip()
-    if not prompt:
-        sys.stderr.write("luna: nothing to ask\n")
+    prompt = _from_stdin(args.prompt, "ask", 'luna ask "what is the bar called"')
+    if prompt is None:
         return 2
     with Client(timeout=args.timeout + 30) as client:
         request_id = uuid.uuid4().hex[:12]
@@ -113,24 +220,61 @@ def cmd_ask(args: argparse.Namespace) -> int:
         return 0 if resp.get("ok") else 1
     if not resp.get("ok"):
         return fail(resp)
+    # Verbatim, and deliberately so. The reply is the payload: something is
+    # piping this, and a client that reflowed a model's code block to the
+    # terminal width would corrupt it for the sake of looking tidy.
     print(resp["reply"])
     if args.verbose:
         cost = resp.get("cost_usd")
-        bits = [str(resp.get("model") or resp.get("agent")),
-                f"{resp.get('wall_ms', 0) / 1000:.1f}s"]
-        if cost is not None:
-            bits.append(f"${cost:.4f}")
-        if resp.get("recalled"):
-            bits.append("recalled")
-        bits.append("resumed" if resp.get("resumed") else "new session")
-        sys.stderr.write(f"{DIM}[{' · '.join(bits)}]{RESET}\n")
+        _meta(resp.get("model") or resp.get("agent"),
+              f"{resp.get('wall_ms', 0) / 1000:.1f}s",
+              render.money(cost) if cost is not None else None,
+              "recalled" if resp.get("recalled") else None,
+              "resumed" if resp.get("resumed") else "new session")
+    return 0
+
+
+def cmd_look(args: argparse.Namespace) -> int:
+    """Show Luna the screen and ask her about it.
+
+    An ask with a picture attached, not a separate mode: same conversation,
+    same memory, same episode written afterwards. The screenshot is taken by
+    the daemon at the moment of the call and deleted when it returns — there is
+    no ambient capture and no file left behind.
+    """
+    question = " ".join(args.question).strip()
+    with Client(timeout=args.timeout + 30) as client:
+        request_id = uuid.uuid4().hex[:12]
+        try:
+            payload = {"scope": args.scope, "timeout": args.timeout,
+                       "id": request_id, "surface": args.surface,
+                       "remember": not args.no_remember,
+                       "conversation": args.conversation}
+            if question:
+                payload["prompt"] = question
+            if args.speak:
+                payload["speak"] = True
+            resp = client.call("look", **payload)
+        except KeyboardInterrupt:
+            with Client(timeout=10) as c2:
+                c2.call("cancel", target=request_id)
+            sys.stderr.write("\nluna: cancelled\n")
+            return 130
+    if args.json:
+        print(json.dumps(resp, indent=2))
+        return 0 if resp.get("ok") else 1
+    if not resp.get("ok"):
+        return fail(resp)
+    print(resp["reply"])
+    if args.verbose:
+        _meta(resp.get("model") or resp.get("agent"), args.scope,
+              f"{resp.get('wall_ms', 0) / 1000:.1f}s")
     return 0
 
 
 def cmd_say(args: argparse.Namespace) -> int:
-    text = " ".join(args.text).strip() or sys.stdin.read().strip()
-    if not text:
-        sys.stderr.write("luna: nothing to say\n")
+    text = _from_stdin(args.text, "say", 'luna say "the build is green"')
+    if text is None:
         return 2
     with Client(timeout=args.timeout + 30) as client:
         resp = client.call("say", text=text, wait=args.wait,
@@ -143,17 +287,14 @@ def cmd_say(args: argparse.Namespace) -> int:
     if not resp.get("sentences"):
         sys.stderr.write(f"luna: {resp.get('note', 'nothing speakable')}\n")
         return 1
-    bits = [f"{resp['sentences']} sentence(s)"]
-    if resp.get("provider"):
-        bits.append(str(resp["provider"]))
-    if resp.get("sample_rate"):
-        bits.append(f"{resp['sample_rate']} Hz")
-    if resp.get("first_audio_ms") is not None:
-        bits.append(f"first audio {resp['first_audio_ms']} ms")
-    if resp.get("total_ms") is not None:
-        bits.append(f"total {resp['total_ms']} ms")
     print(resp["spoken"])
-    sys.stderr.write(f"{DIM}[{' · '.join(bits)}]{RESET}\n")
+    _meta(render.count(resp["sentences"], "sentence"),
+          resp.get("provider"),
+          f"{resp['sample_rate']} Hz" if resp.get("sample_rate") else None,
+          (f"first audio {resp['first_audio_ms']} ms"
+           if resp.get("first_audio_ms") is not None else None),
+          (f"total {resp['total_ms']} ms"
+           if resp.get("total_ms") is not None else None))
     return 0
 
 
@@ -171,7 +312,7 @@ def cmd_session(args: argparse.Namespace) -> int:
         resp = client.call("session.reset", conversation=args.conversation)
     if not resp.get("ok"):
         return fail(resp)
-    print(f"dropped {resp['dropped']} session(s)")
+    print(f"dropped {render.count(resp['dropped'], 'session')}")
     return 0
 
 
@@ -180,19 +321,33 @@ def cmd_codex_profile(args: argparse.Namespace) -> int:
         resp = client.call("codex.profile")
     if not resp.get("ok"):
         return fail(resp)
-    print(f"wrote {resp['path']}\nuse it with: {resp['usage']}")
+    print(f"wrote {resp['path']}")
+    print(f"{S.dim('use it with')}  {resp['usage']}")
     return 0
 
 
-def _meter(pct: float, width: int = 20) -> str:
-    """The occupancy bar, in the one place that draws it.
+# =========================================================================
+# status — the one screen that answers "what is she doing, and what is it
+# costing me"
+# =========================================================================
 
-    Shared between `luna status` and the consolidation report so that a file
-    at 61% looks the same in both. Two bars drawn from the same number by two
-    pieces of code is a difference waiting to happen.
+
+def _tier1_rows(tier1: dict, style: render.Style) -> list[str]:
+    """The curated files, as one aligned sub-table.
+
+    The meter is the only picture in the whole program and it earns its place:
+    the number that matters about a tier-1 file is how close it is to the cap
+    that will start rejecting writes, and a percentage read as text does not
+    say "nearly full" the way a bar does.
     """
-    filled = min(width, int(width * pct / 100))
-    return "#" * filled + "." * (width - filled)
+    bar = 10 if style.narrow else 18
+    rows = []
+    for name, u in tier1.items():
+        rows.append([style.bold(name), render.meter(u["pct"], bar, style),
+                     f"{u['pct']:.0f}%",
+                     f"{u['chars']}/{u['cap']}" + ("" if style.narrow else " chars"),
+                     render.count(u["entries"], "entry", "entries")])
+    return render.columns(rows, style, gap=2, align="llrrl")
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -203,88 +358,179 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 0 if resp.get("ok") else 1
     if not resp.get("ok"):
         return fail(resp)
+    print(_status_text(resp, S))
+    return 0
+
+
+def _status_text(resp: dict, style: render.Style) -> str:
+    """Everything `luna status` prints, as one string, from one dict.
+
+    A pure function of the reply so the layout can be asserted without a
+    daemon: what this returns is exactly what reaches the terminal.
+    """
     d, a, m, act = resp["daemon"], resp["agent"], resp["memory"], resp["activity"]
-    print(f"{BOLD}lunad{RESET} {d['version']}  pid {d['pid']}  "
-          f"up {d['uptime_s']:.0f}s  threads {d['threads']}")
-    print(f"  socket   {d['socket']}")
-    print(f"  agent    {a['name']} "
-          f"({'ready' if a['available'] else 'UNAVAILABLE'}) — {a['detail']}")
-    for name, u in m["tier1"].items():
-        print(f"  {name:<8} [{_meter(u['pct'])}] "
-              f"{u['chars']}/{u['cap']} chars "
-              f"({u['pct']}%) · {u['entries']} entries")
-    t2 = m["tier2"]
-    print(f"  episodes {t2['episodes']} rows, {t2['size_bytes']} bytes, "
-          f"mean salience {t2['mean_salience']}")
-    t3 = m.get("tier3") or {}
-    if t3.get("exists"):
-        print(f"  profile  {t3.get('facts', 0)} fact(s) in "
-              f"{len(t3.get('slots') or [])} slot(s), "
-              f"{t3.get('corrections', 0)} correction(s), from "
-              f"{t3.get('episodes', 0)} episodes "
-              f"{DIM}(rebuilt {t3.get('iso') or '?'}){RESET}")
-    else:
-        print(f"  profile  {DIM}not built yet — "
-              f"luna memory profile --rebuild{RESET}")
-    con = resp.get("consolidation") or {}
-    if con.get("enabled"):
-        print(f"  consolidate every {con['every_turns']} turns "
-              f"({con['turns_since']} since) · {con['passes']} pass(es), "
-              f"{con['added']} added, {con['removed']} removed, "
-              f"${con['cost_usd']:.4f}"
-              + (f", {con['previews']} dry run(s)" if con.get("previews")
-                 else "")
-              + (" · RUNNING" if con.get("running") else ""))
-    else:
-        print(f"  consolidate {DIM}off "
-              f"([memory] consolidate_every_turns = 0)"
-              f"{RESET}")
-    print(f"  activity {act['counters']['ask']} asks, "
-          f"{act['counters']['errors']} errors, "
-          f"{len(act['in_flight'])} in flight, "
-          f"${act['session_cost_usd']:.4f} this session")
-    for run in act["in_flight"]:
-        print(f"    - {run['id']} {run['age_s']}s  {run['prompt']!r}")
+    out: list[str] = []
+    out.append(f"{style.bold('lunad')} {d['version']}  "
+               + style.dim(render.join(style, [
+                   f"pid {d['pid']}",
+                   f"up {render.human_duration(d['uptime_s'])}",
+                   render.count(d["threads"], "thread")])))
+    out.append(style.rule(min(style.width, 88)))
+
+    b = render.Block(style)
+
+    # What she is, and what she can do this session. `tools` is the line worth
+    # reading: it is what her operating notes were written against, and an
+    # assistant whose prompt says she has a shell when this says no is the
+    # failure this whole section exists to remove — so it is the one thing
+    # here that gets the colour.
+    ready = a["available"]
+    b.add("agent", style.bold(a["name"]),
+          "ready" if ready else style.alert("UNAVAILABLE"),
+          str(a.get("model") or "agent default"),
+          "tools" if a.get("tools") else style.alert("no tools"),
+          f"sandbox {a['sandbox']}" if a.get("sandbox") else None,
+          alert=not ready)
+    vis = resp.get("vision") or {}
+    seen = ("can see" if vis.get("available")
+            else f"cannot see ({vis.get('detail', 'unknown')})")
+    where = render.fit(a.get("detail", ""), max(20, style.width - 40), style)
+    b.cont(style.dim(render.join(style, [seen, where])))
+    b.add("socket", style.dim(d["socket"]))
 
     sp = resp.get("speech") or {}
-    state = "speaking" if sp.get("speaking") else (
-        "loaded" if sp.get("loaded") else "unloaded")
-    print(f"  speech   {sp.get('voice')} — {state}"
-          + (f", pid {sp['pid']}, {sp.get('load_ms')} ms load" if sp.get("pid")
-             else f", unloads after {sp.get('idle_unload_s', 0):.0f}s idle"))
+    if sp:
+        state = "speaking" if sp.get("speaking") else (
+            "loaded" if sp.get("loaded") else "unloaded")
+        b.add("speech", sp.get("voice"), state,
+              (f"pid {sp['pid']}, {sp.get('load_ms')} ms load" if sp.get("pid")
+               else style.dim("unloads after "
+                              f"{render.human_duration(sp.get('idle_unload_s', 0))}"
+                              " idle")))
+
+    b.blank()
+    for i, row in enumerate(_tier1_rows(m["tier1"], style)):
+        if i == 0:
+            b.add("memory", row)
+        else:
+            b.cont(row)
+    t2 = m["tier2"]
+    b.cont(f"{style.bold('episodes')} "
+           + render.join(style, [render.count(t2["episodes"], "row"),
+                                 render.human_bytes(t2["size_bytes"]),
+                                 f"mean salience {t2['mean_salience']}"]))
+    # Additive: an older daemon does not report vectors at all, and a line
+    # that says "0 embedded" when the daemon simply cannot count them would
+    # be a lie about tier 2 rather than a gap in it.
+    if t2.get("vectors") is not None:
+        pending = t2.get("vectors_pending") or 0
+        b.cont(f"{style.bold('recall')}   "
+               + render.join(style, [
+                   f"{t2['vectors']} embedded",
+                   f"{pending} still keyword-only" if pending else None,
+                   style.dim("luna embed status")]))
+    t3 = m.get("tier3") or {}
+    if t3.get("exists"):
+        # At 80 columns the slot and correction counts are what goes: they are
+        # the second question about the profile, and a line that runs off the
+        # edge answers none of them.
+        rebuilt = str(t3.get("iso") or "?")
+        facts = [f"{render.count(t3.get('facts', 0), 'fact')} in "
+                 f"{render.count(len(t3.get('slots') or []), 'slot')}",
+                 render.count(t3.get("corrections", 0), "correction"),
+                 f"from {render.count(t3.get('episodes', 0), 'episode')}"]
+        if style.narrow:
+            facts = [render.count(t3.get("facts", 0), "fact"), facts[-1]]
+            rebuilt = rebuilt.split(" ")[0]
+        b.cont(f"{style.bold('profile')}  "
+               + render.join(style, facts + [style.dim(f"rebuilt {rebuilt}")]))
+    else:
+        b.cont(f"{style.bold('profile')}  "
+               + style.dim("not built yet — luna memory profile --rebuild"))
+
+    b.blank()
+    b.add("spend", render.money(act["session_cost_usd"]) + " this session",
+          render.count(act["counters"]["ask"], "ask"),
+          render.count(act["counters"]["errors"], "error"),
+          f"{len(act['in_flight'])} in flight")
+    for run in act["in_flight"]:
+        b.cont(f"{style.bold(run['id'])} {run['age_s']}s  "
+               + render.fit(str(run["prompt"]), max(20, style.width - 30), style))
+    con = resp.get("consolidation") or {}
+    if con.get("enabled"):
+        b.add("consolidate",
+              f"every {con['every_turns']} turns, {con['turns_since']} since",
+              render.count(con["passes"], "pass", "passes"),
+              f"+{con['added']} {'−' if style.unicode else '-'}{con['removed']}",
+              render.money(con["cost_usd"]),
+              (render.count(con["previews"], "dry run")
+               if con.get("previews") else None),
+              style.alert("RUNNING") if con.get("running") else None)
+    else:
+        b.add("consolidate",
+              style.dim("off ([memory] consolidate_every_turns = 0)"))
+
+    b.blank()
     dsp = resp.get("dispatch") or {}
     ws = dsp.get("workspace") or {}
     waiting = dsp.get("queued") or []
     if ws.get("available"):
-        print(f"  workspace {ws['workspace']} — "
-              f"{'visible' if ws.get('visible') else 'hidden'}, "
-              f"{ws.get('windows', 0)} window(s), "
-              f"{len(dsp.get('running', []))} of "
-              f"{dsp.get('max_parallel', 1)} job(s) running"
-              + (f", {len(waiting)} queued" if waiting else ""))
+        b.add("workspace", ws["workspace"],
+              "visible" if ws.get("visible") else "hidden",
+              render.count(ws.get("windows", 0), "window"),
+              f"{len(dsp.get('running', []))} of {dsp.get('max_parallel', 1)} "
+              f"running",
+              f"{len(waiting)} queued" if waiting else None)
     else:
-        print(f"  workspace unavailable — {ws.get('detail', '?')}")
+        b.add("workspace", style.alert("unavailable"),
+              style.dim(ws.get("detail", "?")))
     for job in dsp.get("running", []):
-        print(f"    - {job['id']} → {job['to']} {job['elapsed_s']}s "
-              f"{job['task'][:60]!r}")
+        b.cont(f"{style.bold(job['id'])} → {job['to']} {job['elapsed_s']}s  "
+               + render.fit(job["task"], max(20, style.width - 34), style))
     for job in waiting:
-        print(f"    - {job['id']} → {job['to']} queued {job['queued_s']}s "
-              f"{job['task'][:60]!r}")
+        b.cont(f"{style.bold(job['id'])} → {job['to']} "
+               f"queued {job['queued_s']}s  "
+               + render.fit(job["task"], max(20, style.width - 40), style))
+
     spawned = resp.get("spawned") or {}
     aud = resp.get("audit") or {}
-    print(f"  firewall {spawned.get('tracked', 0)} pid(s) tracked, "
-          f"{spawned.get('refusals', 0)} refusal(s) · "
-          f"audit {aud.get('size_bytes', 0)} bytes")
+    refusals = spawned.get("refusals", 0)
+    b.add("firewall", render.count(spawned.get("tracked", 0), "pid") + " tracked",
+          (style.alert(render.count(refusals, "refusal")) if refusals
+           else render.count(0, "refusal")),
+          style.dim(f"audit {render.human_bytes(aud.get('size_bytes', 0))}"))
+
+    amb = resp.get("ambient") or {}
+    if amb:
+        # One line, and it says "notify" out loud: the whole contract of this
+        # subsystem is that it never speaks, and a status that did not say so
+        # would leave the user guessing what she is allowed to do unprompted.
+        watching = [n for n, w in (amb.get("watchers") or {}).items()
+                    if w.get("enabled")]
+        b.add("ambient",
+              "watching " + ", ".join(watching) if watching
+              else style.dim("nothing enabled"),
+              style.dim("notify only, never speaks"),
+              style.dim(f"{amb.get('delivered', 0)} since start"))
 
     se = resp.get("sessions") or {}
     c = se.get("counters", {})
-    print(f"  sessions {len(se.get('live', []))} live · "
-          f"{c.get('new', 0)} new, {c.get('resumed', 0)} resumed, "
-          f"{c.get('retired', 0)} retired")
+    b.add("sessions", f"{len(se.get('live', []))} live",
+          style.dim(f"{c.get('new', 0)} new, {c.get('resumed', 0)} resumed, "
+                    f"{c.get('retired', 0)} retired"))
     for live in se.get("live", []):
-        print(f"    - {live['key']}: {live['turns']} turns, "
-              f"idle {live['idle_s']:.0f}s, ${live['cost_usd']:.4f}")
-    return 0
+        b.cont(f"{style.bold(live['key'])} "
+               + render.join(style, [
+                   render.count(live["turns"], "turn"),
+                   f"idle {render.human_duration(live['idle_s'])}",
+                   render.money(live["cost_usd"])]))
+    out.extend(b.lines())
+    return "\n".join(out)
+
+
+# =========================================================================
+# memory
+# =========================================================================
 
 
 def cmd_memory(args: argparse.Namespace) -> int:
@@ -320,58 +566,107 @@ def cmd_memory(args: argparse.Namespace) -> int:
         return fail(resp)
 
     if args.mem_cmd == "search":
-        if not resp["results"]:
-            print(f"{DIM}no episodes match {resp['query']!r}{RESET}")
-            return 0
-        for hit in resp["results"]:
-            print(f"{BOLD}{hit['iso']}{RESET} "
-                  f"{DIM}[{hit['surface']} · salience "
-                  f"{hit['effective_salience']:.2f} of {hit['salience']:.2f}]{RESET}")
-            print(f"  > {hit['user_text'].strip()}")
-            reply = hit["luna_text"].strip().replace("\n", "\n    ")
-            print(f"    {reply}\n")
-        return 0
-
+        return _print_search(resp, S)
     if args.mem_cmd == "profile":
         return _print_profile(resp)
-
     if args.mem_cmd == "consolidate":
         return _print_consolidation(resp)
-
     if args.mem_cmd in ("write", "rm"):
         u = resp["usage"]
-        print(f"{u['file']}: {u['chars']}/{u['cap']} chars ({u['pct']}%), "
-              f"{u['entries']} entries")
+        print(f"{S.bold(u['file'])}  {render.meter(u['pct'], 18 if not S.narrow else 10, S)} "
+              f"{u['pct']:.0f}%  "
+              + S.dim(f"{u['chars']}/{u['cap']} chars"
+                      f"{S.sep}{render.count(u['entries'], 'entry', 'entries')}"))
         return 0
+    return _print_memory(resp, S, one_file=bool(args.file))
 
-    if args.file:
-        u = resp["usage"]
-        print(f"{BOLD}{resp['file']}{RESET} {DIM}{u['chars']}/{u['cap']} chars "
-              f"({u['pct']}%){RESET}")
-        for i, entry in enumerate(resp["entries"]):
-            print(f"  [{i}] {entry}")
+
+def _entries(entries: list, style: render.Style, out: list[str]) -> None:
+    """A numbered list of paragraphs, kept rectangular.
+
+    Tier-1 entries run to three or four lines at this width. Left to the
+    terminal they wrap back to column zero and the numbering stops being a
+    list; wrapped here with a hanging indent, the index column reads down the
+    left and each entry is one block.
+    """
+    if not entries:
+        out.append("  " + style.dim("(empty)"))
+        return
+    # The index is plain rather than dim: it is not provenance, it is the
+    # argument you type into `luna memory rm`.
+    pad = len(str(max(0, len(entries) - 1)))
+    indent = 2 + pad + 3
+    for i, entry in enumerate(entries):
+        out.extend(render.wrapped(entry, style, indent,
+                                  first=f"  [{i:>{pad}}] "))
+
+
+def _file_head(name: str, u: dict, style: render.Style) -> str:
+    return (f"{style.bold(name)}  "
+            + f"{render.meter(u['pct'], 10 if style.narrow else 18, style)} "
+            + f"{u['pct']:.0f}%  "
+            + style.dim(f"{u['chars']}/{u['cap']} chars"))
+
+
+def _print_memory(resp: dict, style: render.Style, one_file: bool) -> int:
+    out: list[str] = []
+    if one_file:
+        out.append(_file_head(resp["file"], resp["usage"], style))
+        _entries(resp["entries"], style, out)
+        print("\n".join(out))
         return 0
-
     for name, block in resp["tier1"].items():
-        u = block["usage"]
-        print(f"{BOLD}{name}{RESET} {DIM}{u['chars']}/{u['cap']} chars "
-              f"({u['pct']}%){RESET}")
-        for i, entry in enumerate(block["entries"]):
-            print(f"  [{i}] {entry}")
-        if not block["entries"]:
-            print(f"  {DIM}(empty){RESET}")
-    print(f"\n{BOLD}recent episodes{RESET} "
-          f"{DIM}({resp['tier2']['episodes']} total){RESET}")
-    for ep in resp["recent"]:
-        print(f"  {ep['iso']} [{ep['surface']} {ep['effective_salience']:.2f}] "
-              f"{ep['user_text'].strip()[:80]}")
+        out.append(_file_head(name, block["usage"], style))
+        _entries(block["entries"], style, out)
+        out.append("")
+    t2 = resp["tier2"]
+    out.append(f"{style.bold('recent episodes')}  "
+               + style.dim(render.count(t2["episodes"], "in total")))
+    rows = [[style.dim(ep["iso"]), f"{ep['surface']} {ep['effective_salience']:.2f}",
+             render.fit(ep["user_text"], max(24, style.width - 34), style)]
+            for ep in resp["recent"]]
+    out.extend("  " + line for line in render.columns(rows, style))
     t3 = resp.get("tier3") or {}
-    print(f"\n{BOLD}derived profile{RESET} "
-          + (f"{DIM}{t3.get('facts', 0)} fact(s) from {t3.get('episodes', 0)} "
-             f"episodes, rebuilt {t3.get('iso') or '?'} · "
-             f"luna memory profile{RESET}"
-             if t3.get("exists")
-             else f"{DIM}not built yet — luna memory profile --rebuild{RESET}"))
+    out.append("")
+    out.append(f"{style.bold('derived profile')}  "
+               + style.dim(render.join(style, [
+                   render.count(t3.get("facts", 0), "fact"),
+                   f"from {render.count(t3.get('episodes', 0), 'episode')}",
+                   f"rebuilt {t3.get('iso') or '?'}", "luna memory profile"])
+                   if t3.get("exists")
+                   else "not built yet — luna memory profile --rebuild"))
+    print("\n".join(out))
+    return 0
+
+
+def _print_search(resp: dict, style: render.Style) -> int:
+    """A hit, and why it is a hit.
+
+    `coverage` and `similarity` are what semantic recall added, and they are
+    the difference between a result list and an explanation: a hit at cosine
+    0.00 that surfaced on one shared token is a different kind of answer from
+    one the model thinks means the same thing, and the person reading has to
+    be able to tell them apart.
+    """
+    if not resp["results"]:
+        print(style.dim(f"no episodes match {resp['query']!r}"))
+        return 0
+    out: list[str] = []
+    for hit in resp["results"]:
+        facets = [hit["surface"],
+                  f"salience {hit['effective_salience']:.2f} "
+                  f"of {hit['salience']:.2f}"]
+        if hit.get("similarity") is not None:
+            facets.append(f"meaning {hit['similarity']:.2f}")
+        if hit.get("coverage") is not None:
+            facets.append(f"words {hit['coverage']:.2f}")
+        out.append(f"{style.bold(hit['iso'])}  "
+                   + style.dim(render.join(style, facets)))
+        out.extend(render.wrapped(hit["user_text"], style, 4, first="  > "))
+        for line in hit["luna_text"].strip().splitlines() or [""]:
+            out.extend(render.wrapped(line, style, 4, first="    "))
+        out.append("")
+    print("\n".join(out).rstrip())
     return 0
 
 
@@ -385,17 +680,20 @@ def _print_profile(resp: dict) -> int:
     """
     st = resp.get("status") or {}
     if not st.get("exists"):
-        print(f"{DIM}no profile yet. It is derived from episodic memory, so "
-              f"there is nothing to derive until there are episodes.{RESET}")
-        print(f"{DIM}build one: luna memory profile --rebuild{RESET}")
+        print(S.dim("no profile yet. It is derived from episodic memory, so "
+                    "there is nothing to derive until there are episodes."))
+        print(S.dim("build one: luna memory profile --rebuild"))
         return 0
-    print(f"{BOLD}profile.json{RESET} {DIM}{st.get('facts', 0)} fact(s) from "
-          f"{st.get('episodes', 0)} episodes · rebuilt {st.get('iso')} · "
-          f"{st.get('size_bytes', 0)} bytes{RESET}")
+    print(f"{S.bold('profile.json')}  "
+          + S.dim(render.join(S, [
+              render.count(st.get("facts", 0), "fact"),
+              f"from {render.count(st.get('episodes', 0), 'episode')}",
+              f"rebuilt {st.get('iso')}",
+              render.human_bytes(st.get("size_bytes", 0))])))
     block = (resp.get("block") or "").strip()
-    print(block if block else f"{DIM}(nothing measurable yet){RESET}")
-    print(f"\n{DIM}derived from tier 2 and safe to delete; the next rebuild "
-          f"reproduces it. {st.get('path')}{RESET}")
+    print(block if block else S.dim("(nothing measurable yet)"))
+    print("\n" + S.dim("derived from tier 2 and safe to delete; the next "
+                       f"rebuild reproduces it. {st.get('path')}"))
     return 0
 
 
@@ -419,19 +717,19 @@ def _print_consolidation(resp: dict) -> int:
     if not resp.get("ran"):
         reason = resp.get("reason")
         if reason == "no new episodes":
-            print(f"{DIM}nothing to consolidate: no exchanges recorded since "
-                  f"the last pass (watermark: episode "
-                  f"{resp.get('after_id', 0)}). Nothing was spent.{RESET}")
+            print(S.dim(f"nothing to consolidate: no exchanges recorded since "
+                        f"the last pass (watermark: episode "
+                        f"{resp.get('after_id', 0)}). Nothing was spent."))
         elif reason == "already running":
-            print(f"{DIM}a pass is already running, so this one did not "
-                  f"start: two passes proposing edits against the same batch "
-                  f"is the one thing this refuses to do. `luna status` shows "
-                  f"when it finishes.{RESET}")
+            print(S.dim("a pass is already running, so this one did not "
+                        "start: two passes proposing edits against the same "
+                        "batch is the one thing this refuses to do. "
+                        "`luna status` shows when it finishes."))
         elif reason == "disabled":
-            print(f"{DIM}consolidation is off — [memory] "
-                  f"consolidate_every_turns = 0, which is honoured "
-                  f"completely: no pass runs, by hand or on the counter, and "
-                  f"nothing is spent. Turn it back on with{RESET}")
+            print(S.dim("consolidation is off — [memory] "
+                        "consolidate_every_turns = 0, which is honoured "
+                        "completely: no pass runs, by hand or on the counter, "
+                        "and nothing is spent. Turn it back on with"))
             print("  luna settings set memory.consolidate_every_turns 12")
         elif reason == "agent unavailable":
             sys.stderr.write(
@@ -440,63 +738,145 @@ def _print_consolidation(resp: dict) -> int:
                 f"{resp.get('detail', '(no detail)')}\n")
             return 1
         else:
-            print(f"{DIM}the pass did not run: {reason}{RESET}")
+            print(S.dim(f"the pass did not run: {reason}"))
         return 0
 
     if dry:
-        print(f"{BOLD}dry run — nothing was written.{RESET}")
+        print(S.bold("dry run — nothing was written."))
     cost = resp.get("cost_usd")
-    print(f"{BOLD}{'would consolidate' if dry else 'consolidated'} "
-          f"{resp['episodes']} episode(s){RESET} "
-          f"{DIM}through #{resp['through_id']} · "
-          f"{resp.get('wall_ms', 0) / 1000:.1f}s · "
-          + (f"${cost:.4f}" if cost is not None else "subscription")
-          + f"{RESET}")
+    print(f"{S.bold(('would consolidate' if dry else 'consolidated') + ' ' + render.count(resp['episodes'], 'episode'))}  "
+          + S.dim(render.join(S, [
+              f"through #{resp['through_id']}",
+              f"{resp.get('wall_ms', 0) / 1000:.1f}s",
+              render.money(cost) if cost is not None else "subscription"])))
     for name, rec in (resp.get("files") or {}).items():
         u = rec.get("usage") or {}
         # No usage means the pass had nothing to do to this file: `_apply`
         # only measures a file it wrote, and saying "unchanged" is more
         # honest than re-reading it here and implying this pass is why.
-        print(f"{BOLD}{name}{RESET} "
-              + (f"[{_meter(u['pct'])}] {DIM}{u['chars']}/{u['cap']} chars "
-                 f"({u['pct']}%), {u['entries']} entries{RESET}"
-                 if u else f"{DIM}unchanged{RESET}"))
+        print(f"{S.bold(name)} "
+              + (f"{render.meter(u['pct'], 10 if S.narrow else 18, S)} "
+                 f"{u['pct']:.0f}%  "
+                 + S.dim(f"{u['chars']}/{u['cap']} chars{S.sep}"
+                         f"{render.count(u['entries'], 'entry', 'entries')}")
+                 if u else S.dim("unchanged")))
         index = rec.get("removed_index") or []
         for entry in rec.get("added") or []:
-            print(f"  + {entry}")
+            print("\n".join(render.wrapped(entry, S, 4, first="  + ")))
         for n, entry in enumerate(rec.get("removed") or []):
-            print(f"  - {f'[{index[n]}] ' if n < len(index) else ''}{entry}")
+            head = f"  - {f'[{index[n]}] ' if n < len(index) else ''}"
+            print("\n".join(render.wrapped(entry, S, 4, first=head)))
         over = rec.get("over_cap")
         if over:
-            print(f"  {DIM}rejected whole, and the file left exactly as it "
-                  f"was: over cap by {over['overflow']} chars "
-                  f"({over['proposed_chars']}/{over['cap']}){RESET}")
+            print(S.dim(f"  rejected whole, and the file left exactly as it "
+                        f"was: over cap by {over['overflow']} chars "
+                        f"({over['proposed_chars']}/{over['cap']})"))
             refused = rec.get("refused") or {}
             for entry in refused.get("added") or []:
-                print(f"  {DIM}! would not have fitted: {entry}{RESET}")
+                print(S.dim(f"  ! would not have fitted: {entry}"))
     if resp.get("note"):
-        print(f"{DIM}note: {resp['note']}{RESET}")
+        print(S.dim(f"note: {resp['note']}"))
     if not resp.get("parsed"):
         sys.stderr.write("luna: the model's answer could not be read as a "
                          "proposal, so nothing was applied. The call was "
                          "still paid for; `luna log` has the reply.\n")
     if dry:
-        print(f"\n{DIM}the watermark did not move, so the next pass — this "
-              f"one applied, or the automatic one — sees the same "
-              f"{resp['episodes']} episode(s). Apply a pass with{RESET}")
+        print("\n" + S.dim(f"the watermark did not move, so the next pass — "
+                           f"this one applied, or the automatic one — sees the "
+                           f"same {render.count(resp['episodes'], 'episode')}. "
+                           f"Apply a pass with"))
         print("  luna memory consolidate")
     floor = resp.get("floor_left_s") or 0
     if floor:
-        sys.stderr.write(f"{DIM}[{floor:.0f}s of the interval floor between "
-                         f"passes was overridden: you asked for this "
-                         f"one]{RESET}\n")
+        sys.stderr.write(S.dim(f"[{floor:.0f}s of the interval floor between "
+                               f"passes was overridden: you asked for this "
+                               f"one]") + "\n")
     return 0 if resp.get("parsed") else 1
 
 
+# =========================================================================
+# embed — the model semantic recall needs, and whether it is there
+# =========================================================================
+
+
+def cmd_embed(args: argparse.Namespace) -> int:
+    """`luna embed status | fetch | backfill`.
+
+    The three commands were only reachable as `python3 -m lunad.embed <cmd>`,
+    which works and is not how anything else on this machine is spelled.
+    `fetch` and `backfill` are handed straight to that module — they do real
+    work and print their own progress, and a wrapper that re-implemented their
+    output would be a second thing to keep true. `status` is rendered here,
+    because it is a state screen and this file is where state screens live.
+    """
+    from lunad import embed  # noqa: PLC0415 - 86 MB of tokeniser, imported late
+
+    if args.embed_cmd in ("fetch", "backfill"):
+        argv = ["embed", args.embed_cmd] + (["--force"] if args.force else [])
+        return embed.cli(argv)
+
+    st = embed.get_embedder().status()
+    st["power"] = embed.on_mains_power()
+    if args.json:
+        print(json.dumps(st, indent=2))
+        return 0
+    print(_embed_status_text(st, S))
+    # Always 0. A model that has not been fetched is a state this command
+    # exists to report, not a failure of the command; the one thing a status
+    # screen must not do is make "I looked, and it is not there" indistinguish-
+    # able from "I could not look".
+    return 0
+
+
+def _embed_status_text(st: dict, style: render.Style) -> str:
+    """Present or absent, on or off, and what to type about it.
+
+    Absent is not an error — recall falls back to keyword search with no other
+    change in behaviour — so this says what is lost rather than what is broken,
+    and gives the one command that changes it.
+    """
+    out = [f"{style.bold('semantic recall')}  "
+           + style.dim(render.join(style, [st["model"], st["licence"],
+                                           f"{st['dim']} dimensions"]))]
+    out.append(style.rule(min(style.width, 88)))
+    b = render.Block(style)
+    present, enabled = st["present"], st["enabled"]
+    b.add("model", "present" if present else style.alert("not fetched"),
+          style.dim(st["dir"]), alert=not present)
+    b.add("setting", "on" if enabled else style.alert("off"),
+          style.dim("[memory] semantic_recall"), alert=not enabled)
+    b.add("worker", "running" if st.get("ready") else "not loaded",
+          style.alert("broken") if st.get("broken") else None,
+          style.dim(st["python"]))
+    power = st.get("power")
+    b.add("power", "mains" if power in (True, None) else "battery",
+          style.dim("backfill waits for mains") if power is False else None)
+    out.extend(b.lines())
+    out.append("")
+    if not present:
+        out.append(style.dim("recall is keyword-only until the model is "
+                             "there, and nothing else changes. Fetch it with"))
+        out.append("  luna embed fetch")
+    elif not enabled:
+        out.append(style.dim("the model is here but the setting is off, so "
+                             "recall is keyword-only. Turn it on with"))
+        out.append("  luna settings set memory.semantic_recall true")
+    else:
+        out.append(style.dim("episodes recorded before the model arrived have "
+                             "no vector until they are backfilled"))
+        out.append("  luna embed backfill")
+    return "\n".join(out)
+
+
+# =========================================================================
+# dispatch and jobs
+# =========================================================================
+
+
 def cmd_dispatch(args: argparse.Namespace) -> int:
-    task = " ".join(args.task).strip() or sys.stdin.read().strip()
-    if not task:
-        sys.stderr.write("luna: nothing to dispatch\n")
+    task = _from_stdin(args.task, "dispatch",
+                       'luna dispatch "run the test suite and report"')
+    if task is None:
         return 2
     timeout = args.timeout + 60 if args.wait else 30
     with Client(timeout=timeout) as client:
@@ -515,19 +895,16 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
     if resp.get("output"):
         print(resp["output"].rstrip())
     state, code = resp.get("state"), resp.get("exit_code")
-    sys.stderr.write(f"{DIM}[{state} · exit {code} · "
-                     f"{resp.get('elapsed_s')}s · {resp.get('dir')}]{RESET}\n")
+    _meta(S.alert(state) if state != "finished" else state, f"exit {code}",
+          f"{resp.get('elapsed_s')}s", resp.get("dir"))
     return 0 if state == "finished" else 1
 
 
-def _job_line(job: dict) -> str:
-    mark = {"finished": "ok  ", "failed": "FAIL", "running": "run ",
-            "queued": "wait", "cancelled": "cxl ", "orphaned": "orph"
-            }.get(job["state"], "?   ")
-    code = "" if job.get("exit_code") is None else f" exit {job['exit_code']}"
-    return (f"{BOLD}{job['id']}{RESET} {mark} {job['to']:<6} "
-            f"{job['elapsed_s']:>6.1f}s{code}  {DIM}{job['iso']}{RESET}\n"
-            f"     {job['task'].splitlines()[0][:100]}")
+#: How a job's state is spelled, in the four characters every row gives it.
+#: Fixed width so the column beside it stays a column; the two that mean
+#: something went wrong are the only ones that take colour.
+_STATE_MARK = {"finished": "ok", "failed": "FAIL", "running": "run",
+               "queued": "wait", "cancelled": "cxl", "orphaned": "orph"}
 
 
 def cmd_jobs(args: argparse.Namespace) -> int:
@@ -545,19 +922,42 @@ def cmd_jobs(args: argparse.Namespace) -> int:
         return 0 if resp.get("ok") else 1
     if not resp.get("ok"):
         return fail(resp)
-    ws = resp.get("workspace") or {}
-    print(f"{DIM}{ws.get('workspace')} — "
-          f"{'visible' if ws.get('visible') else 'hidden'}, "
-          f"{ws.get('windows', 0)} window(s){RESET}")
-    if not resp["jobs"]:
-        print(f"{DIM}no jobs dispatched yet{RESET}")
-        return 0
-    for job in resp["jobs"]:
-        print(_job_line(job))
-        if args.output and job.get("output"):
-            body = job["output"].rstrip().replace("\n", "\n     ")
-            print(f"     {DIM}{body}{RESET}")
+    print(_jobs_text(resp, S, with_output=args.output))
     return 0
+
+
+def _jobs_text(resp: dict, style: render.Style, with_output: bool = False) -> str:
+    ws = resp.get("workspace") or {}
+    out = [style.dim(render.join(style, [
+        ws.get("workspace"),
+        "visible" if ws.get("visible") else "hidden",
+        render.count(ws.get("windows", 0), "window")]))]
+    if not resp["jobs"]:
+        out.append(style.dim("no jobs dispatched yet"))
+        return "\n".join(out)
+    out.append("")
+    rows = []
+    for job in resp["jobs"]:
+        mark = _STATE_MARK.get(job["state"], job["state"][:4])
+        if job["state"] in ("failed", "orphaned"):
+            mark = style.alert(mark)
+        code = "" if job.get("exit_code") is None else f"exit {job['exit_code']}"
+        rows.append([style.bold(job["id"]), mark, job["to"],
+                     f"{job['elapsed_s']:.1f}s", code,
+                     style.dim(job["iso"].replace("T", " "))])
+    laid = render.columns(rows, style, gap=2, align="lllrll")
+    # The task is the reason the job exists, so it gets its own line at full
+    # width rather than a truncated sixth column.
+    indent = 2 + max(len(j["id"]) for j in resp["jobs"]) + 2
+    for job, line in zip(resp["jobs"], laid):
+        out.append("  " + line)
+        out.extend(render.wrapped(job["task"].splitlines()[0], style, indent,
+                                  first=" " * indent))
+        if with_output and job.get("output"):
+            for raw in job["output"].rstrip().splitlines():
+                out.append(style.dim(" " * indent + render.fit(
+                    raw, max(20, style.width - indent), style)))
+    return "\n".join(out)
 
 
 def cmd_peek(args: argparse.Namespace) -> int:
@@ -570,6 +970,11 @@ def cmd_peek(args: argparse.Namespace) -> int:
     return 0
 
 
+# =========================================================================
+# audit
+# =========================================================================
+
+
 def cmd_audit(args: argparse.Namespace) -> int:
     with Client(timeout=30) as client:
         resp = client.call("audit", since=args.since, limit=args.limit,
@@ -580,29 +985,63 @@ def cmd_audit(args: argparse.Namespace) -> int:
     if not resp.get("ok"):
         return fail(resp)
     if not resp["entries"]:
-        print(f"{DIM}nothing in the audit log for that window "
-              f"({resp['path']}){RESET}")
+        print(S.dim(f"nothing in the audit log for that window ({resp['path']})"))
         return 0
-    skip = {"ts", "iso", "action", "actor", "ok", "why", "undo", "by_pid"}
+    print(_audit_text(resp, S))
+    _meta(render.count(resp["count"], "entry", "entries"),
+          render.human_bytes(resp["size_bytes"]), resp["path"])
+    return 0
+
+
+_AUDIT_SKIP = {"ts", "iso", "action", "actor", "ok", "why", "undo", "by_pid"}
+
+
+def _audit_text(resp: dict, style: render.Style) -> str:
+    """The log, grouped by day.
+
+    An audit log read as a flat list repeats the date on every line and the
+    eye stops seeing it. Printed as a dim day heading with times under it, the
+    same screen holds more entries and the shape of a day — a burst at 22:16,
+    nothing until morning — is visible without reading a word.
+    """
+    out: list[str] = []
+    day = None
     for entry in resp["entries"]:
-        status = "" if entry.get("ok") is None else (
-            " ok" if entry["ok"] else " FAILED")
-        print(f"{DIM}{entry.get('iso', '?')}{RESET} "
-              f"{BOLD}{entry.get('action', '?')}{RESET}"
-              f"{status} {DIM}({entry.get('actor', 'luna')}){RESET}")
+        iso = str(entry.get("iso", "?"))
+        date, _, clock = iso.partition("T")
+        if date != day:
+            if out:
+                out.append("")
+            out.append(style.dim(date))
+            day = date
+        ok = entry.get("ok")
+        status = "" if ok is None else ("ok" if ok else style.alert("FAILED"))
+        out.append(f"  {style.dim(clock or iso)}  "
+                   + render.join(style, [style.bold(entry.get("action", "?")),
+                                         status,
+                                         style.dim(entry.get("actor", "luna"))]))
+        indent = 12
         if entry.get("why"):
-            print(f"    why: {str(entry['why']).splitlines()[0][:160]}")
+            # Labelled, because the two lines under an action are a sentence a
+            # human wrote and a dump a program wrote, and with colour off
+            # nothing else tells them apart.
+            out.extend(render.wrapped(str(entry["why"]).splitlines()[0], style,
+                                      indent + 5,
+                                      first=" " * indent + "why  "))
         rest = " ".join(f"{k}={_short(v)}" for k, v in entry.items()
-                        if k not in skip)
+                        if k not in _AUDIT_SKIP)
         if rest:
-            print(f"    {DIM}{rest[:400]}{RESET}")
+            out.append(" " * indent + style.dim(render.fit(
+                rest, max(20, style.width - indent), style)))
         if entry.get("undo"):
             undo = entry["undo"]
             cmd = " ".join(undo.get("cmd", [])) or "(no command)"
-            print(f"    undo: {cmd}  {DIM}({undo.get('valid_while', '')}){RESET}")
-    sys.stderr.write(f"{DIM}[{resp['count']} entries · {resp['size_bytes']} "
-                     f"bytes · {resp['path']}]{RESET}\n")
-    return 0
+            out.append(" " * indent + "undo: " + render.fit(
+                cmd, max(20, style.width - indent - 6), style))
+            if undo.get("valid_while"):
+                out.append(" " * indent + style.dim(
+                    f"      while {undo['valid_while']}"))
+    return "\n".join(out)
 
 
 def _short(value: object) -> str:
@@ -622,20 +1061,35 @@ def cmd_spawned(args: argparse.Namespace) -> int:
         return fail(resp)
     check = resp.get("check")
     if check:
-        verdict = "MAY SIGNAL" if check["may_signal"] else "REFUSED"
-        print(f"{BOLD}pid {check['pid']}: {verdict}{RESET}")
+        allowed = check["may_signal"]
+        print(f"{S.bold('pid ' + str(check['pid']))}  "
+              + ("MAY SIGNAL" if allowed else S.alert("REFUSED")))
+        b = render.Block(S)
         if check.get("reason"):
-            print(f"  reason:  {check['reason']}")
+            b.add("reason", check["reason"])
         if check.get("cmdline"):
-            print(f"  cmdline: {check['cmdline']}")
-        print()
-    print(f"{DIM}{resp['tracked']} tracked, {resp['refusals']} refusal(s) "
-          f"this session · {resp['path']}{RESET}")
-    for rec in resp["entries"]:
-        alive = "alive" if rec["alive"] else "dead "
-        print(f"  {rec['pid']:>8} {alive} {rec['kind']:<12} "
-              f"{DIM}{rec['iso']}  {' '.join(rec['cmd'])[:70]}{RESET}")
+            b.add("cmdline", S.dim(render.fit(check["cmdline"],
+                                              max(20, S.width - 12), S)))
+        print(b.render())
+    refusals = resp["refusals"]
+    print(S.dim(render.join(S, [
+        f"{resp['tracked']} tracked",
+        render.count(refusals, "refusal") + " this session",
+        resp["path"]])))
+    rows = [[str(rec["pid"]),
+             "alive" if rec["alive"] else S.dim("dead"),
+             rec["kind"],
+             S.dim(rec["iso"].replace("T", " ")),
+             S.dim(render.fit(" ".join(rec["cmd"]), max(20, S.width - 46), S))]
+            for rec in resp["entries"]]
+    for line in render.columns(rows, S, align="rlll"):
+        print("  " + line)
     return 0
+
+
+# =========================================================================
+# settings
+# =========================================================================
 
 
 def cmd_settings(args: argparse.Namespace) -> int:
@@ -646,9 +1100,12 @@ def cmd_settings(args: argparse.Namespace) -> int:
     because the file said something invalid reads back as the default here,
     which is the honest answer.
     """
+    if args.set_cmd == "set":
+        value = _parse_value(args.key, args.value, literal=args.string)
+        if value is _BAD:
+            return 2
     with Client(timeout=30) as client:
         if args.set_cmd == "set":
-            value = _parse_value(args.value)
             resp = client.call("settings.set", key=args.key, value=value,
                                actor="cli", why="set from the CLI")
         else:
@@ -660,52 +1117,137 @@ def cmd_settings(args: argparse.Namespace) -> int:
         return fail(resp)
     if args.set_cmd == "set":
         for key, value in resp["applied"].items():
-            print(f"{key} = {_toml(value)}")
-        sys.stderr.write(f"{DIM}[{resp['path']}]{RESET}\n")
+            print(f"{S.bold(key)} = {_toml(value)}")
+        _meta(resp["path"])
         return 0
     if args.key:
-        spec = f" {DIM}({resp['kind']}"
-        if resp.get("choices"):
-            spec += ": " + " | ".join(resp["choices"])
-        spec += f", default {_toml(resp['default'])}){RESET}"
-        print(f"{args.key} = {_toml(resp['value'])}{spec}")
+        print(f"{S.bold(args.key)} = {_toml(resp['value'])}  "
+              + S.dim(render.join(S, [
+                  resp["kind"] + (": " + " | ".join(resp["choices"])
+                                  if resp.get("choices") else ""),
+                  f"default {_toml(resp['default'])}"])))
+        if resp.get("comment"):
+            print("  " + S.dim(resp["comment"]))
         return 0
-    for section, values in resp["settings"].items():
-        print(f"{BOLD}[{section}]{RESET}")
-        for key, value in values.items():
-            print(f"  {key} = {_toml(value)}")
-    sec = resp.get("secrets") or {}
-    print(f"\n{DIM}{resp['path']} mode {resp.get('mode')} · "
-          f"{resp.get('reloads', 0)} reload(s) · "
-          f"watching {resp.get('watching')}{RESET}")
-    print(f"{DIM}api key: "
-          + (f"present from {sec.get('source')}" if sec.get("present")
-             else "MISSING — " + str(sec.get("hint", "")))
-          + RESET)
-    for problem in resp.get("problems") or []:
-        sys.stderr.write(f"  ! {problem}\n")
+    print(_settings_text(resp, S))
     return 0
 
 
-def _parse_value(raw: str) -> object:
-    """CLI arguments are strings; the schema is typed. Bridge honestly.
+def _settings_text(resp: dict, style: render.Style) -> str:
+    """The whole file, with what you changed standing out from what you did not.
 
-    `true`/`false` and numbers are converted, everything else stays a string.
-    The daemon validates whatever comes out, so a wrong guess here is a clear
-    error rather than a silently stored wrong type.
+    The question a person opens this to answer is almost never "what is the
+    default" — it is "what have I changed". So a value that differs from the
+    schema's default is set in bold and everything else is left plain, which
+    makes the answer a shape rather than a comparison. There is no legend
+    because the file is short enough to see, and a legend for one weight is
+    chrome.
+    """
+    out: list[str] = []
+    defaults = resp.get("defaults") or {}
+    comments = {}
+    for sec in resp.get("schema") or []:
+        for key in sec["keys"]:
+            if key.get("comment"):
+                comments[f"{sec['section']}.{key['name']}"] = key["comment"]
+    for section, values in resp["settings"].items():
+        if out:
+            out.append("")
+        out.append(style.bold(f"[{section}]"))
+        rows = []
+        for key, value in values.items():
+            if isinstance(value, dict):
+                continue
+            shown = _toml(value)
+            changed = (section in defaults and key in defaults[section]
+                       and defaults[section][key] != value)
+            rows.append([key, "=", style.bold(shown) if changed else shown,
+                         comments.get(f"{section}.{key}", "")])
+        # The comment column is dropped rather than truncated on a narrow
+        # terminal: half a sentence explaining a setting is worse than none.
+        # Where it is kept it is marked `#`, so it reads as a comment with the
+        # colour off as well as on.
+        spent = 2 + max(len(r[0]) for r in rows) + 3 \
+            + max(render.visible_len(r[2]) for r in rows) + 1
+        for row in rows:
+            row[3] = (style.dim("# " + render.fit(row[3], style.width - spent - 2,
+                                                  style))
+                      if row[3] and not style.narrow else "")
+        out.extend("  " + line for line in render.columns(rows, style, gap=1))
+    sec = resp.get("secrets") or {}
+    out.append("")
+    out.append(style.dim(render.join(style, [
+        resp["path"], f"mode {resp.get('mode')}",
+        render.count(resp.get("reloads", 0), "reload"),
+        f"watching {resp.get('watching')}"])))
+    out.append("api key: " + (style.dim(f"present from {sec.get('source')}")
+                              if sec.get("present")
+                              else style.alert("MISSING") + " — "
+                              + str(sec.get("hint", ""))))
+    for problem in resp.get("problems") or []:
+        out.append("  " + style.alert("!") + f" {problem}")
+    return "\n".join(out)
+
+
+#: What `_parse_value` returns when it has already explained itself.
+_BAD = object()
+
+
+def _parse_value(key: str, raw: str, literal: bool = False) -> object:
+    """CLI arguments are strings; the schema is typed. Bridge against the type.
+
+    The old version guessed from the *text* — anything `int()` would swallow
+    became an int — so `luna settings set assistant.name 42` sent the number
+    42 to a key declared `str` and the daemon answered with a type error about
+    a value the user never typed. Worse, there was then no way to say 42 at
+    all.
+
+    So the declared type decides, read from the same schema module the daemon
+    validates against, and `--string` is the escape for the cases the schema
+    cannot settle: a key it has never heard of (a daemon newer than this
+    client) falls back to the old guess, and `--string` turns the guess off.
     """
     text = raw.strip()
+    if literal:
+        return text
+    kind = _declared_kind(key)
+    if kind in ("str", "policy"):
+        return text
+    if kind == "bool":
+        low = text.lower()
+        if low in ("true", "yes", "on", "1"):
+            return True
+        if low in ("false", "no", "off", "0"):
+            return False
+        sys.stderr.write(f"luna: {key} is a true/false setting; "
+                         f"{text!r} is neither.\n")
+        return _BAD
+    if kind in ("int", "float"):
+        try:
+            return int(text) if kind == "int" else float(text)
+        except ValueError:
+            want = "whole number" if kind == "int" else "number"
+            sys.stderr.write(f"luna: {key} wants a {want}, not {text!r}.\n")
+            return _BAD
+    # Unknown to this client's schema: guess as before and let the daemon,
+    # which may know the key, be the judge.
     if text.lower() in ("true", "false"):
         return text.lower() == "true"
-    try:
-        return int(text)
-    except ValueError:
-        pass
-    try:
-        return float(text)
-    except ValueError:
-        pass
+    for cast in (int, float):
+        try:
+            return cast(text)
+        except ValueError:
+            pass
     return text
+
+
+def _declared_kind(key: str) -> str | None:
+    from lunad import settings as schema  # noqa: PLC0415
+
+    try:
+        return schema.find(key)[1].kind
+    except Exception:  # noqa: BLE001 - an unknown key is not this file's error
+        return None
 
 
 def _toml(value: object) -> str:
@@ -714,6 +1256,9 @@ def _toml(value: object) -> str:
     if isinstance(value, (int, float)):
         return str(value)
     return json.dumps(value)
+
+
+# =========================================================================
 
 
 def cmd_confirm(args: argparse.Namespace) -> int:
@@ -744,24 +1289,7 @@ def cmd_confirm(args: argparse.Namespace) -> int:
         return fail(resp)
 
     if action == "list":
-        pol = resp["policies"]
-        print(f"{BOLD}policies{RESET} "
-              f"{DIM}({resp['channel']}, {resp['timeout_s']:.0f}s, "
-              f"timeout = {resp['default_on_timeout']}){RESET}")
-        for name, value in pol.items():
-            mark = {"never": DIM, "ask": "", "deny": BOLD}.get(value, "")
-            print(f"  {name:<20} {mark}{value}{RESET}")
-        print(f"{DIM}always denied: {', '.join(resp['hard_denies'])}{RESET}")
-        if not resp["pending"]:
-            print(f"{DIM}nothing waiting on an answer{RESET}")
-            return 0
-        print(f"\n{BOLD}waiting{RESET}")
-        for item in resp["pending"]:
-            print(f"  {item['token']}  {item['action']}  "
-                  f"{item['remaining_s']:.0f}s left")
-            print(f"    {item['detail'][:120]}")
-            print(f"    {DIM}luna confirm yes {item['token']}  |  "
-                  f"luna confirm no {item['token']}{RESET}")
+        print(_confirm_text(resp, S))
         return 0
 
     if action in ("yes", "no"):
@@ -773,6 +1301,33 @@ def cmd_confirm(args: argparse.Namespace) -> int:
 
     print(resp["message"])
     return 0 if resp["allowed"] else 3
+
+
+def _confirm_text(resp: dict, style: render.Style) -> str:
+    out = [f"{style.bold('policies')}  "
+           + style.dim(render.join(style, [
+               resp["channel"], f"{resp['timeout_s']:.0f}s",
+               f"timeout = {resp['default_on_timeout']}"]))]
+    rows = []
+    for name, value in resp["policies"].items():
+        # `deny` is the one that stops work, so it is the one that is loud.
+        shown = (style.alert(value) if value == "deny"
+                 else style.dim(value) if value == "never" else value)
+        rows.append([name, shown])
+    out.extend("  " + line for line in render.columns(rows, style))
+    out.append(style.dim("always denied: " + ", ".join(resp["hard_denies"])))
+    if not resp["pending"]:
+        out.append(style.dim("nothing waiting on an answer"))
+        return "\n".join(out)
+    out.append("")
+    out.append(style.bold("waiting"))
+    for item in resp["pending"]:
+        out.append(f"  {style.bold(item['token'])}  {item['action']}  "
+                   + style.dim(f"{item['remaining_s']:.0f}s left"))
+        out.extend(render.wrapped(item["detail"], style, 4, first="    "))
+        out.append("    " + style.dim(f"luna confirm yes {item['token']}"
+                                      f"  |  luna confirm no {item['token']}"))
+    return "\n".join(out)
 
 
 def cmd_log(args: argparse.Namespace) -> int:
@@ -794,8 +1349,11 @@ def cmd_log(args: argparse.Namespace) -> int:
             f"{k}={v}" for k, v in rec.items()
             if k not in ("ts", "level", "logger", "msg", "exc")
         )
-        print(f"{DIM}{rec['ts']}{RESET} {rec['level']:<7} {rec['msg']} "
-              f"{DIM}{extra}{RESET}")
+        level = rec["level"]
+        print(f"{S.dim(rec['ts'])} "
+              + (S.alert(f"{level:<7}") if level in ("ERROR", "CRITICAL")
+                 else f"{level:<7}")
+              + f" {rec['msg']} {S.dim(extra)}".rstrip())
         if "exc" in rec:
             print(rec["exc"])
     return 0
@@ -810,17 +1368,102 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ambient(args: argparse.Namespace) -> int:
+    """`luna ambient` — what she is watching; `... diagnose <pid>` — why.
+
+    The `diagnose` form is what the crash toast's single click runs, so it is
+    a real command rather than an internal hook: a notification the user can
+    also type is one they can retry after they have dismissed it.
+    """
+    if getattr(args, "amb_cmd", None) == "diagnose":
+        with Client(timeout=30) as client:
+            resp = client.call("ambient.diagnose", pid=args.pid,
+                               exe=args.exe or "", when=args.when or "")
+        if not resp.get("ok"):
+            return fail(resp)
+        if args.json:
+            print(json.dumps(resp, indent=2))
+            return 0
+        print(resp.get("announce") or f"diagnosing pid {args.pid}")
+        print(S.dim(f"job {resp.get('id')} — `luna jobs` for the answer"))
+        return 0
+
+    with Client(timeout=15) as client:
+        resp = client.call("ambient")
+    if not resp.get("ok"):
+        return fail(resp)
+    amb = resp.get("ambient") or {}
+    if args.json:
+        print(json.dumps(amb, indent=2))
+        return 0
+    print(_ambient_text(amb, S))
+    return 0
+
+
+def _ambient_text(amb: dict, style: render.Style) -> str:
+    out = [f"{style.bold('ambient')} "
+           + ("on" if amb.get("enabled") else style.dim("off")) + "  "
+           + style.dim(render.join(style, [
+               f"every {amb.get('poll_seconds')}s",
+               f"{amb.get('ticks')} ticks",
+               f"{amb.get('delivered')} delivered", "never speaks"]))]
+    rows = []
+    for name, w in (amb.get("watchers") or {}).items():
+        on = w.get("enabled")
+        bits = [f"every {w.get('every_s'):.0f}s"]
+        if name == "crash":
+            bits.append(f"{w.get('known')} dumps known")
+            bits.append("diagnose on click" if w.get("diagnose") else "notify only")
+            # Said whichever way round it is, because "off" here is a
+            # decision and not an oversight: the desktop's own
+            # omarchy-crash-watch already announces these.
+            if w.get("desktop_already_watching"):
+                bits.append("omarchy-crash-watch is live"
+                            + (" — you will get two toasts" if on else ""))
+        elif name == "battery":
+            pct = w.get("pct")
+            bits.append(f"{pct}% {w.get('status') or ''}".strip()
+                        if pct is not None else "not read yet")
+            bits.append(f"low {w.get('low_pct')}% / crit {w.get('critical_pct')}%")
+        elif name == "update":
+            bits.append(f"omarchy {w.get('version') or 'unknown'}")
+        mark = "on" if on else style.dim("off")
+        rows.append([name, mark, style.dim(render.join(style, bits))])
+    out.extend("  " + line for line in render.columns(rows, style))
+    return "\n".join(out)
+
+
+# =========================================================================
+
+
 def build_parser() -> argparse.ArgumentParser:
     # `jarvis` and `luna` are the same client; argv[0] decides only the name
     # in the help text, because the app is Jarvis and the assistant inside it
     # is called whatever `[assistant] name` says.
     prog = Path(sys.argv[0]).name or "luna"
+
+    # `--json` is global, and a global flag that only works in front of the
+    # subcommand is a papercut every user hits exactly once and then works
+    # around forever. So it is defined once and inherited by every parser,
+    # with `SUPPRESS` as the default: without it, argparse writes the
+    # subparser's own `False` over a `True` the main parser had already set,
+    # and `luna --json status` would silently stop working the moment the
+    # flag was accepted after the subcommand too.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true",
+                        default=argparse.SUPPRESS,
+                        help="raw JSON response (accepted before or after the "
+                             "subcommand)")
+
     p = argparse.ArgumentParser(
-        prog=prog, description="Talk to your assistant (Jarvis).")
-    p.add_argument("--json", action="store_true", help="raw JSON response")
+        prog=prog, description="Talk to your assistant (Jarvis).",
+        parents=[common])
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    ask = sub.add_parser("ask", help="ask Luna something")
+    def add(name: str, **kw: object) -> argparse.ArgumentParser:
+        return sub.add_parser(name, parents=[common], **kw)  # type: ignore[arg-type]
+
+    ask = add("ask", help="ask Luna something")
     ask.add_argument("prompt", nargs="*")
     ask.add_argument("--model", default=None)
     ask.add_argument("--surface", default="cli",
@@ -837,67 +1480,98 @@ def build_parser() -> argparse.ArgumentParser:
                      help="print model, latency and cost to stderr")
     ask.set_defaults(func=cmd_ask)
 
-    st = sub.add_parser("status", help="daemon and memory state")
+    lk = add("look", help="show her the screen and ask about it")
+    lk.add_argument("question", nargs="*",
+                    help="what to ask about it; omit for a description")
+    lk.add_argument("--scope", default="window", choices=["window", "screen"],
+                    help="the focused window (default) or the whole screen")
+    lk.add_argument("--speak", action="store_true")
+    lk.add_argument("--surface", default="cli")
+    lk.add_argument("--conversation", default="default")
+    lk.add_argument("--no-remember", action="store_true")
+    lk.add_argument("--timeout", type=float, default=180.0)
+    lk.add_argument("-v", "--verbose", action="store_true")
+    lk.set_defaults(func=cmd_look)
+
+    st = add("status", help="daemon and memory state")
     st.set_defaults(func=cmd_status)
 
-    mem = sub.add_parser("memory", help="inspect and edit memory")
+    mem = add("memory", help="inspect and edit memory")
     msub = mem.add_subparsers(dest="mem_cmd", required=True)
-    show = msub.add_parser("show", help="show curated memory and recent episodes")
+
+    def memadd(name: str, **kw: object) -> argparse.ArgumentParser:
+        return msub.add_parser(name, parents=[common], **kw)  # type: ignore[arg-type]
+
+    show = memadd("show", help="show curated memory and recent episodes")
     show.add_argument("file", nargs="?", default=None,
                       help="LUNA.md or USER.md; omit for everything")
     show.add_argument("--limit", type=int, default=10)
-    search = msub.add_parser("search", help="keyword search of episodic memory")
+    search = memadd("search", help="search episodic memory by word and meaning")
     search.add_argument("query", nargs="+")
     search.add_argument("--limit", type=int, default=10)
-    write = msub.add_parser("write", help="append a curated entry")
+    write = memadd("write", help="append a curated entry")
     write.add_argument("entry", nargs="+")
     write.add_argument("--file", default="LUNA.md")
     write.add_argument("--limit", type=int, default=10)
-    rm = msub.add_parser("rm", help="remove a curated entry by index")
+    rm = memadd("rm", help="remove a curated entry by index")
     rm.add_argument("index", type=int)
     rm.add_argument("--file", default="LUNA.md")
     rm.add_argument("--limit", type=int, default=10)
-    prof = msub.add_parser("profile",
-                           help="the derived profile (tier 3), as the "
-                                "consolidation pass reads it")
+    prof = memadd("profile",
+                  help="the derived profile (tier 3), as the consolidation "
+                       "pass reads it")
     prof.add_argument("--rebuild", action="store_true",
                       help="regenerate it from episodic memory first")
     prof.add_argument("--limit", type=int, default=10)
-    con = msub.add_parser("consolidate",
-                          help="run one consolidation pass now, instead of "
-                               "waiting for the turn counter")
+    con = memadd("consolidate",
+                 help="run one consolidation pass now, instead of waiting for "
+                      "the turn counter")
     con.add_argument("--dry-run", action="store_true",
                      help="make the same model call, print the proposal in "
                           "full, and apply none of it")
     mem.set_defaults(func=cmd_memory)
 
-    lg = sub.add_parser("log", help="tail the daemon log")
+    em = add("embed", help="the model tier-2 recall uses to match by meaning")
+    emsub = em.add_subparsers(dest="embed_cmd", required=False)
+    emsub.add_parser("status", parents=[common],
+                     help="is the model there, is the setting on")
+    emfetch = emsub.add_parser("fetch", parents=[common],
+                               help="download it (86 MB, Apache-2.0)")
+    emfetch.add_argument("--force", action="store_true",
+                         help="fetch again even if it is already there")
+    emback = emsub.add_parser("backfill", parents=[common],
+                              help="embed episodes recorded before the model "
+                                   "arrived")
+    emback.add_argument("--force", action="store_true",
+                        help="re-embed episodes that already have a vector")
+    em.set_defaults(func=cmd_embed, embed_cmd="status", force=False)
+
+    lg = add("log", help="tail the daemon log")
     lg.add_argument("-n", "--lines", type=int, default=40)
     lg.add_argument("--raw", action="store_true")
     lg.set_defaults(func=cmd_log)
 
-    sy = sub.add_parser("say", help="speak text aloud through piper")
+    sy = add("say", help="speak text aloud through piper")
     sy.add_argument("text", nargs="*")
     sy.add_argument("--wait", action="store_true",
                     help="block until playback finishes")
     sy.add_argument("--timeout", type=float, default=120.0)
     sy.set_defaults(func=cmd_say)
 
-    hu = sub.add_parser("hush", help="stop speaking now")
+    hu = add("hush", help="stop speaking now")
     hu.set_defaults(func=cmd_hush)
 
-    ss = sub.add_parser("session", help="conversation session control")
+    ss = add("session", help="conversation session control")
     ss.add_argument("action", choices=["reset"])
     ss.add_argument("conversation", nargs="?", default=None)
     ss.set_defaults(func=cmd_session)
 
-    cp = sub.add_parser("codex-profile",
-                        help="write the `luna` codex profile so that "
-                             "`codex -p luna` boots Codex as Luna")
+    cp = add("codex-profile",
+             help="write the `luna` codex profile so that `codex -p luna` "
+                  "boots Codex as Luna")
     cp.set_defaults(func=cmd_codex_profile)
 
-    dp = sub.add_parser("dispatch", help="hand a task to an agent in the "
-                                        "luna workspace")
+    dp = add("dispatch", help="hand a task to an agent in the luna workspace")
     dp.add_argument("task", nargs="*")
     dp.add_argument("--to", default="worker", choices=["worker", "sol"],
                     help="sol is the specialist: own prompt, own memory")
@@ -906,17 +1580,17 @@ def build_parser() -> argparse.ArgumentParser:
     dp.add_argument("--timeout", type=float, default=3600.0)
     dp.set_defaults(func=cmd_dispatch)
 
-    jb = sub.add_parser("jobs", help="dispatched work, newest first")
+    jb = add("jobs", help="dispatched work, newest first")
     jb.add_argument("-n", "--limit", type=int, default=20)
     jb.add_argument("--output", action="store_true",
                     help="include what each job wrote")
     jb.add_argument("--cancel", default=None, metavar="JOB_ID")
     jb.set_defaults(func=cmd_jobs)
 
-    pk = sub.add_parser("peek", help="show or hide the luna workspace")
+    pk = add("peek", help="show or hide the luna workspace")
     pk.set_defaults(func=cmd_peek)
 
-    au = sub.add_parser("audit", help="read the append-only audit log")
+    au = add("audit", help="read the append-only audit log")
     au.add_argument("--since", default=None,
                     help="30m, 6h, 2d, 1w, YYYY-MM-DD, or a unix timestamp")
     au.add_argument("-n", "--limit", type=int, default=40)
@@ -924,42 +1598,57 @@ def build_parser() -> argparse.ArgumentParser:
                     help="only actions starting with this prefix")
     au.set_defaults(func=cmd_audit)
 
-    sp = sub.add_parser("spawned",
-                        help="the signal allowlist; --check asks the firewall "
-                             "about one pid")
+    sp = add("spawned",
+             help="the signal allowlist; --check asks the firewall about one pid")
     sp.add_argument("--check", type=int, default=None, metavar="PID")
     sp.add_argument("--all", action="store_true",
                     help="include records whose process has exited")
     sp.set_defaults(func=cmd_spawned)
 
-    se = sub.add_parser("settings",
-                        help="read and write ~/.config/jarvis/config.toml")
+    se = add("settings", help="read and write ~/.config/jarvis/config.toml")
     sesub = se.add_subparsers(dest="set_cmd", required=False)
-    seshow = sesub.add_parser("show", help="print the live settings")
+    seshow = sesub.add_parser("show", parents=[common],
+                              help="print the live settings")
     seshow.add_argument("key", nargs="?", default=None,
                         help="one dotted key, e.g. voice.voice")
-    seset = sesub.add_parser("set", help="change one setting")
+    seset = sesub.add_parser("set", parents=[common], help="change one setting")
     seset.add_argument("key")
     seset.add_argument("value")
-    se.set_defaults(func=cmd_settings, set_cmd="show", key=None)
+    seset.add_argument("-s", "--string", action="store_true",
+                       help="store the value as a string exactly as typed, "
+                            "whatever it looks like")
+    se.set_defaults(func=cmd_settings, set_cmd="show", key=None, string=False)
 
-    cf = sub.add_parser("confirm",
-                        help="the confirmation policy, and answers to it")
+    cf = add("confirm", help="the confirmation policy, and answers to it")
     cfsub = cf.add_subparsers(dest="confirm_cmd", required=False)
-    cfsub.add_parser("list", help="policies and anything waiting for an answer")
-    cfyes = cfsub.add_parser("yes", help="approve a pending question")
+    cfsub.add_parser("list", parents=[common],
+                     help="policies and anything waiting for an answer")
+    cfyes = cfsub.add_parser("yes", parents=[common],
+                             help="approve a pending question")
     cfyes.add_argument("token")
-    cfno = cfsub.add_parser("no", help="decline a pending question")
+    cfno = cfsub.add_parser("no", parents=[common],
+                            help="decline a pending question")
     cfno.add_argument("token")
     cfask = cfsub.add_parser(
-        "ask", help="ask the user before doing something; exits 0 for yes, "
-                    "3 for no. This is the gate a dispatched agent calls.")
+        "ask", parents=[common],
+        help="ask the user before doing something; exits 0 for yes, "
+             "3 for no. This is the gate a dispatched agent calls.")
     cfask.add_argument("klass", metavar="CLASS")
     cfask.add_argument("detail", nargs="*")
     cfask.add_argument("--timeout", type=float, default=120.0)
     cf.set_defaults(func=cmd_confirm, confirm_cmd="list")
 
-    cn = sub.add_parser("cancel", help="cancel an in-flight request")
+    am = add("ambient", help="the three things she notices on her own")
+    amsub = am.add_subparsers(dest="amb_cmd", required=False)
+    amdiag = amsub.add_parser(
+        "diagnose", parents=[common],
+        help="work out why a process crashed (the crash toast's click action)")
+    amdiag.add_argument("pid", type=int, help="the pid that dumped core")
+    amdiag.add_argument("--exe", default="", help="the crashed command's name")
+    amdiag.add_argument("--when", default="", help="when it happened")
+    am.set_defaults(func=cmd_ambient)
+
+    cn = add("cancel", help="cancel an in-flight request")
     cn.add_argument("target", nargs="?", default=None)
     cn.add_argument("--all", action="store_true")
     cn.set_defaults(func=cmd_cancel)

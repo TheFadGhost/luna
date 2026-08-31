@@ -25,6 +25,39 @@ def encode(obj: dict[str, Any]) -> bytes:
     return (json.dumps(obj, ensure_ascii=False, default=str) + "\n").encode("utf-8")
 
 
+def read_line(rfile: Any, max_bytes: int = MAX_LINE_BYTES) -> bytes:
+    """Read one newline-terminated line, bounded *while reading*.
+
+    ``rfile.readline()`` with no size argument buffers the whole line before
+    handing it back, so a client that sends ``max_bytes`` of data with no
+    newline in sight grows the daemon's memory by exactly that much before
+    ``decode`` ever gets a chance to reject it on length. Each ``readline()``
+    call here is itself capped, so the read is abandoned as soon as the total
+    crosses ``max_bytes`` rather than after the whole (unbounded) line has
+    already been buffered.
+
+    Low severity in this daemon specifically — the socket is a 0600 unix
+    socket, local-only — but it is a real amplification and it costs nothing
+    to close.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        # +1 so a line landing on exactly max_bytes still reads its own
+        # newline in the same call, rather than needing one more empty read
+        # to discover there is nothing left.
+        chunk = rfile.readline(max_bytes - total + 1)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if chunk.endswith(b"\n"):
+            break
+        if total > max_bytes:
+            raise ProtocolError(f"request exceeds {max_bytes} bytes")
+    return b"".join(chunks)
+
+
 def decode(line: bytes) -> dict[str, Any]:
     if len(line) > MAX_LINE_BYTES:
         raise ProtocolError(f"request exceeds {MAX_LINE_BYTES} bytes")

@@ -603,6 +603,9 @@ class DriftCase(unittest.TestCase):
         ("dispatch.job_retention_days", "JOB_RETENTION_DAYS"),
         ("audit.max_mb", "AUDIT_MAX_MB"),
         ("audit.keep", "AUDIT_KEEP"),
+        ("ambient.poll_seconds", "AMBIENT_POLL_S"),
+        ("ambient.battery_low_pct", "AMBIENT_BATTERY_LOW_PCT"),
+        ("ambient.battery_critical_pct", "AMBIENT_BATTERY_CRITICAL_PCT"),
     )
 
     def test_every_default_matches_its_fallback_constant(self) -> None:

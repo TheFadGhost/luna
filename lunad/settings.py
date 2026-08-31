@@ -134,10 +134,25 @@ SCHEMA: tuple[Section, ...] = (
             Key("name", "Luna", "str",
                 comment="display name + how she refers to herself"),
             Key("specialist", "Sol", "str", comment="the delegate persona"),
-            Key("agent", "claude", "str", choices=("claude", "codex"),
+            # codex, not claude. Luna's brain is `codex` running
+            # `gpt-5.6-luna`: it has a shell, web access and native vision, and
+            # the ask path now runs with all three switched on. This key is the
+            # one that decides — deliberately here and NOT in
+            # ~/.config/omarchy/defaults/agent, which is the whole desktop's
+            # default agent and is read by things that are not Luna. Changing
+            # that file to change her brain would have been a change to
+            # everyone else's.
+            Key("agent", "codex", "str", choices=("claude", "codex"),
                 comment="claude | codex   (falls back to "
                         "~/.config/omarchy/defaults/agent)"),
-            Key("model", "", "str", comment='"" = agent default'),
+            # Still "", and still meaning "the agent's own default" — which for
+            # codex is `gpt-5.6-luna` (config.CODEX_ASK_MODEL) and for claude is
+            # whatever claude picks. A model slug is not portable between
+            # agents, so pinning one here would be wrong the moment `agent`
+            # changed; the default belongs to the adapter, and this key is the
+            # override for someone who wants a different one.
+            Key("model", "", "str",
+                comment='"" = agent default (codex: gpt-5.6-luna)'),
         ),
     ),
     Section(
@@ -229,6 +244,13 @@ SCHEMA: tuple[Section, ...] = (
             Key("consolidate_every_turns", 12, "int", minimum=0, maximum=1000,
                 comment="0 = never; the pass costs tokens"),
             Key("decay_half_life_days", 30, "int", minimum=1, maximum=3650),
+            # Read late, on every recall, so a change takes effect on the next
+            # question without a restart. Off is not a degraded mode: recall
+            # falls back to the keyword index it has always had, which is also
+            # what happens on its own when the model is absent.
+            Key("semantic_recall", True, "bool",
+                comment="search episodes by meaning as well as by keyword; "
+                        "needs `luna embed fetch`"),
         ),
     ),
     Section(
@@ -269,6 +291,53 @@ SCHEMA: tuple[Section, ...] = (
                 comment="rotate once the live log passes this; 0 = never"),
             Key("keep", 5, "int", minimum=1, maximum=100,
                 comment="numbered siblings kept; the oldest is deleted"),
+        ),
+    ),
+    Section(
+        "ambient",
+        align=22,
+        header=(
+            "The three things she notices on her own. Ambient events NOTIFY;",
+            "they never speak -- speaking aloud is reserved for a job the "
+            "user started.",
+        ),
+        keys=(
+            Key("enabled", True, "bool",
+                comment="master switch for all three hooks"),
+            Key("poll_seconds", 60, "int", minimum=5, maximum=3600,
+                comment="one tick; each hook is a stat(), not a fork"),
+            # OFF, and for the same reason `battery` is: Omarchy already
+            # ships `omarchy-crash-watch.service`, it is running, and it does
+            # this better -- it streams the coredump MESSAGE_ID out of the
+            # journal (so it has the signal name and the full exe path, which
+            # a core filename does not) and its toast already offers a
+            # click-to-diagnose against the same skill. Luna's exists for
+            # anyone who has turned that one off, or who wants the crash and
+            # the diagnosis in her audit log and her job list instead.
+            Key("crash", False, "bool",
+                comment="OFF: omarchy-crash-watch already announces these"),
+            Key("crash_diagnose", True, "bool",
+                comment="when crash is on, the toast's click dispatches it"),
+            # OFF by default, and the only hook that is. Omarchy already
+            # notifies at 10% from its own bar service, and UPower hibernates
+            # at 2%. A second source nagging about the same battery at the
+            # same moment is worse than none, so this stays off until somebody
+            # decides they want an *earlier* warning than the desktop's.
+            Key("battery", False, "bool",
+                comment="OFF: Omarchy already warns at 10%"),
+            Key("battery_low_pct", 20, "int", minimum=1, maximum=100,
+                comment="above Omarchy's 10% toast"),
+            Key("battery_critical_pct", 5, "int", minimum=1, maximum=100,
+                comment="below it, above UPower's 2% hibernate"),
+            Key("update", True, "bool",
+                comment="an omarchy update landed and rewrote /usr/share"),
+        ),
+        footer=(
+            "'An update is available' is deliberately NOT checked here: that "
+            "costs a",
+            "network sync (checkupdates), and Omarchy's own bar widget "
+            "already polls it",
+            "every six hours and shows the answer.",
         ),
     ),
     Section(

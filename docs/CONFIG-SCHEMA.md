@@ -26,8 +26,8 @@ default and its fallback ever disagree again.
 [assistant]
 name         = "Luna"        # display name + how she refers to herself
 specialist   = "Sol"         # the delegate persona
-agent        = "claude"      # claude | codex   (falls back to ~/.config/omarchy/defaults/agent)
-model        = ""            # "" = agent default
+agent        = "codex"       # claude | codex   (falls back to ~/.config/omarchy/defaults/agent)
+model        = ""            # "" = agent default (codex: gpt-5.6-luna)
 
 [voice]
 enabled      = true
@@ -81,6 +81,7 @@ luna_cap_chars = 3000
 user_cap_chars = 2000
 consolidate_every_turns = 12  # 0 = never; the pass costs tokens
 decay_half_life_days = 30
+semantic_recall = true  # search episodes by meaning as well as by keyword; needs `luna embed fetch`
 
 [dispatch]
 workspace          = "luna"  # hyprland special workspace name
@@ -93,6 +94,21 @@ job_retention_days = 14      # finished job directories older than this are coll
 [audit]
 max_mb = 8                   # rotate once the live log passes this; 0 = never
 keep   = 5                   # numbered siblings kept; the oldest is deleted
+
+# The three things she notices on her own. Ambient events NOTIFY;
+# they never speak -- speaking aloud is reserved for a job the user started.
+[ambient]
+enabled                = true   # master switch for all three hooks
+poll_seconds           = 60     # one tick; each hook is a stat(), not a fork
+crash                  = false  # OFF: omarchy-crash-watch already announces these
+crash_diagnose         = true   # when crash is on, the toast's click dispatches it
+battery                = false  # OFF: Omarchy already warns at 10%
+battery_low_pct        = 20     # above Omarchy's 10% toast
+battery_critical_pct   = 5      # below it, above UPower's 2% hibernate
+update                 = true   # an omarchy update landed and rewrote /usr/share
+# 'An update is available' is deliberately NOT checked here: that costs a
+# network sync (checkupdates), and Omarchy's own bar widget already polls it
+# every six hours and shows the answer.
 
 [ui]
 theme_follows_omarchy = true
@@ -188,6 +204,7 @@ file and the file cannot re-enable them.
 | `user_cap_chars` | `memory.Tier1File.cap` | Live, same. |
 | `consolidate_every_turns` | `consolidate.Consolidator` | Live. Counts completed asks; on the Nth, a background pass reads the tier-2 episodes recorded since the last one, rebuilds the tier-3 profile, and proposes tier-1 edits through the model. **`0` means never** — nothing is counted, no pass starts, no tokens are spent, and `luna memory consolidate` refuses too rather than spending money the setting has ruled out. The pass is subject to the ordinary cap contract: a proposal that would overflow a file is rejected whole and recorded, and the file is left exactly as it was. Never blocks a reply. The counter is the *automatic* trigger only: a pass asked for by hand runs whatever it says (above `0`) and leaves it untouched. |
 | `decay_half_life_days` | `memory.decayed_salience` | Live. Decay is applied at read time, so a change reaches the very next recall. Corrections score 1.0 and never decay regardless. |
+| `semantic_recall` | `embed.Embedder.enabled` | Live, read on every recall, so a change takes effect on the very next question without a restart. On, tier-2 recall matches episodes by meaning as well as by keyword, which needs the embedding model — `luna embed fetch`, 86 MB, Apache-2.0. **Off is not a degraded mode and neither is a missing model**: recall falls back to the FTS5 keyword index it has always had, with no error and no other change in behaviour. `luna embed status` says which of the two is in force. |
 
 `SOL.md` has a cap of its own (`config.SOL_MD_CAP`) with no key: Sol's
 namespace is deliberately outside the user-facing contract.
@@ -207,6 +224,39 @@ namespace is deliberately outside the user-facing contract.
 |---|---|---|
 | `max_mb` | `audit.AuditLog.append` | Live, checked after each line on the position the write already reached — so the decision costs no extra syscall and can never land between a line and its `fsync`. A rotated sibling is therefore one line *past* the ceiling, never short of it. `0` means never rotate, for the same reason `job_retention_days` has an off switch: this is evidence, and someone keeping a machine under scrutiny must be able to say "grow without bound" in the file rather than by patching the daemon. |
 | `keep` | `audit.AuditLog.append` | Live. The live file becomes `audit.jsonl.1`, each sibling shifts up one, and only `audit.jsonl.<keep>` is ever deleted — and that deletion is itself an entry, `audit.rotated`, written as the **first line of the new live file**, naming what was renamed and what was dropped. So the chain reads backwards from the live file and any gap in it explains itself. `luna audit` reads the siblings too, stopping at the first file that cannot hold anything the query asked for. Lowering `keep` from 8 to 5 leaves `.6` and `.7` on disk and rotation will never touch them again — they are still *read*, because history you stopped rotating is not the same as history that silently stopped existing. Delete them by hand if you want them gone. |
+
+### `[ambient]`
+
+Read by `ambient.Ambient` and its three watchers, live, on the next tick. This
+is the only table whose keys make `lunad` do something **nobody asked for**, so
+each one says what it costs and the one that duplicates the desktop is off.
+
+**The rule the whole table serves: an ambient event notifies, it never speaks.**
+That is not a setting and there is no key to change it. `lunad/ambient.py` does
+not import `lunad.speech`, `Ambient` refuses any delivery channel that is not a
+`Notifier`, and it refuses at construction any collaborator with a `.say()` —
+`tests/test_ambient.py::NeverSpeaksCase` fails if any of the three is weakened.
+Speaking aloud stays reserved for the completion of a job the user themselves
+started.
+
+| key | read by | effect |
+|---|---|---|
+| `enabled` | `ambient.Ambient.tick` | Live. `false` and the thread still ticks but every watcher is skipped, so turning it back on costs nothing and needs no restart. Two of the three hooks under it are off by default, both for the same reason: **the desktop already does it.** What is left on is the one thing nothing else on this machine watches — that an `omarchy update` landed. |
+| `poll_seconds` | `ambient.Ambient.interval` | Live, on the next wake. The floor is 5 s and the schema minimum enforces it; the default of 60 is already far below the noise floor — a tick that finds nothing is three `stat()`s and a 12-byte read, and the settings watcher this daemon has run since P2b stats its config file thirty times more often. Each hook has its own cadence on top: crash and battery every tick, `update` every 300 s. |
+| `crash` | `ambient.CrashWatcher` | Live. **Defaults to `false`, and the reason is the same rule that keeps `battery` off: Omarchy got there first.** `omarchy-crash-watch.service` ships with Omarchy, is enabled, and is running — it streams the coredump `MESSAGE_ID` out of the journal (event-driven, no polling at all), dedupes crash loops on a 60 s window, and toasts *"Process crashed: &lt;comm&gt;"* with a click that runs `omarchy-agent-crash` against the **same** `diagnose-crash` skill. It knows the signal name and the full executable path, which a core *filename* does not, so it is strictly better at the job. Luna's is kept for the two things the desktop's cannot do — put the crash in her **audit log** and the diagnosis in her **job list**, under her confirmation policy — and for anyone who has run `omarchy-toggle-crash-capture` to turn the other one off. Turned on behind a live `omarchy-crash-watch`, you get two toasts per crash and one warning in the log saying so. When it is on: one `stat()` on `/var/lib/systemd/coredump` per tick, a `scandir` only when the mtime moves, and it **never forks `coredumpctl`**. Only this user's dumps. First run seeds silently, so a fresh daemon does not announce the fortnight of history tmpfiles keeps, and a burst of more than three in one tick coalesces into a single toast — this machine writes eight `foot` cores in a minute when a suite deletes a running script. |
+| `crash_diagnose` | `ambient.CrashWatcher._diagnose` | Live. When `crash` is on, puts the diagnosis one click away: the toast's single action is `luna ambient diagnose <pid>`, which dispatches an agent session pointed at the `diagnose-crash` skill. It is **not** automatic, and that is deliberate — a diagnosis is a real model call and a terminal window, and running one unasked on every core dump is Luna acting rather than noticing. `false` leaves the crash a plain notification. |
+| `battery` | `ambient.BatteryWatcher` | Live. **Defaults to `false`**, alone in this table, because Omarchy already owns this: `shell/plugins/services/battery/Service.qml` polls every 30 s and runs `omarchy-battery-low` at 10%, and UPower hibernates at 2%. A second toast about the same battery at the same moment is worse than none. Turn it on if you want an *earlier* warning than the desktop's. The battery is found by reading each `/sys/class/power_supply/*/type` for `Battery` rather than assumed — on this laptop it is `BAT1`, not `BAT0`, and it has no `charge_now` at all. |
+| `battery_low_pct` | `ambient.BatteryWatcher.thresholds` | Live. Fires once while discharging at or below this, and re-arms only on mains or on climbing back above it. Sits above Omarchy's 10% on purpose so the two do not land together. |
+| `battery_critical_pct` | `ambient.BatteryWatcher.thresholds` | Live. Below Omarchy's 10% and above UPower's 2% hibernate, so it is the last warning before the machine acts on its own. Clamped to `battery_low_pct` if set higher, because a critical above the low would make the low unreachable. |
+| `update` | `ambient.UpdateWatcher` | Live, every 300 s. Two `stat()`s and a 12-byte read: `/usr/share/omarchy/version` (contents **and** mtime) plus `/tmp/omarchy-update.log`. This is the hook that matters most — `omarchy update` is `pacman -Syu --overwrite '/usr/share/omarchy/*'`, which rewrites that whole tree, and it is exactly how a customisation gets silently reverted. The mtime is checked as well as the version string because a same-version reinstall clobbers just as thoroughly. A run that moved no package is reported at `low` urgency rather than not at all. |
+
+**"An update is available" is not here, on purpose.** That check is
+`omarchy-update-available`, which runs `checkupdates` and syncs a pacman
+database over the network. Omarchy's own `SystemUpdate.qml` bar widget already
+runs it on a six-hour timer and shows the result, so a second poller would cost
+the network and the battery to duplicate a light the user is already looking
+at. The half worth having is the half the bar does *not* show: that an update
+already landed and took `/usr/share/omarchy` with it.
 
 ### `[ui]`
 
