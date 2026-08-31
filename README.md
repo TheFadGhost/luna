@@ -42,9 +42,18 @@ bin/luna audit --since 30m                 # what she did, and why
 bin/luna spawned --check 12345             # ask the firewall about a pid
 bin/luna settings                          # the live config, and where it lives
 bin/luna settings set voice.voice flux-donovan-en
+bin/luna settings set assistant.name 42 --string   # keep a value literal
+bin/luna embed status                      # semantic recall: on? model here?
 bin/luna confirm                           # the policy, and anything waiting
 bin/luna confirm yes <token>               # release a pending confirmation
 ```
+
+`--json` is accepted before or after the subcommand and prints the daemon's
+reply unchanged. Everything else is laid out for a terminal: aligned columns,
+weight for hierarchy, and one colour, red, which only ever means something is
+wrong. It is width-aware, it obeys [`NO_COLOR`](https://no-color.org), and it
+emits no escape sequence at all when stdout is not a terminal — so piping any
+of it, `--json` or not, gets bytes.
 
 ## Delegation
 
@@ -172,15 +181,21 @@ The model is **not** in this repository and is never downloaded behind a
 question. A fresh clone answers on keywords alone until you run
 
 ```
-python3 -m lunad.embed fetch      # ~86 MB into ~/.local/share/luna/models/
+bin/luna embed fetch              # ~86 MB into ~/.local/share/luna/models/
 ```
 
 after which paraphrase works too: measured on the real database, *"how much
 charge is left"* went from retrieving nothing to retrieving both episodes
 about the battery, while *"so anyway do you think I should do something about
-this"* still retrieves nothing at all. `python3 -m lunad.embed status` says
-whether the model is present and `backfill` indexes old episodes by hand —
-though it happens on its own, in the background, on mains power.
+this"* still retrieves nothing at all. `luna embed status` says whether the
+model is present, whether the setting is on, and what to type about either;
+`luna embed backfill` indexes old episodes by hand — though it happens on its
+own, in the background, on mains power.
+
+`[memory] semantic_recall = false` turns it off without deleting anything.
+Off is not a degraded mode, and neither is a model that was never fetched:
+recall falls back to the keyword index it has always had, with no error and no
+other change in behaviour.
 
 ## Contributing
 
