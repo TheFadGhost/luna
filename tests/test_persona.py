@@ -62,6 +62,20 @@ class SpecGateCase(unittest.TestCase):
                       self.spec)
         self.assertIn("she makes no tool call at all", self.spec)
 
+    def test_read_only_depth_still_goes_to_the_specialist(self) -> None:
+        """The first cut of the decision rule said "read-only -> just do it",
+        and she pulled a whole retrieval-code audit into that branch: she
+        dispatched Sol *and* did the work herself, told the user about neither
+        the job nor the terminal it opened, and answered the same question
+        twice. Read-only is not the same as cheap."""
+        self.assertIn("Read-only is not", self.spec)
+        self.assertIn("depth goes to Sol even when it changes nothing",
+                      self.spec)
+
+    def test_a_dispatch_is_announced_and_not_also_done_by_hand(self) -> None:
+        self.assertIn("Having dispatched, she says so and stops.", self.spec)
+        self.assertIn("She does not also do the job herself", self.spec)
+
     def test_delegating_does_not_skip_the_gate(self) -> None:
         """`dispatch` was the escape hatch she actually used."""
         self.assertIn("Delegating is acting.", self.spec)
@@ -126,6 +140,11 @@ class OperatingNotesGateCase(unittest.TestCase):
     def test_the_objecting_turn_makes_no_tool_call(self) -> None:
         self.assertIn("you make no tool call at all that turn", self.notes())
 
+    def test_the_notes_forbid_doing_a_dispatched_job_twice(self) -> None:
+        notes = self.notes()
+        self.assertIn("Do not also do the", notes)
+        self.assertIn("do not dispatch silently", notes)
+
     def test_a_failed_command_is_quoted_not_paraphrased(self) -> None:
         notes = self.notes()
         self.assertIn("When a command fails, report what it actually printed.",
@@ -141,6 +160,30 @@ class OperatingNotesGateCase(unittest.TestCase):
         self.assertIn(
             "call a job started, queued or underway unless the command",
             self.notes())
+
+    def test_the_four_hard_denies_bind_her_too(self) -> None:
+        """`CODEX_ASK_SANDBOX` is "bypass": her own ask has no sandbox, and
+        the boundaries were only ever given to the sessions she dispatches.
+        She was enforcing on Sol a rule nobody had told her applied to her."""
+        notes = self.notes()
+        for rule in ("signalling a process you",
+                     "restarting `omarchy-shell`",
+                     "CUSTOMISATIONS.md",
+                     "`rm -rf` outside your own directories"):
+            with self.subTest(rule=rule):
+                self.assertIn(rule, notes)
+
+    def test_a_hard_deny_does_not_bend_to_being_overruled(self) -> None:
+        self.assertIn("Being overruled does not unlock these four",
+                      self.notes())
+
+    def test_the_count_is_pinned_to_the_enforcer(self) -> None:
+        """The notes say "four". `confirm` is the authority, so a fifth deny
+        must not be able to land without this block being updated."""
+        from lunad import confirm
+        self.assertEqual(len(confirm.HARD_DENIES) + 1, 4,
+                         "the hard denies changed; the operating notes still "
+                         "say 'Four things are refused outright'")
 
     def test_the_shell_is_still_granted(self) -> None:
         """The gate must not have turned into a ban. She still acts."""
