@@ -13,7 +13,7 @@ Hierarchy is size, weight, colour value and whitespace; the only geometry
 left is the window's own chrome and the controls themselves.
 
 Every row is the same three columns — label, control, trailing note — so the
-eye can run down one x for any of the three across all seven panes.
+eye can run down one x for any of the three across all eight panes.
 """
 
 from __future__ import annotations

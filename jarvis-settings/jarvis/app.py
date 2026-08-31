@@ -1,6 +1,6 @@
 """Jarvis — the settings app for the Luna assistant daemon.
 
-A sidebar and seven panes, drawn from the live Omarchy palette so it sits
+A sidebar and eight panes, drawn from the live Omarchy palette so it sits
 next to Sill rather than next to a stock GTK dialog. The window has no
 GtkHeaderBar: it draws its own title row, the same way every other surface on
 this desktop does.
@@ -30,6 +30,7 @@ PANES = (
     ("voice", "Voice"),
     ("listen", "Listening"),
     ("confirm", "Confirmations"),
+    ("ambient", "Ambient"),
     ("memory", "Memory"),
     ("jobs", "Jobs"),
     ("about", "About"),
@@ -236,7 +237,15 @@ class JarvisApp(Gtk.Application):
         return bar
 
     def _sidebar(self):
-        """Seven names, and nothing else.
+        """Eight names, and nothing else.
+
+        The order is a sentence: who she is, how she hears and speaks, what
+        she may do when you ask, what she notices when you do not, what she
+        remembers, what she ran, and where it all lives. Ambient sits next to
+        Confirmations because they are the two halves of one question —
+        Confirmations governs what she may do unattended once you have asked
+        her for something, Ambient governs the only things she does when
+        nobody has asked her for anything at all.
 
         The row that is selected is the one drawn in full contrast and bold
         weight — no accent bar, no pill, no fill, no left border. The 1–7
@@ -278,6 +287,8 @@ class JarvisApp(Gtk.Application):
             return panes.listen_pane(b, self.set_status)
         if key == "confirm":
             return panes.confirm_pane(b)
+        if key == "ambient":
+            return panes.ambient_pane(b)
         if key == "memory":
             return panes.memory_pane(b, self.win)
         if key == "jobs":

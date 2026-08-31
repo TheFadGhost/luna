@@ -1,4 +1,4 @@
-"""The seven panes.
+"""The eight panes.
 
 Every editable control is produced by `Binder.control_for(dotted)`, which
 dispatches on the schema field kind. That is the whole point: a setting added
@@ -16,7 +16,8 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 
-from . import async_util, client, config, models, schema, state, voices, voxtype
+from . import (ambient, async_util, client, config, models, schema, state,
+               voices, voxtype)
 from .theme import COLUMN, RHYTHM, SPACE
 from .widgets import (TriToggle, act, clear, column, group, head, label,
                       locked_entry, row, rowbox, scroller, separator,
@@ -690,6 +691,283 @@ def confirm_pane(b):
                    "path that writes them. They protect other running "
                    "sessions and the machine's own record of itself."),
     )
+
+
+def _and_list(items):
+    """`a`, `a and b`, `a, b and c` — a sentence, not a comma-joined list."""
+    items = list(items)
+    if len(items) < 2:
+        return items[0] if items else ""
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def ambient_pane(b):
+    """The three things she notices without being asked.
+
+    Two of the three ship off, and this pane's job is to say *why* without
+    standing in the way of turning them on. Omarchy already watches crashes
+    and the battery and is better at both, so the argument sits next to the
+    switch instead of in a manual, and it is sourced from lunad's own
+    `desktop_already_watching()` rather than asserted here — see
+    jarvis.ambient. Nothing is disabled on that account: a user who turns the
+    crash hook on gets it, and gets told what it will cost them.
+
+    Two idioms are borrowed from the Confirmations pane, because this is the
+    other surface where the machine acts without being asked each time. The
+    live count above the rows: the shape of what she notices on her own
+    should be readable in one look, not assembled from three switches. And
+    the one fact that has to carry weight — that the hook you just switched
+    on duplicates a service running right now — is the only full-contrast
+    thing here, the way `Allow` is the only one there.
+
+    None of the handlers below reads the widget it is attached to; they all
+    re-read the editor, which the Binder has already written by the time they
+    run. That keeps every closure free of its own widget (CUSTOMISATIONS.md
+    §6e) and means one function states the whole pane's dependent state,
+    rather than three switches each knowing a piece of it.
+    """
+    ed = b.editor
+    f = ambient.facts()
+
+    # Built before the rows so the pane can listen to them as well as bind
+    # them: every one of these changes something else on the pane.
+    master_ctl = b.control_for("ambient.enabled")
+    update_ctl = b.control_for("ambient.update")
+    crash_ctl = b.control_for("ambient.crash")
+    diagnose_ctl = b.control_for("ambient.crash_diagnose")
+    battery_ctl = b.control_for("ambient.battery")
+    low_ctl = b.control_for("ambient.battery_low_pct", COLUMN["narrow"])
+    crit_ctl = b.control_for("ambient.battery_critical_pct", COLUMN["narrow"])
+
+    # Full contrast, body size: the count of hooks that will act unprompted is
+    # the headline fact of this pane, exactly as the count of unattended
+    # action classes is on Confirmations.
+    summary = label("", css=("rowlabel",), wrap=True, measure=COLUMN["note"])
+
+    n_update, n_crash, n_diagnose = (state_note(""), state_note(""),
+                                     state_note(""))
+    n_battery, n_low, n_crit = state_note(""), state_note(""), state_note("")
+
+    def note_line():
+        return label("", css=("rowdoc",), wrap=True, measure=COLUMN["note"])
+
+    live_update, live_crash, live_battery = (note_line(), note_line(),
+                                             note_line())
+
+    r_enabled = b.bound_row("ambient.enabled", ctl=master_ctl)
+    r_poll = b.bound_row("ambient.poll_seconds", width=COLUMN["narrow"])
+    r_update = b.bound_row("ambient.update", ctl=update_ctl, trail=n_update)
+    r_crash = b.bound_row("ambient.crash", ctl=crash_ctl, trail=n_crash)
+    r_diagnose = b.bound_row("ambient.crash_diagnose", ctl=diagnose_ctl,
+                             trail=n_diagnose)
+    r_battery = b.bound_row("ambient.battery", ctl=battery_ctl,
+                            trail=n_battery)
+    r_low = b.bound_row("ambient.battery_low_pct", width=COLUMN["narrow"],
+                        ctl=low_ctl, trail=n_low)
+    r_crit = b.bound_row("ambient.battery_critical_pct",
+                         width=COLUMN["narrow"], ctl=crit_ctl, trail=n_crit)
+
+    # A dependent row that is inert has to look inert *and say so*, the way
+    # the Voice pane does when speech is off. Grey rows on their own read as
+    # broken; a sentence reads as a consequence.
+    off_all = note_line()
+    off_all.set_text(
+        "Noticing is off, so none of the three hooks below runs. The thread "
+        "still ticks, so switching it back on takes effect on the next tick "
+        "and needs no restart. Everything below is still saved.")
+    off_crash = note_line()
+    off_crash.set_text(
+        "There is no toast to put an action on while crashes are not "
+        "watched. The setting is still saved.")
+    off_battery = note_line()
+    off_battery.set_text(
+        "Neither threshold is read while the battery is not watched. Both "
+        "are still saved.")
+
+    def mark(note, text, risk=False):
+        note.set_text(text)
+        note.set_visible(bool(text))
+        if risk:
+            note.add_css_class("risk")
+        else:
+            note.remove_css_class("risk")
+
+    def restate(*_a):
+        on = bool(ed.get("ambient.enabled"))
+        upd = bool(ed.get("ambient.update"))
+        crash = bool(ed.get("ambient.crash"))
+        diag = bool(ed.get("ambient.crash_diagnose"))
+        batt = bool(ed.get("ambient.battery"))
+        try:
+            low = int(ed.get("ambient.battery_low_pct") or 0)
+            crit = int(ed.get("ambient.battery_critical_pct") or 0)
+        except (TypeError, ValueError):
+            low, crit = 0, 0
+        duplicated = ambient.duplicated_hooks(ed.values)
+
+        # The master gate first, then the dependents inside it: a threshold
+        # under a hook that is on, under a master that is off, is still inert.
+        off_all.set_visible(not on)
+        for w in (r_poll, r_update, r_crash, r_diagnose, r_battery, r_low,
+                  r_crit):
+            w.set_sensitive(on)
+        off_crash.set_visible(on and not crash)
+        r_diagnose.set_sensitive(on and crash)
+        off_battery.set_visible(on and not batt)
+        for w in (r_low, r_crit):
+            w.set_sensitive(on and batt)
+
+        live = [name for name, flag in (("an update landing", upd),
+                                        ("crashes", crash),
+                                        ("the battery", batt)) if flag]
+        if not on:
+            summary.set_text(
+                "Noticing is off. She notices nothing on her own, whatever "
+                "the three hooks below say.")
+        elif not live:
+            summary.set_text(
+                "All three hooks are off. She notices nothing on her own.")
+        else:
+            summary.set_text(
+                f"{len(live)} of 3 hooks on — she notices {_and_list(live)}.")
+
+        # A trailing note says what a setting is *currently doing*, so a row
+        # that is inert says nothing at all: "watching" under a master switch
+        # that is off would be false, and dimming it does not make it true.
+        # The sentence above each inert block is what explains the silence.
+        dup = "crash" in duplicated
+        mark(n_update, ("watching" if upd else "off") if on else "")
+        mark(n_crash, ("duplicated" if dup else
+                       ("watching" if crash else "off")) if on else "",
+             risk=dup)
+        mark(n_diagnose, ("one click away" if diag else "no action")
+             if on and crash else "")
+        mark(n_battery, ("watching" if batt else "off") if on else "")
+        if not (on and batt):
+            mark(n_low, "")
+            mark(n_crit, "")
+        else:
+            # Silence means the value sits where it was meant to. A note
+            # appears only where a threshold has stopped doing its job.
+            mark(n_low, "" if low > 10 else
+                 ("with Omarchy's" if low == 10 else "after Omarchy's"))
+            if crit > low:
+                # The daemon clamps this rather than refusing it, so the clamp
+                # is silent unless something here says it out loud.
+                mark(n_crit, f"clamped to {low}%", risk=True)
+            else:
+                mark(n_crit, "under UPower's" if crit <= 2 else "")
+
+        # --- what she would actually be reading, right now -----------------
+        if f["version"]:
+            live_update.set_text(
+                f"{f['version_file']} reads {f['version']}, written "
+                f"{f['version_written']}. Both the text and that date are "
+                "compared, every 300 seconds.")
+        elif f["available"]:
+            live_update.set_text(
+                "The version file could not be read, so this hook has nothing "
+                "to compare — the daemon treats that as “not an Omarchy "
+                "machine” rather than as an error.")
+        else:
+            live_update.set_text(
+                "Jarvis could not ask lunad which file this watches.")
+
+        unit = f["crash_unit"]
+        if f["crash_desktop"] and on and crash:
+            live_crash.set_text(
+                f"{unit} is running right now, so this gives you two toasts "
+                "for one crash — hers as well as the desktop's. Nothing is "
+                "blocked: `omarchy-toggle-crash-capture` turns the desktop's "
+                "off if you would rather have only hers.")
+            live_crash.add_css_class("locked-value")
+            live_crash.remove_css_class("rowdoc")
+        else:
+            live_crash.add_css_class("rowdoc")
+            live_crash.remove_css_class("locked-value")
+            if f["crash_desktop"]:
+                live_crash.set_text(
+                    f"{unit} is running right now, which is why this ships "
+                    "off.")
+            elif f["crash_desktop"] is False:
+                live_crash.set_text(
+                    f"{unit} is not active here, so nothing else on this "
+                    "machine announces a crash.")
+            else:
+                live_crash.set_text(
+                    f"Jarvis could not ask lunad whether {unit} is live, so "
+                    "it is not saying either way.")
+
+        if f["battery_device"]:
+            reading = (f"{f['battery_pct']}%, {f['battery_status'].lower()}"
+                       if f["battery_pct"] is not None else "no reading")
+            live_battery.set_text(
+                f"{f['battery_device']} reads {reading}. The device is found "
+                "by asking each one its type, never by assuming BAT0.")
+        elif f["available"]:
+            live_battery.set_text(
+                "No battery device was found, so this hook has nothing to "
+                "read.")
+        else:
+            live_battery.set_text(
+                "Jarvis could not ask lunad which battery this watches.")
+
+    def rebuild():
+        """Re-read the machine, then restate. Runs on every visit to the pane
+        — the battery percentage is the one fact here that moves."""
+        nonlocal f
+        f = ambient.facts()
+        restate()
+
+    for ctl in (master_ctl, update_ctl, crash_ctl, diagnose_ctl, battery_ctl):
+        ctl.connect("notify::active", restate)
+    for ctl in (low_ctl, crit_ctl):
+        ctl.connect("value-changed", restate)
+    restate()
+
+    p = pane(
+        head("Ambient",
+             "The three things she notices without being asked. Two of them "
+             "are off, because the desktop already does the job — each one "
+             "says so, and says whose it is."),
+        group("Noticing", summary, r_enabled, off_all, r_poll,
+              note="An ambient event notifies; it never speaks aloud. That is "
+                   "not a setting and there is no key for it: the daemon's "
+                   "ambient module never imports the speech code, refuses any "
+                   "delivery channel that is not a notifier, and refuses at "
+                   "construction any collaborator that has a .say() at all — "
+                   "and a test walks the live object graph to prove no "
+                   "speaker is reachable from it. Speaking aloud stays "
+                   "reserved for a job you started."),
+        group("Updates", r_update, live_update,
+              note="`omarchy update` rewrites all of /usr/share/omarchy, "
+                   "which is exactly how a desktop customisation gets "
+                   "silently reverted — so this is the one hook nothing else "
+                   "on the machine covers. She reads both the version "
+                   "file's contents and its mtime, because a same-version "
+                   "reinstall clobbers just as thoroughly, plus "
+                   "/tmp/omarchy-update.log. Whether an update is available "
+                   "is deliberately not checked: that costs a network sync, "
+                   "and Omarchy's own bar widget already polls it every six "
+                   "hours and shows the answer."),
+        group("Crashes", r_crash, live_crash, off_crash, r_diagnose,
+              note="Omarchy ships omarchy-crash-watch.service, enabled, "
+                   "event-driven off the journal, and strictly better at this "
+                   "job: it knows the signal name and the full executable "
+                   "path, which a core file's name does not. Hers exists for "
+                   "the two things that one cannot do — put the crash in her "
+                   "audit log and the diagnosis in her job list, under her "
+                   "confirmation policy — and for anyone who has turned the "
+                   "desktop's off."),
+        group("Battery", r_battery, live_battery, off_battery,
+              r_low, r_crit,
+              note="Omarchy's own battery service polls every 30 seconds and "
+                   "fires omarchy-battery-low at 10%, and UPower hibernates "
+                   "at 2%. Hers sit either side of that rather than on top of "
+                   "it: one warning earlier than the desktop's, and one last "
+                   "one after it, before the machine acts on its own."))
+    p.jarvis_refresh = rebuild
+    return p
 
 
 def memory_pane(b, window):
