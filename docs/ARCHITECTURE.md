@@ -221,6 +221,15 @@ scored **0.311** and the highest false positive **0.269**, that FP being
 a near-miss rather than nonsense. The gap is narrow because the corpus is
 small; re-measure once tier 2 holds thousands of episodes.
 
+**A known rough edge, not fixed.** On the real database, "what terminal do I
+use" also injects episode 5 — four hundred repetitions of the word "word" —
+at coverage 0.50, because it OR-matched one of the query's two tokens. That is
+pre-existing *lexical* behaviour, unaffected by semantic recall (its cosine is
+0.00, so the embedding half contributes nothing to it). It is the strongest
+argument for eventually requiring some semantic agreement before an
+OR-widened hit is injected at all, but that would tighten recall for everyone
+and wants its own measurement rather than a reflexive tightening.
+
 Only the **user's turn** is embedded, not the whole exchange. Measured both
 ways: including Luna's reply recovers exactly one case out of thirteen and
 costs a false positive of the same magnitude, because her replies share a
