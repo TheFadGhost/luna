@@ -76,9 +76,26 @@ class SpecGateCase(unittest.TestCase):
         self.assertIn("Having dispatched, she says so and stops.", self.spec)
         self.assertIn("She does not also do the job herself", self.spec)
 
+    def test_pointlessness_is_also_a_trigger(self) -> None:
+        """She gated impossibility and hard denies, but ran cheerfully at
+        "write me a 2000-word essay about how much disk space I have left":
+        it changed nothing and cost nothing, so neither of the first two
+        triggers fired. Being able to do a thing is not a finding that it is
+        worth doing."""
+        self.assertIn("plainly out of proportion", self.spec)
+        self.assertIn("Possible, cheap and pointless still earns the question.",
+                      self.spec)
+
     def test_delegating_does_not_skip_the_gate(self) -> None:
         """`dispatch` was the escape hatch she actually used."""
         self.assertIn("Delegating is acting.", self.spec)
+
+    def test_a_delegated_job_is_priced_in_the_line_that_announces_it(self):
+        """Asked to read the whole tree she enrolled Sol and said so, but
+        never said what it would take. The estimate rule already existed; it
+        was simply nowhere near the act that keeps skipping it."""
+        self.assertIn("big enough to hand to Sol is big enough to price",
+                      self.spec)
 
     def test_the_two_objection_cap_still_binds_the_gate(self) -> None:
         self.assertIn("at most TWO objections", self.spec)
@@ -137,11 +154,15 @@ class OperatingNotesGateCase(unittest.TestCase):
     def test_read_only_work_is_done_without_asking(self) -> None:
         self.assertIn("go and get it now, without asking", self.notes())
 
+    def test_the_notes_gate_disproportion_too(self) -> None:
+        self.assertIn("plainly out of proportion to what it", self.notes())
+
     def test_the_objecting_turn_makes_no_tool_call(self) -> None:
-        self.assertIn("you make no tool call at all that turn", self.notes())
+        self.assertIn("make no tool call at all that turn", self.notes())
 
     def test_the_notes_forbid_doing_a_dispatched_job_twice(self) -> None:
         notes = self.notes()
+        self.assertIn("what it will roughly take", notes)
         self.assertIn("Do not also do the", notes)
         self.assertIn("do not dispatch silently", notes)
 
@@ -184,6 +205,13 @@ class OperatingNotesGateCase(unittest.TestCase):
         self.assertEqual(len(confirm.HARD_DENIES) + 1, 4,
                          "the hard denies changed; the operating notes still "
                          "say 'Four things are refused outright'")
+
+    def test_the_block_stays_hand_wrapped(self) -> None:
+        """Every assertion in this file matches inside a single line, so a
+        reflow past the margin is what silently breaks them. Cheaper to catch
+        the reflow."""
+        over = [ln for ln in self.notes().splitlines() if len(ln) > 80]
+        self.assertEqual(over, [], "operating notes lines must stay under 80")
 
     def test_the_shell_is_still_granted(self) -> None:
         """The gate must not have turned into a ban. She still acts."""
