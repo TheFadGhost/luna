@@ -243,6 +243,12 @@ SPEC: tuple[Section, ...] = (
             Number("decay_half_life_days", "Salience half-life",
                    "Trivia ages out on its own. Corrections never decay.",
                    default=30, min=1, max=365, step=1, unit="days"),
+            Toggle("semantic_recall", "Match meaning, not just words",
+                   "Off, recall is keyword-only, so \u201chow much charge is "
+                   "left\u201d finds nothing about the battery. On, it also "
+                   "needs the embedding model — `luna embed status` says "
+                   "whether it is there. Absent, this silently does nothing.",
+                   default=True),
         ),
     ),
     Section(
