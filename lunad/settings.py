@@ -244,6 +244,13 @@ SCHEMA: tuple[Section, ...] = (
             Key("consolidate_every_turns", 12, "int", minimum=0, maximum=1000,
                 comment="0 = never; the pass costs tokens"),
             Key("decay_half_life_days", 30, "int", minimum=1, maximum=3650),
+            # Read late, on every recall, so a change takes effect on the next
+            # question without a restart. Off is not a degraded mode: recall
+            # falls back to the keyword index it has always had, which is also
+            # what happens on its own when the model is absent.
+            Key("semantic_recall", True, "bool",
+                comment="search episodes by meaning as well as by keyword; "
+                        "needs `luna embed fetch`"),
         ),
     ),
     Section(

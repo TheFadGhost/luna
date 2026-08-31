@@ -81,6 +81,7 @@ luna_cap_chars = 3000
 user_cap_chars = 2000
 consolidate_every_turns = 12  # 0 = never; the pass costs tokens
 decay_half_life_days = 30
+semantic_recall = true  # search episodes by meaning as well as by keyword; needs `luna embed fetch`
 
 [dispatch]
 workspace          = "luna"  # hyprland special workspace name
@@ -203,6 +204,7 @@ file and the file cannot re-enable them.
 | `user_cap_chars` | `memory.Tier1File.cap` | Live, same. |
 | `consolidate_every_turns` | `consolidate.Consolidator` | Live. Counts completed asks; on the Nth, a background pass reads the tier-2 episodes recorded since the last one, rebuilds the tier-3 profile, and proposes tier-1 edits through the model. **`0` means never** — nothing is counted, no pass starts, no tokens are spent, and `luna memory consolidate` refuses too rather than spending money the setting has ruled out. The pass is subject to the ordinary cap contract: a proposal that would overflow a file is rejected whole and recorded, and the file is left exactly as it was. Never blocks a reply. The counter is the *automatic* trigger only: a pass asked for by hand runs whatever it says (above `0`) and leaves it untouched. |
 | `decay_half_life_days` | `memory.decayed_salience` | Live. Decay is applied at read time, so a change reaches the very next recall. Corrections score 1.0 and never decay regardless. |
+| `semantic_recall` | `embed.Embedder.enabled` | Live, read on every recall, so a change takes effect on the very next question without a restart. On, tier-2 recall matches episodes by meaning as well as by keyword, which needs the embedding model — `luna embed fetch`, 86 MB, Apache-2.0. **Off is not a degraded mode and neither is a missing model**: recall falls back to the FTS5 keyword index it has always had, with no error and no other change in behaviour. `luna embed status` says which of the two is in force. |
 
 `SOL.md` has a cap of its own (`config.SOL_MD_CAP`) with no key: Sol's
 namespace is deliberately outside the user-facing contract.
