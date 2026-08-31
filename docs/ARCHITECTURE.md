@@ -1018,6 +1018,23 @@ stated in his system prompt; it is not a filesystem sandbox, and this document
 says so rather than implying otherwise. The audit log is what makes that
 tolerable.
 
+**Open question: her own `ask` path has no code gate at all, dispatch has a
+thin one.** `CODEX_ASK_SANDBOX` is `"bypass"` (§6a), so a turn on her own ask
+path runs with no sandbox and a real shell. `op_ask`/`_ask` in `server.py`
+never calls `confirm.hard_denials`, `confirm.classify` or `confirm.gate` — the
+four hard denies bind that path only because `persona.py`'s `_CLOSING` states
+them as text the model is asked to obey. A dispatch is different in kind, not
+just in degree: `Dispatcher.spawn` (`dispatch.py`) runs `confirm.gate` against
+the task string *before* a job exists, so a task whose text trips
+`restart_omarchy_shell`, `delete_customisations` or `rm_rf_outside_own_dirs`
+is refused before anything is spawned — a real, if text-pattern and therefore
+evadable, code gate. Nothing equivalent exists for a command she decides to
+run herself mid-conversation; the daemon has no hook into what her own shell
+tool executes turn to turn, the way it does have a single task string to
+classify before a dispatch. The user chose full autonomy deliberately, and the
+audit log is the backstop for both paths regardless of which is gated — this
+is recorded as an open question, not an argument for changing it.
+
 ## 7a. Confirmation — `lunad/confirm.py` — BUILT
 
 The user revised the Phase-2 "full autonomy, no prompts" position to *"not
