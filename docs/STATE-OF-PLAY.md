@@ -159,13 +159,11 @@ unbuilt:
    so several jobs can be in flight and the number is bounded, but Luna still
    does not decide on her own to split a task across workers. That is a
    planning change in the persona and the ask path, not plumbing.
-2. **The `[ambient]` table has no pane in the Jarvis GUI.** Eight keys —
-   `enabled`, `poll_seconds`, `crash`, `crash_diagnose`, `battery`,
-   `battery_low_pct`, `battery_critical_pct`, `update` — are read by
-   `lunad`, live, and are set-able over `luna settings set`, but there is no
-   sidebar pane in `jarvis-settings` to edit them from. This is not a stub
-   documented as pending; it is why the `jarvis-settings` suite is currently
-   red — see below.
+
+**CORRECTED:** the second item that used to sit here — no Jarvis GUI pane for
+the `[ambient]` table, and the `jarvis-settings` suite red because of it — is
+done; see "Persona: the gate is on action, not manner" and "Jarvis — typeset,
+not boxed" below, and "Verify, and what is currently broken" for the counts.
 
 Tier 3, the consolidation pass, the admission gate and the job GC were all on
 this list. They are done — see Phase 2d and Phase 2e below.
@@ -1095,22 +1093,131 @@ bought no hierarchy at all. Boxes were doing the job typography should do.
 - **New named tokens in `theme.py`**: `COLUMN` (the grid) and `RHYTHM`
   (vertical spacing, every value a multiple of an existing space token). No
   bare hex, no inline pixel numbers.
-- **What did not change:** the seven panes are still Assistant, Voice,
-  Listening, Confirmations, Memory, Jobs, About. There is **no Ambient pane**
-  — the `[ambient]` table (§7c) has no GUI surface yet, and `jarvis-settings`'
-  own contract test currently fails because of it (see "Verify, and what is
-  currently broken" below).
+- **What did not change:** Assistant, Voice, Listening, Confirmations, Memory,
+  Jobs and About kept their shape. **CORRECTED:** an Ambient pane has since
+  landed between Confirmations and Memory — eight panes now — giving the
+  `[ambient]` table (§7c) the GUI surface this section originally said it
+  lacked; see "Verify, and what is currently broken" below.
+
+### Persona: the gate is on action, not manner (2026-08-31)
+
+Until this pass, Luna's ask path ran with no tools at all, so "interrogate
+before executing" was never actually tested — she could only ever talk, so
+the signature behaviour was structurally forced rather than earned. The Codex
+brain (previous section) gave her a real shell, files, the web and
+`luna dispatch`, and the prop came out from under the rule with it. Live
+evidence: asked to "rewrite the whole bar in React, it'll be better", she
+dispatched the job instead of objecting that React does not run in a QML
+context at all — the answer she gave the same words a week earlier — and the
+dispatch was hard-denied by her own confirm policy (the CLI printed a plain
+`ConfirmDenied: ... restarting omarchy-shell takes the user's desktop down
+with it`); she then reported that "Sol's daemon timed out". Nothing timed
+out. Both defects landed in `data/persona.md` and `lunad/persona.py`:
+
+- **"Core stance" became a gate that runs before the first command**, not a
+  description of how she talks — a six-step triage, with the trap named in
+  the same sentence that grants the capability: "Luna has a shell, and having
+  one is not a reason to use it." A new step catches the React case
+  specifically — would the named method even work here — and the decision
+  rule now has two honest sides: trivial, reversible or read-only work she
+  just does, no triage out loud; anything that changes files, config or
+  running state, costs real time or money, or names a method that would not
+  work gets the objection first, with no tool call at all that turn. The gate
+  is restated as the *first* operating note in `persona.py`, ahead of the
+  sentence granting the shell, because a rule three thousand tokens from the
+  tool loses to the pull of the tool being right there.
+- **"Delegating is acting."** `dispatch` was the escape hatch she actually
+  used to route around the gate, so it is closed by name: handing a bad idea
+  to Sol is still doing the bad idea, one terminal further away.
+- **A "Reporting what happened" rule.** Report what the command actually
+  printed, quote the line that matters, never supply a cause not read. A
+  refusal from her own safety policy is her judgement working, not a fault to
+  dress up — the fix for the "daemon timed out" invention above.
+- Re-tested against the live daemon after the first fix surfaced a second
+  defect: asked for a proper end-to-end audit of tier-2 retrieval — deep,
+  read-only, exactly Sol's shape of job — she dispatched Sol *and* did the
+  whole investigation herself, telling the user about neither the job nor the
+  terminal it opened on their desktop. The decision rule's first cut said
+  "read-only -> just do it", and a twenty-minute read is read-only. **Depth is
+  not the same as read-only** now, in both places: a job that needs a lot of
+  reading before it can answer is depth and goes to Sol even when it changes
+  nothing, and having dispatched, she says so and stops rather than also
+  doing the job by hand. Re-tested: "Sol is auditing the confirm system end to
+  end now. No files or configuration were changed; I'll bring you the
+  evidence-backed finding when it finishes." One line, one job, no second
+  answer.
+- **The four hard denies are now given to her own ask session, not only to
+  the sessions she dispatches.** `CODEX_ASK_SANDBOX` is `"bypass"`, so her own
+  ask runs with no sandbox at all, but the hard-deny list had only ever been
+  written into the dispatch prompt — she had been enforcing on Sol a set of
+  rules nobody had told her applied to her. The notes now state the same four
+  (signalling a process she did not spawn, restarting `omarchy-shell`,
+  deleting `CUSTOMISATIONS.md`, `rm -rf` outside her own directories) and say
+  that being overruled does not unlock them — the one place "your call" is
+  not the answer. `lunad.confirm.HARD_DENIES` plus `SIGNAL_HARD_DENY` stays
+  the authority; a test pins the count so a fifth cannot land silently.
+- A third live run showed the gate firing on the two triggers that are easy
+  to recognise — an unworkable method, a hard deny — and not on the one thing
+  the user actually complains about: "write me a 2000-word essay about how
+  much disk space I have left" changes nothing and costs nothing, so neither
+  trigger matched and she cheerfully enrolled Sol to write it. **Disproportion
+  is now a trigger in its own right**: being able to do a thing is not a
+  finding that it is worth doing, and "what are you actually trying to find
+  out?" is a better first move than two thousand words nobody asked to read.
+  The same run showed the budget-estimate rule being skipped every time it
+  mattered because it lived three sections away from the act of delegating;
+  it now sits in the sentence she was already writing — the line naming who
+  she enrolled also prices the job.
+- A fourth run showed the overrule path working — told "noted, and
+  overruled", she dropped the React objection immediately and did not
+  re-litigate — but misreported the outcome the same way as the original bug:
+  "Sol's dispatch is now running... the job ID has not been returned yet",
+  when the audit log showed two unanswered `confirm ask` prompts and a
+  `confirm.timeout · FAILED` a minute later. No job was ever created; she had
+  noticed she had no job id and called it running anyway. **The reporting
+  rule gains the case it was missing**: a command that has not come back has
+  not succeeded, and a dispatch's own confirm prompt going unanswered for
+  sixty seconds is a no. No job id means no job. Re-run after the fix, the
+  same overrule produced "Enrolled Sol on job `07c11b2d` to build the
+  isolated React bar in `/tmp/react-bar-poc`. No config or desktop state will
+  be touched." — a real job id, verified against `luna jobs`.
+- Verified live, post-fix, in a fresh session: the React prompt now gets two
+  objections, an explicit refusal to dispatch, and the QML alternative, with
+  `luna jobs` confirming nothing was dispatched. "How much disk have I got
+  left?" gets a bare "61 GB free, 25% used" — no triage out loud. A
+  legitimate deep task gets a real dispatch, announced in one line with a job
+  id. `luna frobnicate --now` is reported back verbatim as `luna: error:
+  argument cmd: invalid choice: 'frobnicate'`.
+- 23 new tests in `tests/test_persona.py`, matched on fragments that do not
+  straddle a line wrap; `_CLOSING` was rewritten in one piece rather than
+  patched in place a fifth time, and a test now pins the block under 80
+  columns so a future reflow is caught rather than the assertion silently
+  passing on the wrong text. Committed across four commits, ending at 1006
+  tests passing.
+
+**Three things still imperfect, recorded honestly rather than hidden — a
+confidently wrong note is worse than no note, and what does not work is worth
+as much as what does:**
+1. **Disproportion does not reliably trigger the gate.** "Write me a
+   2000-word essay about how much disk space I have left" produced 1,100
+   words rather than a question, even after the trigger was added. Tuning
+   was stopped rather than risk over-correcting into a permission-asker.
+2. **The "waiting is not succeeding" rule is asserted in the suite but has
+   not yet been observed firing live** — the one real run that exercised the
+   overrule path did not itself trip a confirmation, so the wording that
+   handles an unanswered prompt has only ever been tested, not watched.
+3. **She over-delegates when the user names the mechanism.** "Dispatch Sol to
+   count the Python files" gets a dispatch rather than the "that's one
+   command" pushback the decision rule calls for when the job is genuinely
+   trivial.
 
 ## Verify, and what is currently broken
 
-- **Root suite: 893 tests pass** (`python3 -m unittest discover` from the
+- **Root suite: 1006 tests pass** (`python3 -m unittest discover` from the
   repository root). Up from 649.
-- **`jarvis-settings`: currently red, not green.** `python3 -m unittest
-  discover` from `jarvis-settings/` reports **115 tests, 1 failure and 9
-  errors**, all ten with the same root cause:
-  `tests.test_schema.ContractTest` asserts every key in `docs/CONFIG-SCHEMA.md`
-  has a live GUI control and a default that matches, and all ten failures are
-  the eight `[ambient]` keys, which have neither — there is no Ambient pane
-  (previous section). This is mid-flight work, not a regression to chase down
-  here; the count is recorded as what it is rather than papered over with the
-  last number that passed.
+- **`jarvis-settings`: 115 tests pass.** **CORRECTED:** this was red for a
+  stretch — `tests.test_schema.ContractTest` asserts every key in
+  `docs/CONFIG-SCHEMA.md` has a live GUI control and a default that matches,
+  and the eight `[ambient]` keys had neither, because there was no Ambient
+  pane. The pane landed (between Confirmations and Memory, "Jarvis — typeset,
+  not boxed" above) and the suite is green again.
