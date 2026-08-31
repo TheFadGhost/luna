@@ -267,6 +267,52 @@ SPEC: tuple[Section, ...] = (
         ),
     ),
     Section(
+        key="ambient", title="Ambient", pane="ambient",
+        doc="The three things she notices on her own. An ambient event "
+            "notifies; it never speaks.",
+        fields=(
+            Toggle("enabled", "Notice things on her own",
+                   "Off, the thread still ticks and every hook is skipped, so "
+                   "switching it back on needs no restart.",
+                   default=True),
+            # The daemon clamps this to a 5 s floor; the schema states the same
+            # floor so the GUI refuses out of range rather than writing a value
+            # that would be silently raised. There is no ceiling in the daemon
+            # — an hour is this app's, and it is a very long time between
+            # three stat()s.
+            Number("poll_seconds", "Tick every",
+                   "One tick is three stat()s and a 12-byte read. A floor, "
+                   "not an override: raising it slows every hook, lowering it "
+                   "will not outrun a hook's own cadence.",
+                   default=60, min=5, max=3600, step=5, unit="s"),
+            Toggle("crash", "A process dumped core",
+                   "Off by default — the desktop already announces crashes. "
+                   "Hers adds the audit-log entry and the job.",
+                   default=False),
+            Toggle("crash_diagnose", "Diagnose from the toast",
+                   "The toast's one action runs `luna ambient diagnose`. "
+                   "Never automatic: a diagnosis is a model call and a "
+                   "terminal window.",
+                   default=True),
+            Toggle("battery", "The battery is getting low",
+                   "Off by default — Omarchy already warns at 10%. Turn it on "
+                   "for a warning earlier than the desktop's.",
+                   default=False),
+            # 0 would mean never and 100 would mean always, so neither is a
+            # threshold; the range is the open interval between them.
+            Number("battery_low_pct", "Warn at", default=20, min=1, max=99,
+                   step=1, unit="%"),
+            Number("battery_critical_pct", "Warn again at",
+                   "Clamped to the warning above if you set it higher — a "
+                   "critical above the low would make the low unreachable.",
+                   default=5, min=1, max=99, step=1, unit="%"),
+            Toggle("update", "An Omarchy update landed",
+                   "The version file's contents and its mtime, plus "
+                   "/tmp/omarchy-update.log. Not whether one is available.",
+                   default=True),
+        ),
+    ),
+    Section(
         key="ui", title="Interface", pane="about",
         fields=(
             Toggle("theme_follows_omarchy", "Follow the Omarchy theme",
