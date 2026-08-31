@@ -3,8 +3,13 @@
 A resident personal assistant for Omarchy. Not a chatbot: a supervised daemon
 with a voice, a memory that compounds, and the run of the desktop.
 
-Status: Phases 0, 1 and 2 built and running, memory complete to all three
-tiers. Phase 3 is design.
+Status: Phases 0 through 2f built and running. Memory is complete to all
+three tiers, semantic recall included. Phase 3 is substantially built — bar
+widget, ambient hooks, semantic recall and the barge-in keybind are all live.
+What is left of it is worker fan-out as something Luna *decides* to do rather
+than something the admission gate merely allows, and wiring the `[ambient]`
+settings into the Jarvis GUI (Settings → jarvis-settings has no pane for them
+yet; see `docs/STATE-OF-PLAY.md`).
 Where reality contradicted the design, the design text has been corrected
 in place and the correction is marked **CORRECTED**.
 
@@ -72,12 +77,20 @@ Every surface (voice, palette, hooks, CLI, bar widget) is a client. The daemon
 is the only thing that touches memory or spawns agents. This is what stops the
 system becoming four half-integrations that each grew their own state.
 
-Requests, as built: `ping`, `ask`, `say`, `speak.cancel`, `session.reset`,
+Requests, as built — this list is re-derived from `LunaServer.dispatch`'s own
+table in `lunad/server.py`, not carried forward from an earlier one: `ping`,
+`ask`, `look`, `say`, `speak.cancel`, `session.reset`, `codex.profile`,
 `status`, `memory.{read,write,search,profile,consolidate}`, `dispatch`,
-`jobs`, `peek`, `audit`, `spawned`, `cancel`, `shutdown`.
+`jobs`, `peek`, `audit`, `spawned`, `ambient`, `ambient.diagnose`,
+`settings.get`, `settings.set`, `confirm`, `cancel`, `shutdown`.
 `memory.read`/`memory.write` take an optional `namespace` (`luna` or `sol`);
 `memory.profile` and `memory.consolidate` are Luna's only — Sol's namespace is
 a working set for one job, not a model of a person.
+`look` takes an optional `scope` (§6b); `codex.profile` writes
+`~/.codex/luna.config.toml` for `luna codex-profile` (§6a); `ambient` /
+`ambient.diagnose` back `luna ambient` and the crash toast's one click (§7c);
+`settings.get` / `settings.set` back the whole config contract (§7b);
+`confirm` carries `list`, `yes`, `no` and the tool-side `ask` gate (§7a).
 `subscribe` (for the bar widget's live state) was dropped in favour of a state
 file — see below. `listen_start` was dropped too: the keybind talks to voxtype
 directly, so the daemon never needs to start a recording.
@@ -639,15 +652,54 @@ Luna announces who she enrolled and why, in one line. The line is composed in
 and an API call would not get made. She does not delegate what she could finish
 in one step.
 
+### Self-dispatch — BUILT
+
+She delegates by doing it, not by offering to. `luna dispatch` already
+existed, was already audited, and already returns immediately — so Luna runs
+it herself, from her own shell, in the same turn: `luna dispatch --to sol
+"<task>"` by absolute path, because her shell is `lunad`'s and `lunad` is a
+systemd `--user` service whose `PATH` need not contain `~/.local/bin`. A bare
+`luna` would have worked when tested from the user's own terminal and failed
+from hers — the gap only shows up run from inside the daemon.
+
+**It has to work from inside a live ask, and that was verified rather than
+assumed.** `ReentrancyCase` stands up a real Unix socket, has the adapter open
+a second connection from inside `ask`, and reads the dispatch reply back while
+the outer request is still open. Nothing deadlocks:
+`ThreadingUnixStreamServer`, `daemon_threads`, and no lock held around
+`Daemon.dispatch`.
+
+**The result has to come back, or delegation is disappearance.** The toast
+already existed; the memory did not — a finding sat in `jobs/<id>/output.txt`
+where Luna would never read it, so a delegated job that succeeded was
+forgotten the moment it finished and the same question a week later
+dispatched the same job again. `ReportingDispatcher` (`lunad/server.py`), a
+subclass rather than a change to `dispatch.py` — the dispatcher owns
+terminals, pids and exit codes, not memory — writes a finished job into tier 2
+as an ordinary exchange: the task as the user's side, the output as hers. It
+is then retrieved by the ordinary recall path, with nobody having to name a
+job id.
+
+Dispatched jobs run `gpt-5.6-sol`, not whatever codex would otherwise have
+picked, and the Daemon hands its own agent name to the Dispatcher — without
+that, a self-dispatch from a codex-brained Luna would have been written in
+claude's flags, `~/.config/omarchy/defaults/agent`'s default, and every job
+would have quietly failed in the hidden workspace.
+
 ### How a job actually runs — BUILT, and not as designed
 
 `luna dispatch "..."` writes a job directory under
 `~/.local/share/luna/jobs/<id>/` (`task.txt`, `system.txt`, `run.sh`,
 `output.txt`, `stderr.txt`, `exit`, `job.json`), spawns `foot` running
-`run.sh`, and watches the pid. `run.sh` runs the configured agent with
-`--permission-mode bypassPermissions --tools default --safe-mode`, wrapped in
-`timeout`, piped through `tee`. `luna jobs` lists them newest first, from disk,
-so the list survives a daemon restart; `luna peek` toggles the workspace.
+`run.sh`, and watches the pid. `run.sh` runs whichever agent adapter is
+active, full autonomy either way — on codex (the default, §6a) that is
+`--dangerously-bypass-approvals-and-sandbox`; on claude it is
+`--permission-mode bypassPermissions --tools default --safe-mode` — wrapped in
+`timeout`, piped through `tee`. **Dispatch does not hard-code either agent's
+flags**: the runner script asks the active adapter for its own command line,
+which is what let the brain move from claude to codex (§6a) without touching
+this path. `luna jobs` lists them newest first, from disk, so the list
+survives a daemon restart; `luna peek` toggles the workspace.
 
 Four things the design got wrong, corrected here:
 
@@ -757,10 +809,54 @@ The two CLIs share almost nothing, and the differences are the design:
 | headless entry | `claude -p <prompt>` | `codex exec -` (prompt on stdin) |
 | system prompt | `--append-system-prompt` | **no such flag** — `-c developer_instructions=` |
 | machine output | `--output-format json`, one object | `--json`, JSONL events |
-| tool policy | `--tools ""` | the sandbox: `-s read-only` |
+| tool policy | `--tools ""` | the sandbox *is* the tool policy — see below |
 | user config off | `--safe-mode` | `--ignore-user-config --ignore-rules` |
 | session id | caller chooses, `--session-id` | codex assigns, read from `thread.started` |
 | cost | dollars, metered | none — ChatGPT subscription |
+
+**`[assistant] agent` now defaults to `codex`.** `~/.config/omarchy/defaults/
+agent` is not touched — it is the whole desktop's default and other things
+read it, so it stays the fallback rather than the source of truth — but
+Luna's own default is `codex`, model `gpt-5.6-luna` (`config.CODEX_ASK_MODEL`,
+an adapter default and deliberately not `[assistant] model`: a slug is not
+portable between agents, and pinning it in the config would be wrong the
+instant someone set `agent = "claude"`). Dispatched jobs, specialist or
+anonymous worker alike, run `gpt-5.6-sol` (`config.CODEX_DISPATCH_MODEL`) —
+Luna thinks, Sol works, and the model follows the role.
+
+### She has real tools on the ask path, and did not used to
+
+`CODEX_ASK_SANDBOX` was `"read-only"` and persona.py's closing text told the
+model so: *"You are running headless with no tools. You cannot read files, run
+commands, or inspect the machine right now."* Both were true and both were the
+wrong trade — asked for a version she said she could not check it; asked what
+was on screen she suggested starting the daemon, which was bad advice she had
+no way of knowing was bad, because nothing in her prompt said the daemon she
+runs inside has a dispatcher, a CLI and a pair of eyes. It is now `"bypass"`,
+same as the dispatch path, and the persona's closing text was rewritten to
+name the shell, files and the web instead of denying them. `claude`'s ask path
+still passes `--tools ""` and keeps the honest "no tools" text, chosen per
+adapter through `BaseAdapter.ask_has_tools` — deleting it there would only have
+moved the same lie one agent to the left.
+
+**`"bypass"` rather than `"danger-full-access"`, and the choice is about the
+mechanism, not about how much access she should have** — the user chose full
+autonomy and the audit log is the backstop for that regardless. Two reasons,
+both about how codex's flags actually behave (verified against 0.149.1
+`--help`, not assumed):
+
+- `codex exec resume` accepts no `-s`. Under a sandbox *mode* the policy has to
+  be restated as `-c sandbox_mode=…` on every resumed turn, and turn one and
+  turn two ending up under different policies is exactly the kind of mismatch
+  that is discovered in production, not in review.
+  `--dangerously-bypass-approvals-and-sandbox` is accepted identically by
+  `exec` and by `exec resume`, so there is nothing to keep in step across a
+  resume.
+- `danger-full-access` removes the sandbox but leaves the *approval* policy in
+  place, and an approval request in a headless turn is not a prompt anyone can
+  answer — it is a hung ask. `bypass` turns approvals off along with the
+  sandbox, which a headless daemon needs regardless of how permissive the
+  sandbox mode is.
 
 **The missing system-prompt flag is the whole problem.** Luna's persona and her
 frozen tier-1 block have to reach the model somehow. codex takes `-c key=value`
@@ -776,6 +872,38 @@ outright under `--strict-config`.
 is `None` and tokens are reported instead, because tokens are what was spent.
 The daemon only ever adds a truthy `cost_usd`, so a subscription reply moves
 the money counter by nothing, which is the truth.
+
+## 6b. Sight — `lunad/context.py` — BUILT
+
+Two reads of the same compositor, sharing one module because the second needs
+the first's geometry.
+
+**The focused-window line rides on every ask.** `hyprctl -j activewindow`
+gives one line — app-id, class, title, workspace — and it goes in the **user
+message**, never the system prompt. The system prompt is the cacheable
+prefix and must stay byte-identical between turns; a line that changes every
+time the user alt-tabs would invalidate it on every single ask, which is
+exactly the mistake tier-2 recall made (§4, "Prompt cost and the cacheable
+prefix") and exactly the cure. It costs about twenty tokens and cannot cost an
+answer: one query, a one-second ceiling, and every failure — no compositor, no
+focused window, `hyprctl` missing or hanging, output that is not JSON —
+degrades to `""` and the ask goes out without it.
+
+**`luna look "<question>"` is the explicit path, and only it takes a
+photograph.** `grim -g <geometry>` (geometry read from Hyprland's `at`/`size`)
+captures the focused window into a `mkdtemp()`, which is removed in a
+`finally` regardless of whether the call raised — an agent call that failed
+must not leave a picture of the user's screen behind on disk. The image
+reaches the model through `codex exec -i`, which `gpt-5.6-luna` reads
+natively: no second model, no vision service, and no OpenRouter call —
+OpenRouter is for text-to-speech and nothing else (§5a), and a test greps the
+module to keep it that way. Nothing is captured unless a look was actually
+asked for; an ordinary ask photographs nothing, on purpose, and there is a
+test that fails loudly if that ever stops being true. `BaseAdapter
+.accepts_images` lets a look through an agent that cannot take one say so,
+rather than silently dropping the image and answering from the window title
+alone — which is everything a model needs to confidently narrate a screen
+nobody looked at.
 
 ## 7. Safety under full autonomy — BUILT
 
@@ -819,6 +947,23 @@ every child is spawned through `safety.spawn`. The one deliberate exception is
 `signal_self`, the daemon stopping itself — `may_signal` refuses `getpid()`
 precisely so self-termination cannot be reached by accident.
 
+**`terminate()` used to return `True` right after sending `SIGKILL`, without
+checking the process actually died** — a process stuck in an uninterruptible
+kernel sleep survives `SIGKILL` too, and the caller had no way to know. It now
+confirms death with a bounded poll after each signal (`Popen.poll()` is a
+`waitpid(WNOHANG)` under the hood, so the check that notices death is the same
+call that reaps it — no window for a pid to slip through between "confirmed
+dead" and "reaped") and returns `False`, honestly, when even that cannot
+confirm it. `reap()` itself only ever edited the ledger; it never waited, and
+every "wait once, give up silently" call site was treating it as if it also
+reaped the child. `reap_after()` does an actual bounded wait and, if that is
+not enough, keeps trying on a background thread rather than abandoning the
+child as a permanent zombie — the fix for a bug where a hung `notify-send` or
+a wedged dispatched terminal leaked one zombie per occurrence, forever, until
+a restart. The pid-firewall invariant is unchanged by this: the fix only moves
+*when* the real reap happens, never what `may_signal()` checks, and a recycled
+pid is still caught by the start-time comparison even in the worst ordering.
+
 ### Audit log — `lunad/audit.py`
 
 `~/.local/share/luna/audit.jsonl`. Opened `"a"`, fsync'd per line, never
@@ -855,8 +1000,10 @@ second explicit instruction required. Judgement, not a prompt. This is persona,
 not code — the code enforces the pid boundary, not the other four.
 
 ### What is *not* enforced by code
-A dispatched session runs with `bypassPermissions` and real tools. It could
-write anywhere the user can. Sol's namespace isolation is enforced in `lunad`'s
+A dispatched session runs full-autonomy and real tools — `bypassPermissions`
+on claude, `--dangerously-bypass-approvals-and-sandbox` on codex (§6a) — either
+way, unsandboxed. It could write anywhere the user can. Sol's namespace
+isolation is enforced in `lunad`'s
 own memory API (`SolMemory.file` refuses `LUNA.md` and `USER.md` by name) and
 stated in his system prompt; it is not a filesystem sandbox, and this document
 says so rather than implying otherwise. The audit log is what makes that
@@ -952,6 +1099,78 @@ machine — lunad accepts `VOXTYPE_WHISPER_API_KEY` as a fallback so nothing had
 to be copied out of a file that belongs to another program. `secrets_status()`
 reports whether a key exists and where it came from, never the key.
 
+## 7c. Ambient — `lunad/ambient.py` — BUILT
+
+Until this, Luna only ever existed when addressed: every path in the daemon
+starts with a request arriving on the socket. This is the first that starts
+with the machine instead — three hooks, and one rule that outranks all of
+them.
+
+**The rule: an ambient event notifies, it never speaks.** In the user's own
+words: *"I prefer notify only, unless I spoke to it first and it was coming
+back with an answer to a task that I gave beforehand."* A coredump, a flat
+battery and an `omarchy update` are none of those — they happened *to* the
+machine while the user was doing something else, and a voice interrupting
+that is exactly the failure mode they asked to avoid. This is enforced, not
+commented: `ambient.py` does not import `lunad.speech` and never will;
+`Ambient` only delivers through a `Notifier`, type-checked at construction, so
+a plain callable is refused; and `_assert_mute` walks everything hung off the
+`Ambient` object at construction and refuses any collaborator with a `.say()`
+or `.speak()` method. `tests/test_ambient.py::NeverSpeaksCase` walks the live
+object graph for a reachable speaker and fails if any of the three is ever
+weakened.
+
+**Three hooks, two of them off by default because the desktop already does
+the job:**
+
+- **Crash** (`[ambient] crash`, default **off**). `omarchy-crash-watch.service`
+  ships with Omarchy, is enabled, and already streams the coredump
+  `MESSAGE_ID` out of the journal — event-driven, no polling — dedupes crash
+  loops on a 60 s window, and toasts with a click that runs the same
+  `diagnose-crash` skill. It knows the signal name and the full executable
+  path, which a core *filename* does not, so it is strictly better at the
+  job. Luna's hook is kept for what the desktop's cannot do: the crash lands
+  in her **audit log** and the diagnosis in her **job list**, under her own
+  confirmation policy, and for anyone who has switched Omarchy's watcher off.
+  When it is on: one `stat()` on `/var/lib/systemd/coredump` per tick, a
+  `scandir` only when the mtime moves, and it never forks `coredumpctl`. The
+  toast's one click runs `luna ambient diagnose <pid>`, which dispatches an
+  agent session against the `diagnose-crash` skill — not automatic, because a
+  diagnosis is a real model call and a terminal window, and running one
+  unasked on every core dump would be Luna acting rather than noticing.
+- **Battery** (`[ambient] battery`, default **off**). Omarchy's own
+  `shell/plugins/services/battery/Service.qml` already polls every 30 s and
+  warns at 10%, with UPower hibernating at 2%; a second toast about the same
+  battery at the same moment is worse than none. The battery is found by
+  reading each `/sys/class/power_supply/*/type` for `Battery` rather than
+  assumed — on this laptop it is `BAT1`, not `BAT0`, with no `charge_now` at
+  all. Turning it on gets an *earlier* warning, deliberately either side of
+  Omarchy's own (20% / 5% against Omarchy's 10% and UPower's 2%).
+- **Update** (`[ambient] update`, default **on** — the one hook nothing else
+  on this machine watches). `omarchy update` is `pacman -Syu --overwrite
+  '/usr/share/omarchy/*'`, which rewrites that whole tree — exactly how a
+  customisation gets silently reverted. Two `stat()`s and a 12-byte read of
+  `/usr/share/omarchy/version` (contents *and* mtime, because a same-version
+  reinstall clobbers just as thoroughly) plus `/tmp/omarchy-update.log`.
+  Whether an update is merely *available* is deliberately not checked here —
+  that costs a `checkupdates` network sync, and Omarchy's own bar widget
+  already polls it every six hours and shows the answer.
+
+State persists in `~/.local/share/luna/ambient.json` so a restart does not
+re-announce a fortnight of coredumps, and every watcher seeds silently on its
+first run. Nothing in this module may raise into the daemon — the same
+contract as `presence.py`, for the same reason.
+
+**The HUD pane's message-file contract is implemented here.** The click-through
+Quickshell overlay itself lives on the machine, not in this repository —
+`~/.config/omarchy/plugins/ghost.lunahud/`, documented in
+`~/.config/omarchy/CUSTOMISATIONS.md` §8a.14 the same way the bar widget is
+referenced in `docs/STATE-OF-PLAY.md`. Its contract, `HANDOFF-hud.md`, is one
+JSON object atomically written to `$XDG_RUNTIME_DIR/luna/message` (sibling of
+`presence.py`'s `state` file) with a monotonically increasing `id`, which is
+what makes a message *new* to the reader; `ambient.py` is what publishes into
+it now, on the same notify-never-speak channel as the toasts.
+
 ## 8. Build phases
 
 | Phase | Ships | Verifiable by |
@@ -961,6 +1180,9 @@ reports whether a key exists and where it came from, never the key.
 | P2 | **DONE.** Workspace dispatch + Sol + audit log + PID firewall. | `luna dispatch "..."` runs in the `luna` special workspace and reports back; `luna spawned --check <foreign pid>` refuses. |
 | P2b | **DONE.** Jarvis: config file + hot reload, OpenRouter TTS with piper fallback, confirmation policy, name as a setting. | Edit `~/.config/jarvis/config.toml`, do not restart, hear the change. |
 | P2d | **DONE.** Tier 3 (the derived profile) and the tier-1 consolidation pass, wiring `[memory] consolidate_every_turns`. | `luna memory profile --rebuild` prints facts drawn from real episodes; a pass shows in `luna status` with what it cost. `luna memory consolidate [--dry-run]` runs one on demand, or shows what one would do without doing it. |
-| P3 | Bar widget, ambient hooks (crash/battery/update), ~~semantic recall~~ (done, §4). | Crash a process, she explains it unprompted. |
+| — | **DONE.** The brain moved from claude to codex (`gpt-5.6-luna`), with real tools on the ask path — §6a. | `luna ask "what's my kernel version"` runs the command instead of declining. |
+| — | **DONE.** Sight (`luna look`, the focused-window context line) and self-dispatch (she runs `luna dispatch` on herself and the result comes back as memory) — §6, §6b. | `luna look "what's on screen"` describes the focused window; ask her to delegate something and the finding surfaces unprompted later. |
+| P3 | **DONE.** Bar widget (§3), ambient hooks — crash/battery/update, §7c — semantic recall (§4) and the `SUPER+F10` hush keybind. | Crash a process, she explains it unprompted (only if `[ambient] crash` is turned on — Omarchy's own watcher covers it by default). |
+| — | **Not built.** Worker fan-out as something Luna *plans* rather than something the admission gate merely allows; the `[ambient]` keys have no pane yet in the Jarvis GUI. | See `docs/STATE-OF-PLAY.md` §Next. |
 
 Each phase is independently useful and independently revertible.
