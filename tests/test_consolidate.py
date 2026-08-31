@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from lunad import agent, config, consolidate
+from lunad import agent, config, consolidate, render
 from lunad.memory import (CONSOLIDATED_THROUGH, EpisodeStore,
                           MemoryCapExceeded, Tier1File)
 
@@ -97,7 +97,12 @@ def _cli() -> Any:
         spec = importlib.util.spec_from_loader("luna_cli", loader)
         module = importlib.util.module_from_spec(spec)
         loader.exec_module(module)
-        module.BOLD = module.DIM = module.RESET = ""
+        # The style object is chosen at import from the real stdout, so a
+        # suite run in a terminal would otherwise assert against escape
+        # codes and a suite run in a pipe would not. Pinned to no colour and
+        # a fixed width, which is also the only way the column assertions
+        # below mean anything.
+        module.S = render.Style(color=False, width=100)
         _CLI = module
     return _CLI
 
@@ -970,7 +975,7 @@ class ReportTests(TempMemoryCase):
         code, text = self.printed(self.report(dry_run=True))
         self.assertEqual(code, 0)
         self.assertTrue(text.startswith("dry run — nothing was written."))
-        self.assertIn("would consolidate 3 episode(s)", text)
+        self.assertIn("would consolidate 3 episodes", text)
         self.assertIn("+ The bar is omarchy-shell.", text)
         self.assertIn("- [2] Uses waybar.", text)
         self.assertIn("the watermark did not move", text)
@@ -979,7 +984,7 @@ class ReportTests(TempMemoryCase):
     def test_an_applied_pass_prints_what_went_in_and_what_came_out(self) -> None:
         code, text = self.printed(self.report())
         self.assertEqual(code, 0)
-        self.assertIn("consolidated 3 episode(s)", text)
+        self.assertIn("consolidated 3 episodes", text)
         self.assertNotIn("would consolidate", text)
         self.assertIn("+ The bar is omarchy-shell.", text)
         self.assertIn("$0.0004", text)
