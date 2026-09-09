@@ -340,6 +340,38 @@ DISPATCH_MAX_PARALLEL = 1
 JOB_RETENTION_DAYS = 14
 JOB_GC_INTERVAL_S = 21_600.0
 
+# --- Version control: the GitHub workflow ---------------------------------
+#
+# Luna works unattended, so work that only exists on this disk is work nobody
+# can review, revert, or find again. Every piece of it goes branch -> commit
+# -> push -> pull request, and she merges her own pull request only when CI is
+# green. `lunad/vcs.py` holds the gate; `docs/CONFIG-SCHEMA.md` `[vcs]` holds
+# the settings.
+#
+# The two binary names are read *late*, in `Repo.__init__`, for exactly the
+# reason the terminal and the notifier are: a name bound as a signature
+# default is fixed at import and cannot be patched, and a test suite that
+# reached the real `gh` would open pull requests on the user's own account.
+# `tests/_support.py` replaces both with names that cannot resolve, and
+# `tests/test_guards.py` asserts both the values and the shape.
+
+GIT_BIN = "git"
+GH_BIN = "gh"
+
+# Fallback defaults for the `[vcs]` table.
+VCS_BRANCH_PREFIX = "luna"           # branches are `luna/<topic>-<yymmdd>`
+VCS_MERGE_METHOD = "squash"          # squash | merge | rebase
+VCS_AUTO_MERGE = True                # attempt the merge once checks are green
+VCS_DELETE_BRANCH = True             # delete the head branch on merge
+VCS_NOTIFY_ON_REFUSAL = True         # toast when an auto-merge was refused
+VCS_CHECK_WAIT_S = 900               # how long `ship` waits for CI to report
+
+# Not settings, deliberately. One `git` or `gh` call is either quick or
+# wedged, and the poll interval is a rate limit on GitHub's API rather than a
+# preference anybody has.
+VCS_TIMEOUT_S = 120.0
+VCS_CHECK_POLL_S = 20.0
+
 # --- Audit log rotation ---------------------------------------------------
 #
 # Fallback defaults for `[audit] max_mb` and `[audit] keep`. The log is

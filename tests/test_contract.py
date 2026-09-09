@@ -606,6 +606,12 @@ class DriftCase(unittest.TestCase):
         ("ambient.poll_seconds", "AMBIENT_POLL_S"),
         ("ambient.battery_low_pct", "AMBIENT_BATTERY_LOW_PCT"),
         ("ambient.battery_critical_pct", "AMBIENT_BATTERY_CRITICAL_PCT"),
+        ("vcs.branch_prefix", "VCS_BRANCH_PREFIX"),
+        ("vcs.auto_merge", "VCS_AUTO_MERGE"),
+        ("vcs.merge_method", "VCS_MERGE_METHOD"),
+        ("vcs.delete_branch", "VCS_DELETE_BRANCH"),
+        ("vcs.notify_on_refusal", "VCS_NOTIFY_ON_REFUSAL"),
+        ("vcs.check_wait_seconds", "VCS_CHECK_WAIT_S"),
     )
 
     def test_every_default_matches_its_fallback_constant(self) -> None:

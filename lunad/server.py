@@ -26,7 +26,8 @@ from typing import Any, Callable
 from . import (__version__, agent, ambient as ambient_mod, audit as audit_mod,
                config, confirm, consolidate, context as context_mod, dispatch,
                log as luna_log, persona, presence as presence_mod, protocol,
-               safety, session as sessions, settings as settings_mod, speech)
+               safety, session as sessions, settings as settings_mod, speech,
+               vcs)
 from .memory import (Memory, MemoryCapExceeded, MemoryError as LunaMemoryError,
                      SolMemory)
 
@@ -1073,6 +1074,107 @@ class Daemon:
         payload = job.to_dict()
         payload["announce"] = self.dispatcher.announce(job)
         return protocol.ok(req.get("id"), **payload)
+    # -- version control -------------------------------------------------
+
+    def repo_for(self, req: dict[str, Any]) -> vcs.Repo:
+        """A :class:`vcs.Repo` for the caller's working directory.
+
+        The *caller's*, not the daemon's. ``git`` is relative to a checkout and
+        the daemon's own cwd is meaningless — the CLI sends its `os.getcwd()`
+        with every request, and a dispatched agent sends the directory it is
+        working in. Falling back to Luna's own repository is the least
+        surprising answer for a caller that sent nothing, and it is a real
+        repository rather than a job scratch directory.
+
+        Built per request. A cached one would be caching the branch the user
+        was on when the daemon started, and it holds the *live* broker so a
+        confirmation raised here can be answered through `luna confirm`.
+        """
+        where = str(req.get("cwd") or "").strip() or str(config.PROJECT_DIR)
+        return vcs.Repo(where, audit=self.audit, confirm=self.confirm,
+                        settings=self.settings)
+
+    def op_vcs(self, req: dict[str, Any]) -> dict[str, Any]:
+        """The GitHub workflow: branch, commit, push, PR, checks, merge.
+
+        One op with an ``action``, in the shape of ``confirm``, rather than ten
+        ops: they share a repository handle, an error family and a working
+        directory, and splitting them would put the same four lines of setup in
+        ten places.
+        """
+        action = str(req.get("action") or "status").lower()
+        repo = self.repo_for(req)
+        rid = req.get("id")
+        actor = str(req.get("actor") or "luna")
+        why = str(req.get("why") or "")
+        paths = [str(p) for p in (req.get("paths") or [])]
+
+        if action == "status":
+            ok, detail = repo.available()
+            return protocol.ok(rid, available=ok, detail=detail,
+                               **(repo.status() if ok else {}))
+        if action == "branch":
+            result = repo.branch(str(req.get("topic") or ""),
+                                 base=(str(req["base"]) if req.get("base")
+                                       else None),
+                                 exact=bool(req.get("exact")),
+                                 adopt=bool(req.get("adopt", True)))
+            return protocol.ok(rid, **result.to_dict())
+        if action == "commit":
+            commit = repo.commit(str(req.get("message") or ""), paths,
+                                 body=str(req.get("body") or ""))
+            return protocol.ok(rid, **commit.to_dict())
+        if action == "push":
+            branch = repo.push(str(req.get("branch") or "") or None,
+                               actor=actor, why=why)
+            return protocol.ok(rid, branch=branch)
+        if action == "pr":
+            pr = repo.pull_request(
+                str(req.get("title") or ""), str(req.get("body") or ""),
+                base=(str(req["base"]) if req.get("base") else None),
+                head=(str(req["head"]) if req.get("head") else None),
+                draft=bool(req.get("draft")), actor=actor, why=why)
+            return protocol.ok(rid, **pr.to_dict())
+        if action == "checks":
+            status = repo.checks(_opt_int(req.get("number")),
+                                 wait=float(req.get("wait") or 0.0))
+            return protocol.ok(rid, **status.to_dict())
+        if action == "merge":
+            result = repo.merge(
+                _opt_int(req.get("number")),
+                method=(str(req["method"]) if req.get("method") else None),
+                delete_branch=(bool(req["delete_branch"])
+                               if "delete_branch" in req else None),
+                wait=float(req.get("wait") or 0.0), actor=actor, why=why)
+            return protocol.ok(rid, **result.to_dict())
+        if action == "issue":
+            issue = repo.open_issue(str(req.get("title") or ""),
+                                    str(req.get("body") or ""),
+                                    labels=[str(l) for l in
+                                            (req.get("labels") or [])],
+                                    actor=actor)
+            return protocol.ok(rid, **issue.to_dict())
+        if action == "comment":
+            url = repo.comment(int(req.get("number") or 0),
+                               str(req.get("body") or ""),
+                               on=str(req.get("on") or "issue"), actor=actor)
+            return protocol.ok(rid, url=url)
+        if action == "ship":
+            report = repo.ship(
+                topic=str(req.get("topic") or ""),
+                message=str(req.get("message") or ""), paths=paths,
+                title=(str(req["title"]) if req.get("title") else None),
+                body=str(req.get("body") or ""),
+                base=(str(req["base"]) if req.get("base") else None),
+                draft=bool(req.get("draft")),
+                wait=(float(req["wait"]) if req.get("wait") is not None
+                      else None),
+                merge=(bool(req["merge"]) if "merge" in req else None),
+                actor=actor, why=why)
+            return protocol.ok(rid, **report)
+        raise protocol.ProtocolError(
+            f"unknown vcs action {action!r}; expected one of status, branch, "
+            "commit, push, pr, checks, merge, issue, comment, ship")
 
     def op_shutdown(self, req: dict[str, Any]) -> dict[str, Any]:
         # Present so a supervisor or the CLI can stop the daemon cleanly; the
@@ -1108,6 +1210,7 @@ class Daemon:
             "settings.get": self.op_settings_get,
             "settings.set": self.op_settings_set,
             "confirm": self.op_confirm,
+            "vcs": self.op_vcs,
             "cancel": self.op_cancel,
             "shutdown": self.op_shutdown,
         }
@@ -1144,6 +1247,14 @@ class Daemon:
             with self._lock:
                 self.counters["errors"] += 1
             log.warning("dispatch error", extra={"op": op, "detail": str(exc)})
+            return protocol.err(req.get("id"), **_strip(exc.to_dict()))
+        except vcs.VcsError as exc:
+            # Not an internal error: the workflow said no, or git did. The
+            # decision travels back whole (`NotGreen` carries the entire check
+            # status) so the caller can say which check is red rather than
+            # only that something is.
+            log.info("vcs refused", extra={"op": op, "kind": exc.kind,
+                                           "detail": str(exc)[:200]})
             return protocol.err(req.get("id"), **_strip(exc.to_dict()))
         except confirm.ConfirmDenied as exc:
             # Not an error in the daemon: it is the answer. Reported with the
@@ -1202,6 +1313,20 @@ def _number(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _opt_int(value: Any) -> int | None:
+    """A pull request number, or ``None`` for "work it out from the branch".
+
+    ``0`` and ``""`` both mean "not given": JSON has no way to say "absent" in
+    a field the CLI always sends, and a merge of pull request 0 is not a thing
+    anybody meant.
+    """
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number or None
 
 
 def _strip(d: dict[str, Any]) -> dict[str, Any]:
