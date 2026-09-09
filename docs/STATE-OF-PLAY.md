@@ -1473,15 +1473,18 @@ other call site uses a zero grace, and the sibling race in
 it was left alone).
 
 **Test counts, verified on the merged integration branch, multiple
-consecutive runs each:** root suite **1210 tests, OK** (base 1006 at
+consecutive runs each:** root suite **1212 tests, OK** (base 1006 at
 `35e89cc`, itself up from 649); `jarvis-settings` **115 tests, OK**.
 Per-stream contribution to the root suite: HUD +25, fan-out and the durable
-queue +40, the GitHub workflow +139 — 1006 + 25 + 40 + 139 = 1210.
+queue +40, the GitHub workflow +139 — 1006 + 25 + 40 + 139 = 1210 — **plus
+the two `CodexBinCase` guard tests added when CI turned out to be red**, for
+1212. This section was written at 1210 and was stale within the same day,
+which is the failure mode the "correct the record" rule exists for.
 
 
 ## Verify, and what is currently broken
 
-- **Root suite: 1210 tests pass** (`python3 -m unittest discover` from the
+- **Root suite: 1212 tests pass** (`python3 -m unittest discover` from the
   repository root), run multiple consecutive times on the merged integration
   branch. **CORRECTED:** up from 1006 at the base this integration branch
   forked from (`35e89cc`), itself up from 649. Per-stream contribution: HUD
