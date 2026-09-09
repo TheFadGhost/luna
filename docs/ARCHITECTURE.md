@@ -6,10 +6,12 @@ with a voice, a memory that compounds, and the run of the desktop.
 Status: Phases 0 through 2f built and running. Memory is complete to all
 three tiers, semantic recall included. Phase 3 is substantially built — bar
 widget, ambient hooks, semantic recall and the barge-in keybind are all live.
-What is left of it is worker fan-out as something Luna *decides* to do rather
-than something the admission gate merely allows, and wiring the `[ambient]`
-settings into the Jarvis GUI (Settings → jarvis-settings has no pane for them
-yet; see `docs/STATE-OF-PLAY.md`).
+Worker fan-out is now something Luna *decides* rather than something the gate
+merely allows — the criterion is in `data/persona.md` and the plan id that
+groups a fan-out is in `dispatch.py` — and queued work survives a daemon
+restart. What is left of Phase 3 is wiring the `[ambient]` settings into the
+Jarvis GUI (Settings → jarvis-settings has no pane for them yet; see
+`docs/STATE-OF-PLAY.md`).
 Where reality contradicted the design, the design text has been corrected
 in place and the correction is marked **CORRECTED**.
 
@@ -652,9 +654,13 @@ about 100 ms for a short sentence.)
 - **Sol** is a specialist she enrols for deep technical work: own system prompt,
   own memory namespace (`memory/sol/SOL.md` + its own episode store), reports
   back to Luna not to the user. Spec in `data/sol-persona.md`.
-- **Workers** are anonymous, disposable. Fan-out grunt work. Luna still does
-  not *plan* a fan-out for you — one `dispatch` call is one job — but several
-  can now be in flight and the number is bounded: see the admission gate below.
+- **Workers** are anonymous, disposable. Fan-out grunt work. One `dispatch`
+  call is still one job, but Luna can now *plan* a fan-out: several tasks go
+  out under one plan id, `luna jobs` shows them together and one cancel stops
+  the group. The number in flight is bounded by the same admission gate as
+  everything else — see below. Her criterion for whether a split is worth
+  paying for at all lives in `data/persona.md`, and its honest answer is
+  usually no.
 
 Luna announces who she enrolled and why, in one line. The line is composed in
 `dispatch.py`, not asked of a model — an announcement that cost four seconds
@@ -751,10 +757,8 @@ The limit is read at each admission decision rather than captured, so lowering
 it stops admitting without touching anything already running and the count
 drains on its own; raising it releases waiting work at once, because the
 settings listener pokes the queue rather than waiting for the next job to end.
-A queued job is **dropped** on daemon shutdown, recorded as cancelled with the
-reason: the queue only ever existed in one process's memory, and a `queued`
-directory left behind by a dead daemon is a promise nobody is going to keep.
-`luna jobs` says so too — such a directory reads as `orphaned`, not `queued`.
+A queued job used to be **dropped** on daemon shutdown, because the queue only
+ever existed in one process's memory. It is now **durable** — see below.
 
 **`[dispatch] job_retention_days` is a GC pass with a stated policy.** A job
 directory is aged from when the job *stopped* — `finished`, falling back to
@@ -767,6 +771,53 @@ what "zero days" reads like and is the entire reason the case exists. The pass
 runs on a six-hour timer in its own thread plus once at start-up, never on the
 request path, and every deletion is an audit entry with no `undo`, because
 there is not one.
+
+### Fan-out as a plan, and a queue that survives the daemon — BUILT
+
+**A fan-out is one plan, not several loose jobs.** `dispatch_plan()` tags every
+job in a fan-out with one `plan` id, which reaches `job.json` and therefore
+disk: `luna jobs` shows the group with its position (`3/6`), and
+`luna jobs --cancel <plan>` stops the lot. It is deliberately not a scheduler —
+each job goes through the ordinary `dispatch()`, so the confirmation gate, the
+admission gate and the FIFO queue bound a plan exactly as they bound anything
+else, and six against `max_parallel = 2` starts two and queues four. Two
+refusals are built in so the grouping keeps meaning something: a plan of one is
+refused (that is a dispatch), and a plan larger than `config.DISPATCH_PLAN_MAX`
+is refused (past that it is a to-do list, and every accepted task costs a
+session and a report). A plan is **not atomic** and says so: the first refusal
+stops the fan-out where it is, the jobs already dispatched stand, and the
+reason is recorded. Cancelling a plan sets the group's flag *before* touching
+any member, because cancelling job by job frees slots, and a freed slot would
+otherwise admit the next member of the very plan being cancelled.
+
+**Queued work now survives the daemon; running work is never re-run.** A queued
+job writes `queued.json` beside its prompt — the watcher's timeout and the
+confirmations the user gave at accept time, which are the only two things that
+live nowhere else — and `Dispatcher.rehydrate()` reads the tree back at
+start-up under `[dispatch] requeue_on_start`. The job directory *is* the store;
+a second index would be one more thing to keep in step with it. There are three
+cases and they are not interchangeable:
+
+- **Queued, known never to have started.** Nothing was spawned, no side effect
+  exists, only the wait was lost. Requeued in its original order, keeping the
+  confirmations verbatim rather than re-gating against a policy that may have
+  changed since, and marked `rehydrated` so `luna jobs` shows `[resumed]`.
+- **Running when the daemon died, process gone.** Never re-run, whatever the
+  setting says. The process is gone but its side effects are not — it may have
+  written half a file or pushed a branch — and nothing on disk records how far
+  it got. Recorded as `interrupted`, a terminal state that says the outcome is
+  unknown. Re-dispatching it is a decision for a human who can look at what it
+  left behind.
+- **Running, but its `exit` file is there.** `run.sh` writes that file after
+  the agent returns, so this one finished and the daemon died before the
+  watcher wrote it down. The exit code is the job's own, so it is recorded as
+  `finished` or `failed` rather than libelled as interrupted.
+
+A job whose process is still **alive** is left completely alone: that is by
+design, `close()` does not kill running jobs, and there is no repair to make.
+Every resurrection is an audit entry (`dispatch.rehydrated`, `job.interrupted`,
+`dispatch.deferred` on the way out), and `[dispatch] requeue_on_start = false`
+restores the old clean-slate behaviour exactly.
 
 ### The Hyprland incantation — the thing that cost the time
 
@@ -1209,6 +1260,7 @@ it now, on the same notify-never-speak channel as the toasts.
 | — | **DONE.** The brain moved from claude to codex (`gpt-5.6-luna`), with real tools on the ask path — §6a. | `luna ask "what's my kernel version"` runs the command instead of declining. |
 | — | **DONE.** Sight (`luna look`, the focused-window context line) and self-dispatch (she runs `luna dispatch` on herself and the result comes back as memory) — §6, §6b. | `luna look "what's on screen"` describes the focused window; ask her to delegate something and the finding surfaces unprompted later. |
 | P3 | **DONE.** Bar widget (§3), ambient hooks — crash/battery/update, §7c — semantic recall (§4) and the `SUPER+F10` hush keybind. | Crash a process, she explains it unprompted (only if `[ambient] crash` is turned on — Omarchy's own watcher covers it by default). |
-| — | **Not built.** Worker fan-out as something Luna *plans* rather than something the admission gate merely allows; the `[ambient]` keys have no pane yet in the Jarvis GUI. | See `docs/STATE-OF-PLAY.md` §Next. |
+| — | **DONE.** Worker fan-out as something Luna *plans* — a criterion in `data/persona.md`, a plan id that groups the jobs — and a queued job that survives a daemon restart without ever re-running one that was already going. §6. | `luna dispatch "a" --and "b" --and "c"` starts what fits and queues the rest under one plan id; `luna jobs --cancel <plan>` stops the group. Restart `lunad` with work queued and it comes back as `[resumed]`. |
+| — | **Not built.** The `[ambient]` keys have no pane yet in the Jarvis GUI. | See `docs/STATE-OF-PLAY.md` §Next. |
 
 Each phase is independently useful and independently revertible.

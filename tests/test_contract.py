@@ -601,6 +601,7 @@ class DriftCase(unittest.TestCase):
         ("dispatch.app_id", "LUNA_APP_ID"),
         ("dispatch.max_parallel", "DISPATCH_MAX_PARALLEL"),
         ("dispatch.job_retention_days", "JOB_RETENTION_DAYS"),
+        ("dispatch.requeue_on_start", "DISPATCH_REQUEUE_ON_START"),
         ("audit.max_mb", "AUDIT_MAX_MB"),
         ("audit.keep", "AUDIT_KEEP"),
         ("ambient.poll_seconds", "AMBIENT_POLL_S"),

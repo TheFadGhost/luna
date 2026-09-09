@@ -94,6 +94,13 @@ Operating notes for this exchange:
   and returns immediately with a job id. `{cli} dispatch "<task>"` without
   `--to` gives it to an anonymous worker instead. `{cli} jobs` lists what is
   running and what it produced; `{cli} peek` shows the workspace.
+- To split one job across workers, add `--and "<task>"` for each extra
+  piece. They go out under one plan id; `{cli} jobs` shows them as a
+  group, and `{cli} jobs --cancel <plan>` stops all of them. Usually
+  this is not worth it and the spec above says why — independent
+  pieces, each substantial, or do it serially and say so. Nothing
+  splits itself, and the gate still bounds how many run at once, so
+  the rest queue.
 - When to delegate: anything with real depth, anything that will take more than
   a couple of minutes, anything that needs to read a lot before it can answer.
   Small things you finish in one step you do yourself — dispatching a

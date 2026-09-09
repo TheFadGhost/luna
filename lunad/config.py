@@ -334,6 +334,23 @@ SPAWN_LEDGER_MAX = 200                             # records kept in spawned.jso
 # job the user cannot see is a job they cannot notice thrashing.
 DISPATCH_MAX_PARALLEL = 1
 
+# The largest fan-out `Dispatcher.dispatch_plan` will accept, and deliberately
+# not a setting. It is not a resource limit — `max_parallel` is the resource
+# limit, and it is what stops six jobs stampeding — it is a limit on how big a
+# thing Luna is allowed to call a plan. Every accepted task costs a job
+# directory, a model session and a report the user has to read, whether or not
+# it ever gets a slot; past eight, a "fan-out" is a to-do list, and the right
+# answer is to say so rather than to let the number grow in a config file.
+DISPATCH_PLAN_MAX = 8
+
+# Fallback default for `[dispatch] requeue_on_start`. On, because the queue is
+# now durable and the alternative is that a `systemctl restart` at three in the
+# morning silently loses unattended work. It governs *queued* jobs only —
+# nothing was spawned, so resuming one cannot repeat anything. A job that was
+# already running when the daemon died is never re-run whatever this says; see
+# `Dispatcher.rehydrate`.
+DISPATCH_REQUEUE_ON_START = True
+
 # Fallback default for `[dispatch] job_retention_days`, and how often the
 # collector wakes. Six hours, not once at startup: this daemon is meant to run
 # for weeks, and a pass that only runs at boot never runs at all.

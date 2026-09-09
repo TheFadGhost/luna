@@ -271,6 +271,14 @@ SCHEMA: tuple[Section, ...] = (
             Key("job_retention_days", 14, "int", minimum=0, maximum=3650,
                 comment="finished job directories older than this are "
                         "collected; 0 = never"),
+            # Queued only. A job that was *running* when the daemon died is
+            # never re-run whatever this says: its process is gone but its
+            # side effects are not, and nothing on disk records how far it
+            # got. Off restores the old behaviour, where a restart meant a
+            # clean slate and the wait was simply lost.
+            Key("requeue_on_start", True, "bool",
+                comment="queued jobs are picked back up after a restart; "
+                        "running ones are never re-run"),
         ),
     ),
     Section(
