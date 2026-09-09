@@ -217,7 +217,12 @@ class ArgvTests(unittest.TestCase):
         """
         argv = self.a.build_argv(PERSONA, images=["/tmp/a.png", "/tmp/b.png"])
         self.assertEqual(argv[-4:], ["-i", "/tmp/a.png", "-i", "/tmp/b.png"])
-        self.assertNotIn("-i", agent.CodexAdapter().build_argv(PERSONA))
+        # A second, otherwise-untouched adapter: this is about argv shape
+        # with no images, not about resolving a real binary, so it gets the
+        # same local stub as `self.a` rather than reaching for codex itself.
+        bare = agent.CodexAdapter()
+        bare.binary = lambda: "/fake/codex"              # type: ignore[method-assign]
+        self.assertNotIn("-i", bare.build_argv(PERSONA))
 
     def test_images_survive_a_resume(self):
         # `codex exec resume` documents -i as "images to attach to the prompt

@@ -83,6 +83,13 @@ config.TERMINAL_BIN = FORBIDDEN_TERMINAL
 #:   GIT_BIN      - pushes to a real remote
 #:   GH_BIN       - opens pull requests, merges them and files issues on the
 #:                  user's own GitHub account
+#:   CODEX_BIN_*  - spawns a real codex CLI turn, burning the user's own
+#:                  ChatGPT session, and only on machines that happen to have
+#:                  codex installed — which is exactly how this one broke: a
+#:                  test that forgot to stub `CodexAdapter.binary()` passed
+#:                  here (codex is on this laptop via mise) and errored on
+#:                  every CI runner (it is not), instead of failing the same
+#:                  way everywhere.
 #:
 #: ``GRIM_BIN`` and ``GH_BIN`` are the sharpest of these and the newest.
 #: ``GRIM_BIN``, left alone, does not merely open a window or make a noise: it
@@ -106,6 +113,7 @@ FORBIDDEN_HYPRCTL = "luna-tests-must-pass-hypr=FakeHyprland"
 FORBIDDEN_PYTHON = Path("/nonexistent/luna-tests-must-pass-python")
 FORBIDDEN_GIT = "luna-tests-must-pass-git_bin=fake-runner"
 FORBIDDEN_GH = "luna-tests-must-pass-gh_bin=fake-runner"
+FORBIDDEN_CODEX_BIN = "luna-tests-must-pass-codex_bin=fake-runner"
 
 config.GRIM_BIN = FORBIDDEN_GRIM
 config.NOTIFY_BIN = FORBIDDEN_NOTIFIER
@@ -114,6 +122,11 @@ config.HYPRCTL_BIN = FORBIDDEN_HYPRCTL
 config.VENV_PYTHON = FORBIDDEN_PYTHON
 config.GIT_BIN = FORBIDDEN_GIT
 config.GH_BIN = FORBIDDEN_GH
+#: `CODEX_BIN_CANDIDATES` has to be emptied rather than pointed at a sentinel
+#: name: it is a tuple of *paths* `CodexAdapter.binary()` stats directly, not
+#: a name handed to `shutil.which`. `CODEX_BIN_NAME` is that name.
+config.CODEX_BIN_CANDIDATES = ()
+config.CODEX_BIN_NAME = FORBIDDEN_CODEX_BIN
 
 #: The same class of bug, one step further out: not a binary but a *file the
 #: desktop is reading*. ``config.STATE_FILE`` is what the Luna bar widget

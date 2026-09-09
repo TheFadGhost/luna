@@ -298,6 +298,24 @@ CODEX_PERSONA_KEY = "developer_instructions"
 CODEX_HOME = _xdg("CODEX_HOME", HOME / ".codex")
 CODEX_AUTH = CODEX_HOME / "auth.json"
 
+# Where `CodexAdapter.binary()` looks for the real executable, and the name it
+# falls back to on $PATH. These used to be a class attribute (`_CANDIDATES`)
+# and a literal `shutil.which("codex")` baked into `agent.py` — fixed at
+# import, like `TERMINAL_BIN` and the rest of the names
+# `tests/_support.py` disarms, and for the same reason it was a bug there:
+# codex is genuinely installed on this laptop (via mise), so an un-stubbed
+# `CodexAdapter()` in a test silently resolves to the real CLI here and then
+# raises `AgentUnavailable` on every CI runner, which has none of these paths.
+# Living in `config` means the test scaffolding can point both at something
+# that cannot resolve on any machine, the same way it does for every other
+# outward binary.
+CODEX_BIN_CANDIDATES = (
+    HOME / ".local/share/mise/installs/codex/latest/bin/codex",
+    HOME / ".local/share/mise/shims/codex",
+    Path("/usr/bin/codex"),
+)
+CODEX_BIN_NAME = "codex"
+
 # --- Dispatch (ARCHITECTURE.md section 6) ---------------------------------
 #
 # Luna's own special workspace. `scratchpad` is already bound to SUPER+S and

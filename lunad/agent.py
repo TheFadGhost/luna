@@ -305,7 +305,7 @@ def shell_lines(argv: list[str]) -> list[str]:
     return lines
 
 
-def _first_existing(candidates: list[Path | str]) -> str | None:
+def _first_existing(candidates: Sequence[Path | str]) -> str | None:
     for cand in candidates:
         p = Path(cand)
         if p.is_file() and os.access(p, os.X_OK):
@@ -574,12 +574,6 @@ class CodexAdapter(BaseAdapter):
 
     name = "codex"
 
-    _CANDIDATES = [
-        Path.home() / ".local/share/mise/installs/codex/latest/bin/codex",
-        Path.home() / ".local/share/mise/shims/codex",
-        "/usr/bin/codex",
-    ]
-
     #: Name of the profile file Luna will write for the user's *own* codex
     #: sessions. A profile-v2 is `$CODEX_HOME/<name>.config.toml`, a separate
     #: file — not a `[profiles.x]` table inside the user's config.toml, which
@@ -620,15 +614,18 @@ class CodexAdapter(BaseAdapter):
                     f"LUNA_CODEX_BIN={override} is not an executable file"
                 )
             return override
-        found = _first_existing(self._CANDIDATES)
+        # Read from `config`, not a class attribute: a name baked into the
+        # class body is fixed at import and a test cannot redirect it — see
+        # `config.CODEX_BIN_CANDIDATES` for the rest of that reasoning.
+        found = _first_existing(config.CODEX_BIN_CANDIDATES)
         if found:
             return found
-        which = shutil.which("codex")
+        which = shutil.which(config.CODEX_BIN_NAME)
         if which:
             return which
         raise AgentUnavailable(
             "codex CLI not found. Looked at: "
-            + ", ".join(str(c) for c in self._CANDIDATES)
+            + ", ".join(str(c) for c in config.CODEX_BIN_CANDIDATES)
             + " and $PATH. Set LUNA_CODEX_BIN to its absolute path."
         )
 

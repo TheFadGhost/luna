@@ -20,12 +20,14 @@ guard that is one refactor from being gone.
 from __future__ import annotations
 
 import inspect
+import os
 import shutil
 import unittest
 from pathlib import Path
 
 from ._support import (FORBIDDEN_AMBIENT_STATE, FORBIDDEN_APLAY,
-                       FORBIDDEN_COREDUMP_DIR, FORBIDDEN_CRASH_TOGGLE_OFF,
+                       FORBIDDEN_CODEX_BIN, FORBIDDEN_COREDUMP_DIR,
+                       FORBIDDEN_CRASH_TOGGLE_OFF,
                        FORBIDDEN_CRASH_WATCH_UNIT, FORBIDDEN_GH,
                        FORBIDDEN_GIT, FORBIDDEN_GRIM,
                        FORBIDDEN_HUD_MESSAGE, FORBIDDEN_HUD_SETTINGS,
@@ -36,8 +38,8 @@ from ._support import (FORBIDDEN_AMBIENT_STATE, FORBIDDEN_APLAY,
                        FORBIDDEN_STATE_FILE, FORBIDDEN_TERMINAL, FakeHyprland,
                        TempMemoryCase)
 
-from lunad import (ambient, config, confirm, context, dispatch, hud, presence,
-                   speech, vcs)
+from lunad import (agent, ambient, config, confirm, context, dispatch, hud,
+                   presence, speech, vcs)
 
 #: Every ``config`` name that reaches the outside world, and what it would do
 #: to the machine running the suite if it were the real thing.
@@ -52,6 +54,9 @@ DISARMED = {
     "GH_BIN": (FORBIDDEN_GH,
                "opens, comments on and MERGES pull requests on the user's "
                "own GitHub account"),
+    "CODEX_BIN_NAME": (FORBIDDEN_CODEX_BIN,
+                       "spawns a real codex CLI turn on the user's own "
+                       "ChatGPT session"),
 }
 
 
@@ -174,6 +179,40 @@ class ConstructionCase(TempMemoryCase):
                                 notify_bin="/bin/true")
         self.assertEqual(d.terminal, "/bin/bash")
         self.assertEqual(d.notify_bin, "/bin/true")
+
+
+class CodexBinCase(unittest.TestCase):
+    """The same class of bug as GIT_BIN/GH_BIN, and how this repo found it.
+
+    `CodexAdapter.binary()` used to hold its own `_CANDIDATES` list and a
+    literal `shutil.which("codex")`, both fixed at import and therefore
+    unreachable from a redirect -- the exact shape `LateReadCase` exists to
+    catch, one step further out: not a signature default, but a class
+    attribute. codex is genuinely installed on this laptop (via mise), so an
+    un-stubbed `CodexAdapter()` in a test resolved to the real CLI *here* and
+    only raised `AgentUnavailable` on a CI runner, which has none of the paths
+    it checks. `tests/test_codex.py::test_images_are_attached_last_and_one_
+    flag_each` is exactly that test.
+    """
+
+    def setUp(self) -> None:
+        self._old_override = os.environ.pop("LUNA_CODEX_BIN", None)
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        if self._old_override is not None:
+            os.environ["LUNA_CODEX_BIN"] = self._old_override
+
+    def test_the_candidate_paths_are_emptied(self) -> None:
+        self.assertEqual(config.CODEX_BIN_CANDIDATES, ())
+
+    def test_an_unstubbed_adapter_cannot_reach_a_real_codex(self) -> None:
+        # Nothing stubbed, and no LUNA_CODEX_BIN in the environment: the
+        # resolution is genuinely attempted and must fail everywhere, not
+        # just on machines without codex installed.
+        with self.assertRaises(agent.AgentUnavailable) as caught:
+            agent.CodexAdapter().binary()
+        self.assertIn("LUNA_CODEX_BIN", str(caught.exception))
 
 
 class SightCase(unittest.TestCase):
