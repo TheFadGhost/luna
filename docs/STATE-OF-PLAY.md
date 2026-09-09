@@ -1365,10 +1365,12 @@ subprocess call under it carries its own timeout.
 - **The `jarvis-settings` contract test caught the `[vcs]`/`git_merge` keys
   with no GUI control**, the same way it once caught the `[ambient]` keys —
   the fix was a "GitHub" pane and two new controls in `jarvis/widgets.py`,
-  not an exemption. (`docs/CONFIG-SCHEMA.md` §`[vcs]` lists six keys plus
-  `[policy] git_merge`, seven in total — the notes this section was built
-  from say eight; recorded here as the number actually verified against the
-  schema file.)
+  not an exemption. **Eight keys, not seven**: the six `[vcs]` keys and
+  `[policy] git_merge` are the obvious ones, but `[dispatch]
+  requeue_on_start` — added by the fan-out branch, not the GitHub one — was
+  in the same failing run and is easy to miss when counting from
+  `CONFIG-SCHEMA.md`'s `[vcs]` table alone. The failing run named all eight;
+  that is the number to trust.
 - Left unbuilt, out of scope for this branch: no retry/backoff on a transient
   `gh` failure (rate limit, a flaky 502); `existing_pr()`/`slug()` still
   assume `gh` is reachable and don't degrade offline the way `default_branch()`
