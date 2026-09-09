@@ -512,8 +512,19 @@ def _wait_dead(proc: subprocess.Popen, grace: float) -> bool:
     call that notices the child died is the same call that reaps it — there
     is no separate step where the confirmation and the reap could be pulled
     apart and a window opened between them.
+
+    A non-positive ``grace`` means no time was budgeted to observe death at
+    all, so it is answered without even one ``poll()``: a zero-length budget
+    that still snuck in a single free check would make the answer depend on
+    whether the kernel happened to have already delivered and reaped the
+    signal by the time that check ran — a real race, since ``SIGKILL`` can
+    finish fast enough for that to be true a noticeable fraction of the time.
+    Skipping the check makes "no grace" mean exactly that, deterministically,
+    rather than "usually no grace."
     """
-    deadline = time.monotonic() + max(0.0, grace)
+    if grace <= 0.0:
+        return False
+    deadline = time.monotonic() + grace
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             return True
