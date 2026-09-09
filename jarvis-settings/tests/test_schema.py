@@ -99,8 +99,9 @@ class TriTest(unittest.TestCase):
         tri = [f.key for s in schema.SPEC if s.key == "confirm"
                for f in s.fields if isinstance(f, schema.Tri)]
         self.assertEqual(sorted(tri), sorted([
-            "delete_files", "git_push", "install_packages", "long_job",
-            "network_send", "spend", "system_config", "write_outside_home"]))
+            "delete_files", "git_merge", "git_push", "install_packages",
+            "long_job", "network_send", "spend", "system_config",
+            "write_outside_home"]))
 
 
 if __name__ == "__main__":
