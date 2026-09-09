@@ -5,7 +5,7 @@ Hyprland special workspace, tracks the pid she created, captures what it wrote,
 and reports back. The workspace is hidden, so the job does not interrupt what
 the user is doing; ``luna peek`` brings it into view.
 
-Four decisions worth the words:
+Six decisions worth the words:
 
 **Luna spawns the terminal, Hyprland does not.** The obvious route is
 ``hyprctl dispatch exec``, which lets the compositor place the window with an
@@ -38,6 +38,31 @@ frees. The only thing it does not have is a pid. Admission is re-decided every
 time a slot frees and every time the setting changes, and the limit is read at
 that moment rather than captured, so lowering it below the number of running
 jobs stops *admitting* without killing anything: the count drains on its own.
+
+**A fan-out is one plan, not six loose jobs.** Nothing here decides to split a
+task — that judgement is Luna's, and ``data/persona.md`` says when it is worth
+paying for and when it is not. What dispatch owns is making the answer legible
+once she has made it: :meth:`Dispatcher.dispatch_plan` tags every job in a
+fan-out with one ``plan`` id, so ``luna jobs`` can show them as a group and
+``luna jobs --cancel <plan>`` stops the group in one command. It is deliberately
+not a scheduler. Each job goes through the ordinary ``dispatch()`` path, which
+means the admission gate and the FIFO queue bound the whole plan exactly as
+they bound any other work: a fan-out of six against ``max_parallel = 2`` starts
+two and queues four.
+
+**Queued work survives the daemon; running work is not re-run.** The queue used
+to live only in this process's memory, and ``close()`` cancelled it. For
+unattended background work that is the wrong default — a ``systemctl restart``
+would silently lose the wait. So a queued job writes ``queued.json`` beside its
+prompt, and :meth:`Dispatcher.rehydrate` reads it back at start-up (subject to
+``[dispatch] requeue_on_start``). A job that was *running* when the daemon died
+is the other case entirely and is never requeued: its process is gone but its
+side effects are not, and re-running it would repeat them. It is recorded as
+``interrupted`` instead — unless its ``exit`` file says it actually finished
+first, in which case that outcome is recorded, because the exit code is the
+job's own and the daemon simply died before writing it down. Anything
+resurrected carries ``rehydrated`` into ``luna jobs`` and an entry into the
+audit log.
 
 The exact Hyprland incantation is documented in :class:`Hyprland`; it was not
 the obvious one.
@@ -282,7 +307,11 @@ def _lua_escape(text: str) -> str:
 # A job
 # =========================================================================
 
-_STATES = ("queued", "running", "finished", "failed", "cancelled")
+_STATES = ("queued", "running", "finished", "failed", "cancelled",
+           # Set only by `rehydrate()`: the daemon died while this job was
+           # running. It is a terminal state on purpose — see the module
+           # docstring on why an interrupted job is never re-run.
+           "interrupted")
 
 
 @dataclass
@@ -295,6 +324,17 @@ class Job:
     ``max_parallel``, and the gap between them is the wait. Keeping both means
     ``luna jobs`` can sort by when the user asked without reporting an hour of
     queueing as an hour of work.
+
+    ``plan`` is the fan-out group this job belongs to, or ``None`` for the
+    ordinary case of one task and one job. It is carried on the job rather than
+    held in a table of its own so that it survives to disk with everything
+    else: after a restart the group is still a group.
+
+    ``rehydrated`` is sticky and says this job was picked back up off disk by a
+    daemon that did not accept it. It is the difference between work that is
+    waiting and work that *was* waiting when something died, and ``luna jobs``
+    shows it, because a resurrected job the user has forgotten about is exactly
+    the thing that should not start silently.
     """
 
     id: str
@@ -308,6 +348,10 @@ class Job:
     exit_code: int | None = None
     note: str = ""
     dir: Path | None = None
+    plan: str | None = None
+    plan_index: int | None = None
+    plan_size: int | None = None
+    rehydrated: bool = False
 
     def to_dict(self, output: str | None = None) -> dict[str, Any]:
         d = {
@@ -330,6 +374,10 @@ class Job:
             "exit_code": self.exit_code,
             "note": self.note,
             "dir": str(self.dir) if self.dir else None,
+            "plan": self.plan,
+            "plan_index": self.plan_index,
+            "plan_size": self.plan_size,
+            "rehydrated": self.rehydrated,
         }
         if output is not None:
             d["output"] = output
@@ -386,6 +434,55 @@ class _Pending:
     job: Job
     timeout: float
     confirmed: list[str] | None = None
+
+    def marker(self) -> dict[str, Any]:
+        """What ``queued.json`` has to hold for another daemon to resume this.
+
+        Deliberately small. The prompt, the system prompt and ``run.sh`` are
+        already on disk — they are written before the job is queued, precisely
+        so a queued job is a real job — and ``job.json`` holds the rest. The
+        only things that live nowhere else are the watcher's timeout and the
+        confirmations the user gave at accept time, and the second of those is
+        the reason this file exists at all: a resumed job must not be able to
+        claim a "yes" that was never said, so the decisions are carried
+        forward verbatim rather than re-gated against a policy that may have
+        changed in the meantime.
+        """
+        return {"id": self.job.id, "timeout": self.timeout,
+                "confirmed": self.confirmed, "queued_at": self.job.started,
+                "daemon_pid": os.getpid()}
+
+
+@dataclass
+class Plan:
+    """One fan-out, and what came of it.
+
+    A plan is an *id and a list*, not a scheduler. The jobs in it were each
+    dispatched through the ordinary path, so the admission gate bounds them
+    like anything else; what the plan buys is that ``luna jobs`` can show them
+    together and one cancel can stop the lot.
+
+    ``errors`` is not an afterthought. A fan-out is not atomic — by the time
+    the fourth task is refused, the first three are already running — so a
+    plan that partly failed says which parts, rather than pretending the whole
+    thing did or did not happen.
+    """
+
+    id: str
+    to: str = "worker"
+    jobs: list[Job] = field(default_factory=list)
+    errors: list[dict[str, str]] = field(default_factory=list)
+
+    @property
+    def size(self) -> int:
+        return len(self.jobs)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"plan": self.id, "to": self.to, "count": len(self.jobs),
+                "jobs": [j.to_dict() for j in self.jobs],
+                "queued": sum(1 for j in self.jobs if j.state == "queued"),
+                "running": sum(1 for j in self.jobs if j.state == "running"),
+                "errors": self.errors}
 
 
 class Dispatcher:
@@ -452,6 +549,17 @@ class Dispatcher:
         # limit of one.
         self._admitting: set[str] = set()
         self._queue: list[_Pending] = []
+        # Fan-out groups, plan id -> job ids in dispatch order. Rebuilt from
+        # `job.json` by `rehydrate()`, so a plan is still cancellable as a unit
+        # after a restart.
+        self._plans: dict[str, list[str]] = {}
+        # Plans the user has cancelled. Checked in `_start`, which is the one
+        # place a spawn actually happens: without it a job the queue had
+        # already popped -- in `_admitting`, so neither queued nor running,
+        # and invisible to `cancel()` -- would start seconds *after* the group
+        # it belongs to was cancelled. Never cleared: a plan that was
+        # cancelled stays cancelled.
+        self._cancelled_plans: set[str] = set()
         self._watchers: list[threading.Thread] = []
         self._lock = threading.Lock()
         # Set by close(). Admission checks it, so a watcher that finishes
@@ -487,6 +595,20 @@ class Dispatcher:
                                         config.JOB_RETENTION_DAYS))
         except (TypeError, ValueError):
             return config.JOB_RETENTION_DAYS
+
+    @property
+    def requeue_on_start(self) -> bool:
+        """`[dispatch] requeue_on_start`. Read late, like every other setting.
+
+        It governs exactly one thing: whether a job that was **queued** when
+        the daemon stopped is picked back up by the next one. It has no say
+        over a job that was *running* — that one is never re-run whatever this
+        says, because nothing on disk can tell how much of it already happened.
+        """
+        value = settings_mod.get("dispatch.requeue_on_start",
+                                 config.DISPATCH_REQUEUE_ON_START)
+        return bool(value) if isinstance(value, bool) else \
+            config.DISPATCH_REQUEUE_ON_START
 
     def agent_bin(self) -> str:
         if self._agent_bin:
@@ -526,6 +648,27 @@ class Dispatcher:
         return (f"Enrolled {who} on job {job.id} — {why}. "
                 f"`luna peek` to watch, `luna jobs` for the result.")
 
+    def announce_plan(self, plan: Plan) -> str:
+        """One line for a whole fan-out, and it names the group, not the jobs.
+
+        A plan of six announced as six enrolment lines is six lines the user
+        has to read to learn one thing. The plan id is the useful handle: it
+        is what cancels the group.
+        """
+        who = (f"{settings_mod.specialist_name()} on" if plan.to == "sol"
+               else "workers on")
+        running = sum(1 for j in plan.jobs if j.state == "running")
+        waiting = len(plan.jobs) - running
+        shape = (f"{running} started" if not waiting
+                 else f"{running} started, {waiting} queued behind "
+                      f"[dispatch] max_parallel = {self.max_parallel}")
+        stopped = ("" if not plan.errors else
+                   f" The fan-out stopped at task {plan.errors[0]['index']}: "
+                   f"{plan.errors[0]['message']}")
+        return (f"Split that across {len(plan.jobs)} {who} plan {plan.id} — "
+                f"{shape}. `luna jobs` shows them together, "
+                f"`luna jobs --cancel {plan.id}` stops all of them.{stopped}")
+
     # -- dispatch --------------------------------------------------------
 
     def dispatch(self, task: str, to: str = "worker", *,
@@ -533,7 +676,10 @@ class Dispatcher:
                  linger: float = config.DISPATCH_LINGER_S,
                  sol_memory_block: str = "",
                  estimate_seconds: float | None = None,
-                 estimate_usd: float | None = None) -> Job:
+                 estimate_usd: float | None = None,
+                 plan: str | None = None,
+                 plan_index: int | None = None,
+                 plan_size: int | None = None) -> Job:
         task = (task or "").strip()
         if not task:
             raise DispatchError("dispatch needs a non-empty task")
@@ -574,7 +720,8 @@ class Dispatcher:
             raise DispatchUnavailable(
                 f"{self.jobs_dir.parent} has gone; refusing to recreate it")
         job_dir.mkdir(parents=True, exist_ok=True)
-        job = Job(id=job_id, task=task, to=to, dir=job_dir)
+        job = Job(id=job_id, task=task, to=to, dir=job_dir, plan=plan,
+                  plan_index=plan_index, plan_size=plan_size)
 
         ask_classes = [name for name in confirm_mod.CLASSES
                        if self.confirm.policy(name) == confirm_mod.ASK]
@@ -601,6 +748,8 @@ class Dispatcher:
         limit = self.max_parallel
         with self._lock:
             self._jobs[job_id] = job
+            if plan:
+                self._plans.setdefault(plan, []).append(job_id)
             running, waiting = self._taken(), len(self._queue)
             # FIFO even when a slot is free: admitting a newcomer past jobs
             # that are already waiting would turn a queue into a lottery.
@@ -612,12 +761,17 @@ class Dispatcher:
         if job.state == "queued":
             job.note = (f"queued: {running} of {limit} running, "
                         f"{waiting} already waiting")
+            # Written before job.json, so a daemon that dies between the two
+            # leaves a marker with no queued job rather than a queued job with
+            # no marker. The first is ignorable; the second would be a job the
+            # next daemon can see waiting and cannot resume.
+            self._write_queue_marker(pending)
             self._write_job(job)
             self.audit.append(
                 "dispatch.queued", ok=True, job_id=job_id, to=to,
                 why=task[:500], job_dir=str(job_dir), position=waiting + 1,
                 running=running, max_parallel=limit,
-                confirmed=pending.confirmed,
+                plan=plan, confirmed=pending.confirmed,
                 undo={"what": "drop the job before it starts",
                       "cmd": ["luna", "jobs", "--cancel", job_id],
                       "valid_while": "the job has not been admitted yet"})
@@ -626,6 +780,143 @@ class Dispatcher:
                                       "max_parallel": limit})
             return job
         return self._start(pending)
+
+    # -- fan-out: several jobs, one plan ---------------------------------
+
+    def dispatch_plan(self, tasks: list[str], to: str = "worker", *,
+                      timeout: float = config.DISPATCH_TIMEOUT_S,
+                      linger: float = config.DISPATCH_LINGER_S,
+                      sol_memory_block: str = "",
+                      estimate_seconds: float | None = None,
+                      estimate_usd: float | None = None,
+                      plan_id: str | None = None) -> Plan:
+        """Dispatch several independent tasks under one plan id.
+
+        This is the whole of the fan-out machinery, and it is deliberately
+        thin. Each task goes through :meth:`dispatch` unchanged, so the
+        confirmation gate, the admission gate and the FIFO queue apply to
+        every job in a plan exactly as they apply to a job dispatched alone: a
+        plan of six against ``max_parallel = 2`` starts two and queues four.
+        There is no scheduler here because there is already a queue.
+
+        Two refusals are built in, because a primitive that will group
+        anything makes the grouping meaningless:
+
+        **A plan of one is refused.** That is a dispatch, and putting a group
+        id on it would let ``luna jobs`` claim a fan-out happened.
+
+        **A plan larger than** ``config.DISPATCH_PLAN_MAX`` **is refused.**
+        Past that it is a to-do list rather than a fan-out, and every accepted
+        task costs a job directory, a model session and a report the user has
+        to read whether or not it ever gets a slot.
+
+        The plan is **not atomic**, and says so: by the time a later task is
+        refused the earlier ones are real, running jobs. So the first failure
+        or denial stops the fan-out where it is — the alternative is asking
+        the user to say "no" five more times — and the jobs already dispatched
+        stand, with the reason recorded in :attr:`Plan.errors`.
+
+        ``estimate_seconds`` and ``estimate_usd`` are **per task**, not per
+        plan: they are handed to the confirmation gate for each job, and a
+        plan of six costs six times what one of them says.
+        """
+        cleaned = [t.strip() for t in (tasks or []) if (t or "").strip()]
+        if len(cleaned) < 2:
+            raise DispatchError(
+                "a plan needs at least two tasks; one task is a dispatch, and "
+                "calling it a plan would report a fan-out that did not happen")
+        if len(cleaned) > config.DISPATCH_PLAN_MAX:
+            raise DispatchError(
+                f"a plan of {len(cleaned)} is a to-do list, not a fan-out; "
+                f"at most {config.DISPATCH_PLAN_MAX} tasks per plan. Each one "
+                f"costs its own session and its own report.")
+
+        plan = Plan(id=plan_id or ("plan-" + uuid.uuid4().hex[:6]), to=to)
+        size = len(cleaned)
+        for index, task in enumerate(cleaned, start=1):
+            try:
+                plan.jobs.append(self.dispatch(
+                    task, to, timeout=timeout, linger=linger,
+                    sol_memory_block=sol_memory_block,
+                    estimate_seconds=estimate_seconds,
+                    estimate_usd=estimate_usd,
+                    plan=plan.id, plan_index=index, plan_size=size))
+            except Exception as exc:  # noqa: BLE001 - recorded, then stops
+                plan.errors.append({"index": str(index), "task": task[:200],
+                                    "error": type(exc).__name__,
+                                    "message": str(exc)})
+                log.warning("a plan stopped part-way",
+                            extra={"plan": plan.id, "index": index,
+                                   "detail": str(exc)})
+                break
+        self.audit.append(
+            "dispatch.plan", ok=not plan.errors, plan=plan.id, to=to,
+            asked=size, dispatched=len(plan.jobs),
+            job_ids=[j.id for j in plan.jobs],
+            queued=sum(1 for j in plan.jobs if j.state == "queued"),
+            max_parallel=self.max_parallel,
+            why=("; ".join(cleaned))[:500],
+            errors=plan.errors or None,
+            undo={"what": "stop every job in the plan",
+                  "cmd": ["luna", "jobs", "--cancel", plan.id],
+                  "valid_while": "any job in the plan is queued or running"})
+        if not plan.jobs:
+            # Nothing was dispatched at all, so there is no group to hand
+            # back and no id worth printing. Raise the reason instead.
+            raise DispatchError(plan.errors[0]["message"] if plan.errors
+                                else "nothing in the plan could be dispatched")
+        return plan
+
+    def plans(self) -> dict[str, list[str]]:
+        """Plan id -> job ids, in dispatch order. A copy, safe to iterate."""
+        with self._lock:
+            return {pid: list(ids) for pid, ids in self._plans.items()}
+
+    def plan_jobs(self, plan_id: str) -> list[str]:
+        with self._lock:
+            return list(self._plans.get(plan_id, ()))
+
+    def cancel_plan(self, plan_id: str) -> dict[str, Any]:
+        """Stop every job in a plan. One command, one entry, no half-groups.
+
+        A fan-out the user has changed their mind about is a fan-out they want
+        *gone*, not one they want to chase job by job through ``luna jobs``.
+        Each job is cancelled through :meth:`cancel`, so a queued one is
+        dropped and a running one is signalled exactly as it would be alone,
+        and a refusal on one job does not leave the rest of the group running:
+        it is recorded and the loop carries on.
+        """
+        with self._lock:
+            ids = list(self._plans.get(plan_id, ()))
+            if ids:
+                # Set before a single job is touched. Cancelling job by job
+                # frees slots as it goes, and a freed slot admits the next
+                # member of the very plan being cancelled.
+                self._cancelled_plans.add(plan_id)
+        if not ids:
+            return {"plan": plan_id, "found": 0, "cancelled": 0,
+                    "job_ids": [], "already_over": [], "refused": [],
+                    "note": "no plan with that id in this daemon"}
+        cancelled: list[str] = []
+        missed: list[str] = []
+        refused: list[dict[str, str]] = []
+        for job_id in ids:
+            try:
+                if self.cancel(job_id):
+                    cancelled.append(job_id)
+                else:
+                    missed.append(job_id)
+            except safety.SignalRefused as exc:
+                refused.append({"job_id": job_id, "reason": str(exc)})
+        self.audit.append(
+            "dispatch.plan.cancel", ok=not refused, plan=plan_id,
+            why="cancel requested for the whole plan", found=len(ids),
+            cancelled=cancelled, already_over=missed, refused=refused or None)
+        return {"plan": plan_id, "found": len(ids), "cancelled": len(cancelled),
+                "job_ids": cancelled, "already_over": missed,
+                "refused": refused,
+                "note": "" if not refused else
+                        f"{len(refused)} job(s) could not be signalled"}
 
     def _taken(self) -> int:
         """Slots in use. Call with the lock held."""
@@ -653,6 +944,29 @@ class Dispatcher:
         task, job_id, to = job.task, job.id, job.to
         job_dir = job.dir
         try:
+            # The last gate before a fork, and the only one that closes the
+            # window between "popped off the queue" and "holding a pid". A job
+            # in that window is in `_admitting`: `cancel()` cannot see it, so
+            # a plan cancelled at exactly the wrong moment would leave one
+            # member of the group starting anyway. Inside the `try`, so the
+            # reservation is released by the same `finally` as everything
+            # else.
+            with self._lock:
+                plan_cancelled = bool(
+                    job.plan and job.plan in self._cancelled_plans)
+            if plan_cancelled:
+                job.state = "cancelled"
+                job.finished = time.time()
+                job.note = ("the plan it belongs to was cancelled while this "
+                            "job was being admitted; nothing was spawned")
+                self._clear_queue_marker(job)
+                self._write_job(job)
+                self.audit.append("dispatch.cancel", ok=True, job_id=job_id,
+                                  plan=job.plan, why="the plan was cancelled",
+                                  was="admitting",
+                                  note="never spawned; no process existed")
+                raise DispatchUnavailable(job.note)
+
             # Best effort: without the rule the job still runs, it just opens
             # the window where the user is looking. Say so rather than failing.
             placed = True
@@ -680,6 +994,7 @@ class Dispatcher:
                 job.state = "failed"
                 job.note = f"could not start {self.terminal}: {exc}"
                 job.finished = time.time()
+                self._clear_queue_marker(job)
                 self._write_job(job)
                 self.audit.append("dispatch.failed", ok=False, job_id=job_id,
                                   why=task[:200], reason=str(exc))
@@ -694,6 +1009,10 @@ class Dispatcher:
             with self._lock:
                 self._jobs[job_id] = job
                 self._procs[job_id] = proc
+            # It is no longer waiting, so it must stop looking like it is: a
+            # marker left behind here is how a job that already ran would come
+            # back from the dead on the next start-up.
+            self._clear_queue_marker(job)
             self._write_job(job)
 
             waited = round(job.admitted - job.started, 1)
@@ -769,6 +1088,180 @@ class Dispatcher:
     def queued(self) -> list[Job]:
         with self._lock:
             return [p.job for p in self._queue]
+
+    # -- start-up: what a dead daemon left behind -------------------------
+
+    def rehydrate(self, admit: bool = True) -> dict[str, Any]:
+        """Read the jobs tree back at start-up and resolve what is stale.
+
+        Called once by the daemon, after construction. It answers a question
+        the daemon could previously not answer at all: *what happened to the
+        work that was in flight when I died?* There are three honest answers
+        and they are not interchangeable.
+
+        **Queued, and known never to have started.** Nothing was spawned, no
+        side effect exists, and the only thing lost is the wait. These are put
+        back in the queue in their original order, keeping the confirmations
+        the user gave when they asked — subject to ``[dispatch]
+        requeue_on_start``, and marked ``rehydrated`` so ``luna jobs`` never
+        shows a resurrected job as though it were fresh. With the setting off
+        they are cancelled on disk with the reason, which is the old
+        behaviour, still available for anyone who wants a restart to mean a
+        clean slate.
+
+        **Running when the daemon died, and the process is gone.** These are
+        *never* re-run, whatever the setting says. The process is gone but its
+        side effects are not: it may have written half a file, pushed a
+        branch, or installed something, and nothing on disk records how far it
+        got. Re-running would repeat whatever it did do, on the user's own
+        machine, with nobody watching. So the job is recorded as
+        ``interrupted`` — a terminal state that says plainly that the outcome
+        is unknown — and re-dispatching it is left to a human who can look at
+        what it left behind. Requeueing "only what is known not to have
+        started" is the whole rule, and a running job fails it by definition.
+
+        **Running when the daemon died, but its ``exit`` file is there.** This
+        one is not interrupted at all: ``run.sh`` writes that file after the
+        agent returns, so the job finished and the daemon died before the
+        watcher could write it down. The exit code is the job's own, so it is
+        recorded as ``finished`` or ``failed`` accordingly rather than being
+        libelled as interrupted.
+
+        A job whose process is **still alive** is left completely alone. That
+        is by design — ``close()`` deliberately does not kill running jobs —
+        and it is the one case with no repair to make: it is still running, it
+        still shows as running, and when it ends it will read as ``orphaned``
+        because this daemon never owned its pid and cannot wait on it.
+
+        ``admit`` is for callers that want the queue restored without anything
+        being spawned yet.
+        """
+        summary: dict[str, Any] = {"requeued": [], "interrupted": [],
+                                   "completed": [], "dropped": [],
+                                   "left_running": [], "admitted": []}
+        with self._lock:
+            known = set(self._jobs)
+        restored: list[_Pending] = []
+        for entry in sorted(self.jobs_dir.glob("*/job.json")):
+            data = _read_json(entry)
+            job_id = str((data or {}).get("id") or "")
+            if not data or not job_id or job_id in known:
+                continue
+            state = str(data.get("state") or "")
+            if state == "running":
+                if not jid_is_dead(data, {}):
+                    summary["left_running"].append(job_id)
+                    continue
+                self._resolve_interrupted(data, entry.parent, summary)
+            elif state == "queued":
+                pending = self._resolve_queued(data, entry.parent, summary)
+                if pending is not None:
+                    restored.append(pending)
+        if restored:
+            # Original acceptance order, so a restart does not reshuffle a
+            # queue that was FIFO before it.
+            restored.sort(key=lambda p: p.job.started)
+            with self._lock:
+                for pending in restored:
+                    self._jobs[pending.job.id] = pending.job
+                    if pending.job.plan:
+                        self._plans.setdefault(
+                            pending.job.plan, []).append(pending.job.id)
+                    self._queue.append(pending)
+        if admit and restored:
+            summary["admitted"] = self.admit_ready()
+        if any(summary[k] for k in ("requeued", "interrupted", "completed",
+                                    "dropped")):
+            log.info("rehydrated the jobs tree",
+                     extra={k: len(v) for k, v in summary.items()})
+        return summary
+
+    def _resolve_interrupted(self, data: dict[str, Any], job_dir: Path,
+                             summary: dict[str, Any]) -> None:
+        """Record what became of a job that was running when the daemon died."""
+        job = _job_from_dict(data, job_dir)
+        job.rehydrated = True
+        job.finished = time.time()
+        raw = _read(job_dir / "exit", 32).strip()
+        code: int | None = None
+        if raw:
+            try:
+                code = int(raw)
+            except ValueError:
+                code = None
+        if code is not None:
+            job.exit_code = code
+            job.state = "finished" if code == 0 else "failed"
+            job.note = ("the daemon died before it could record this; the "
+                        "job itself had already finished and the exit code "
+                        "is its own")
+            summary["completed"].append(job.id)
+        else:
+            job.state = "interrupted"
+            job.note = ("the daemon died while this job was running; its "
+                        "process is gone and whatever it had already done "
+                        "stands. It was not re-run — dispatch it again by "
+                        "hand if you still want it")
+            summary["interrupted"].append(job.id)
+        self._write_job(job)
+        self._clear_queue_marker(job)
+        self.audit.append(
+            "job.interrupted", ok=code == 0, job_id=job.id, to=job.to,
+            pid=data.get("pid"), exit_code=job.exit_code,
+            resolution="finished-before-the-daemon-died" if code is not None
+                       else "outcome unknown; not re-run",
+            why=str(data.get("task", ""))[:200], job_dir=str(job_dir))
+
+    def _resolve_queued(self, data: dict[str, Any], job_dir: Path,
+                        summary: dict[str, Any]) -> _Pending | None:
+        """Requeue a job that never started, or record why it will not be."""
+        job = _job_from_dict(data, job_dir)
+        marker = _read_json(job_dir / self.QUEUE_MARKER)
+        reason = ""
+        if not self.requeue_on_start:
+            reason = ("[dispatch] requeue_on_start is off, so queued work is "
+                      "not carried across a restart")
+        elif not isinstance(marker, dict):
+            reason = ("its queue record is missing or unreadable, so the "
+                      "terms it was accepted on cannot be reconstructed")
+        elif not (job_dir / "run.sh").is_file():
+            reason = "its runner script is gone from the job directory"
+        if reason:
+            job.state = "cancelled"
+            job.finished = time.time()
+            job.rehydrated = True
+            job.note = f"not resumed: {reason}. Nothing was ever spawned"
+            self._write_job(job)
+            self._clear_queue_marker(job)
+            self.audit.append("dispatch.cancel", ok=True, job_id=job.id,
+                              why="found queued by a later daemon", was="queued",
+                              reason=reason, rehydrated=True,
+                              note="never admitted; no process existed")
+            summary["dropped"].append(job.id)
+            return None
+        job.rehydrated = True
+        job.state = "queued"
+        job.note = ("queued again after a daemon restart; it was accepted "
+                    f"{time.strftime('%H:%M:%S', time.localtime(job.started))} "
+                    "and has never been spawned")
+        self._write_job(job)
+        confirmed = marker.get("confirmed")
+        pending = _Pending(
+            job=job,
+            timeout=_float(marker.get("timeout")) or config.DISPATCH_TIMEOUT_S,
+            confirmed=list(confirmed) if isinstance(confirmed, list) else None)
+        self.audit.append(
+            "dispatch.rehydrated", ok=True, job_id=job.id, to=job.to,
+            why=job.task[:500], job_dir=str(job_dir), plan=job.plan,
+            # Carried forward verbatim, and dated to when the user actually
+            # agreed: re-gating here would date a human decision to a restart.
+            confirmed=pending.confirmed,
+            waited_s=round(time.time() - job.started, 1),
+            undo={"what": "drop the resumed job before it starts",
+                  "cmd": ["luna", "jobs", "--cancel", job.id],
+                  "valid_while": "the job has not been admitted yet"})
+        summary["requeued"].append(job.id)
+        return pending
 
     def _runner_script(self, job: Job, timeout: float, linger: float) -> str:
         """The script the terminal runs.
@@ -956,6 +1449,7 @@ exit "$rc"
             job.state = "cancelled"
             job.finished = time.time()
             job.note = "cancelled before it started; nothing was spawned"
+            self._clear_queue_marker(job)
             self._write_job(job)
             self.audit.append("dispatch.cancel", ok=True, job_id=job_id,
                               why="cancel requested", was="queued",
@@ -992,6 +1486,47 @@ exit "$rc"
                 "windows": len(self.hypr.windows()) if visible else None}
 
     # -- listing ---------------------------------------------------------
+
+    # -- `[dispatch] requeue_on_start`: the durable queue -----------------
+
+    QUEUE_MARKER = "queued.json"
+
+    def _write_queue_marker(self, pending: _Pending) -> None:
+        """Record that this job is waiting, in the job's own directory.
+
+        A second store was the obvious alternative and the wrong one: the job
+        directory already *is* the durable record — task, system prompt,
+        ``run.sh``, ``job.json``, ``exit`` — and a queue index somewhere else
+        would be a second thing to keep in step with it, with its own way of
+        going stale. The marker's presence is the whole claim: it exists while
+        the job is waiting and is removed the moment it is admitted, cancelled
+        or dropped.
+        """
+        job = pending.job
+        if job.dir is None:
+            return
+        try:
+            (job.dir / self.QUEUE_MARKER).write_text(
+                json.dumps(pending.marker(), ensure_ascii=False, indent=1),
+                encoding="utf-8")
+        except OSError as exc:
+            # Not fatal. The job still runs in this daemon; it just will not
+            # survive one. Saying so beats refusing to dispatch.
+            log.warning("could not write the queue marker; this job will not "
+                        "survive a restart",
+                        extra={"job_id": job.id, "detail": str(exc)})
+
+    def _clear_queue_marker(self, job: Job) -> None:
+        """The job is no longer waiting. Called on admit, cancel and drop."""
+        if job.dir is None:
+            return
+        try:
+            (job.dir / self.QUEUE_MARKER).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.warning("could not clear the queue marker",
+                        extra={"job_id": job.id, "detail": str(exc)})
 
     def _write_job(self, job: Job) -> None:
         if job.dir is None:
@@ -1054,6 +1589,8 @@ exit "$rc"
         return {"running": running, "queued": waiting,
                 "max_parallel": self.max_parallel,
                 "retention_days": self.retention_days,
+                "requeue_on_start": self.requeue_on_start,
+                "plans": self.plans(),
                 "jobs_dir": str(self.jobs_dir),
                 "workspace": self.hypr.state()}
 
@@ -1160,13 +1697,23 @@ exit "$rc"
         progress, the terminal is visible to the user, and the ledger entry is
         durable so a restarted daemon can still signal it if asked.
 
-        A *queued* job is the opposite case and gets the opposite treatment.
-        Nothing was spawned, the queue only ever existed in this process's
-        memory, and a `queued` directory left behind by a dead daemon is a job
-        that will never start however long anyone waits for it. So the queue is
-        emptied and each job is recorded as cancelled, with the reason. That is
-        also what stops the queue leaking: no waiting job, no watcher, nothing
-        holding a slot that will never be released.
+        A *queued* job used to get the opposite treatment unconditionally:
+        the queue only ever existed in this process's memory, so a `queued`
+        directory left by a dead daemon was a job that would never start, and
+        emptying the queue on the way out was the only honest thing to do with
+        it. That is now a setting, and the default has changed. With
+        `[dispatch] requeue_on_start` on — it is on by default — the queue is
+        emptied *in memory* and each job is left on disk exactly as it is,
+        still `queued`, still holding its `queued.json`, for the next daemon
+        to pick up in `rehydrate()`. Nothing was spawned, so nothing is at
+        risk of running twice, and unattended work no longer disappears
+        because something restarted at three in the morning. With the setting
+        off, the old behaviour is exactly what happens: cancelled on disk,
+        with the reason.
+
+        Either way the queue leaves this object empty, which is what stops it
+        leaking: no waiting job, no watcher, nothing holding a slot that will
+        never be released.
 
         The *watchers* are a different matter. ``_watch`` wakes when the
         terminal exits and only then writes ``dispatch.finish``, so a watcher
@@ -1187,11 +1734,31 @@ exit "$rc"
             dropped = list(self._queue)
             self._queue.clear()
             gc_thread = self._gc
+        keep_queued = self.requeue_on_start
         for pending in dropped:
             job = pending.job
+            if keep_queued:
+                # Left exactly as it is. The marker written at accept time is
+                # deliberately *not* cleared: it and `job.json` are the whole
+                # of what the next daemon reads.
+                job.note = ("the daemon stopped with this job still queued; "
+                            "it will be picked up on the next start")
+                self._write_job(job)
+                self.audit.append(
+                    "dispatch.deferred", ok=True, job_id=job.id, to=job.to,
+                    why="lunad shut down with the job still queued",
+                    plan=job.plan,
+                    queued_s=round(time.time() - job.started, 1),
+                    note="never admitted; nothing was spawned, so resuming it "
+                         "cannot repeat anything",
+                    undo={"what": "drop it instead of resuming it",
+                          "cmd": ["luna", "jobs", "--cancel", job.id],
+                          "valid_while": "before the next daemon admits it"})
+                continue
             job.state = "cancelled"
             job.finished = time.time()
             job.note = "the daemon stopped before this job was started"
+            self._clear_queue_marker(job)
             self._write_job(job)
             self.audit.append("dispatch.cancel", ok=True, job_id=job.id,
                               why="lunad shut down with the job still queued",
@@ -1258,6 +1825,45 @@ def _collectable(entry: Path, live: dict[str, Job],
     stamp = _float(data.get("finished")) or _float(data.get("started")) \
         or _mtime(manifest)
     return stamp < cutoff, stamp, state
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    """A JSON object off disk, or ``None``. Never raises: every caller here is
+    reading a file some earlier daemon may have died half-way through."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _job_from_dict(data: dict[str, Any], job_dir: Path) -> Job:
+    """Rebuild a :class:`Job` from its own ``job.json``.
+
+    Only the fields that mean something after a restart. ``pid`` is carried so
+    the record still names the process that is gone, and the timings are
+    carried so a resumed job's wait is reported from when the user asked, not
+    from when the daemon came back.
+    """
+    return Job(
+        id=str(data.get("id") or ""),
+        task=str(data.get("task") or ""),
+        to=str(data.get("to") or "worker"),
+        state=str(data.get("state") or "queued"),
+        pid=data.get("pid") if isinstance(data.get("pid"), int) else None,
+        started=_float(data.get("started")) or time.time(),
+        admitted=_float(data.get("admitted")) or None,
+        finished=_float(data.get("finished")) or None,
+        exit_code=(data.get("exit_code")
+                   if isinstance(data.get("exit_code"), int) else None),
+        note=str(data.get("note") or ""),
+        dir=job_dir,
+        plan=str(data["plan"]) if data.get("plan") else None,
+        plan_index=(data.get("plan_index")
+                    if isinstance(data.get("plan_index"), int) else None),
+        plan_size=(data.get("plan_size")
+                   if isinstance(data.get("plan_size"), int) else None),
+        rehydrated=bool(data.get("rehydrated")))
 
 
 def _float(value: Any) -> float:

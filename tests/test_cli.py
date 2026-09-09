@@ -348,6 +348,28 @@ class JobsTests(unittest.TestCase):
         text = cli()._jobs_text({"ok": True, "workspace": {}, "jobs": []}, PLAIN)
         self.assertIn("no jobs dispatched yet", text)
 
+    def test_a_fan_out_reads_as_a_group(self) -> None:
+        """The plan id is the useful handle: it is what cancels the group."""
+        reply = self.reply("running")
+        reply["jobs"][0].update({"plan": "plan-abc123", "plan_index": 2,
+                                 "plan_size": 3})
+        text = cli()._jobs_text(reply, PLAIN)
+        self.assertIn("[plan-abc123 2/3]", text)
+
+    def test_a_resumed_job_never_reads_as_a_fresh_one(self) -> None:
+        """It is work the user asked for before something died, and they may
+        well have forgotten it."""
+        reply = self.reply("queued")
+        reply["jobs"][0]["rehydrated"] = True
+        self.assertIn("[resumed]", cli()._jobs_text(reply, PLAIN))
+        self.assertNotIn("[resumed]", cli()._jobs_text(self.reply(), PLAIN))
+
+    def test_an_interrupted_job_takes_colour_like_a_failure(self) -> None:
+        """Not a failure and not a success, but it is not routine either:
+        the daemon died under it and nobody knows how far it got."""
+        text = cli()._jobs_text(self.reply("interrupted"), COLOURED)
+        self.assertIn("\033[31mINTR\033[0m", text)
+
 
 class AuditTests(unittest.TestCase):
     reply = {

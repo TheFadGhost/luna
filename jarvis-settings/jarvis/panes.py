@@ -1,4 +1,4 @@
-"""The eight panes.
+"""The nine panes.
 
 Every editable control is produced by `Binder.control_for(dotted)`, which
 dispatches on the schema field kind. That is the whole point: a setting added
@@ -970,6 +970,119 @@ def ambient_pane(b):
     return p
 
 
+def hud_pane(b):
+    """The orb overlay: what the desktop draws for her, and where.
+
+    The one pane in this app whose settings are read by neither lunad nor
+    Jarvis. The reader is a Quickshell plugin in another process, and the
+    daemon's whole job is to publish these six keys into a file it can read.
+    That is worth saying on the pane rather than in a document nobody opens,
+    because it is what explains the only surprising behaviour here: a change
+    lands when the daemon next reloads its config, which is a second or two,
+    and lands *nowhere at all* while lunad is not running.
+
+    Two dependent blocks, stated the way the Ambient pane states its own: a
+    row that is inert is dimmed **and** says why in a sentence above it. Grey
+    rows on their own read as broken.
+
+    Every handler re-reads the editor rather than the widget it is attached
+    to, so no closure captures its own control (CUSTOMISATIONS.md 6e).
+    """
+    ed = b.editor
+
+    enabled_ctl = b.control_for("hud.enabled")
+    caption_ctl = b.control_for("hud.caption")
+    idle_ctl = b.control_for("hud.idle_visible")
+
+    summary = label("", css=("rowlabel",), wrap=True, measure=COLUMN["note"])
+
+    n_enabled, n_caption, n_idle = (state_note(""), state_note(""),
+                                    state_note(""))
+
+    def note_line():
+        return label("", css=("rowdoc",), wrap=True, measure=COLUMN["note"])
+
+    r_enabled = b.bound_row("hud.enabled", ctl=enabled_ctl, trail=n_enabled)
+    r_corner = b.bound_row("hud.corner")
+    r_scale = b.bound_row("hud.scale", width=COLUMN["narrow"])
+    r_idle = b.bound_row("hud.idle_visible", ctl=idle_ctl, trail=n_idle)
+    r_caption = b.bound_row("hud.caption", ctl=caption_ctl, trail=n_caption)
+    r_sprite = b.bound_row("hud.sprite")
+
+    off_all = note_line()
+    off_all.set_text(
+        "The overlay is off, so nothing below it is drawn. Every setting "
+        "here is still saved, and turning it back on needs no restart.")
+
+    def mark(note, text):
+        note.set_text(text)
+        note.set_visible(bool(text))
+
+    def restate(*_a):
+        on = bool(ed.get("hud.enabled"))
+        caption = bool(ed.get("hud.caption"))
+        idle = bool(ed.get("hud.idle_visible"))
+
+        off_all.set_visible(not on)
+        for w in (r_corner, r_scale, r_idle, r_caption, r_sprite):
+            w.set_sensitive(on)
+
+        if not on:
+            summary.set_text(
+                "Nothing is drawn. The bar icon still shows what she is "
+                "doing; this is the sprite, and it is switched off.")
+        elif idle and caption:
+            summary.set_text(
+                "Always on screen, with a caption of what she says.")
+        elif idle:
+            summary.set_text("Always on screen, with no caption.")
+        elif caption:
+            summary.set_text(
+                "Appears when she is listening, thinking or speaking, with a "
+                "caption of what she says.")
+        else:
+            summary.set_text(
+                "Appears when she is listening, thinking or speaking, and "
+                "shows nothing else.")
+
+        # A trailing note says what a setting is currently *doing*, so an
+        # inert row says nothing at all — the sentence above the block is
+        # what explains the silence.
+        mark(n_enabled, "drawing" if on else "off")
+        mark(n_idle, ("always on" if idle else "on demand") if on else "")
+        mark(n_caption, ("her words" if caption else "sprite only")
+             if on else "")
+
+    for ctl in (enabled_ctl, caption_ctl, idle_ctl):
+        ctl.connect("notify::active", restate)
+    restate()
+
+    return pane(
+        head("Overlay",
+             "The orb the desktop draws for her. Drawn by a Quickshell "
+             "plugin, not by this app and not by lunad — these six settings "
+             "are published to a file it watches."),
+        group("The sprite", summary, r_enabled, off_all, r_corner, r_scale,
+              r_sprite,
+              note="lunad writes these to $XDG_RUNTIME_DIR/luna/hud.json "
+                   "when it starts and whenever this file changes, so a "
+                   "change here reaches the screen within a second or two. "
+                   "While lunad is not running the overlay falls back to "
+                   "exactly these defaults rather than showing an error — an "
+                   "absent file is a normal state, not a fault. Only the orb "
+                   "sprite exists so far; the setting is here so a second one "
+                   "does not need a new setting."),
+        group("What it says", r_caption, r_idle,
+              note="The caption is the spoken form of a reply — the same "
+                   "text she says aloud, capped by Voice out's maximum and "
+                   "cut at a sentence boundary — and it is one message per "
+                   "answer, never one per sentence. `luna hush` takes it off "
+                   "the screen along with her voice. An ambient notification "
+                   "(a crash, a flat battery, an update) uses the same "
+                   "surface and is not affected by this switch; neither can "
+                   "erase the other's message."))
+
+
 def memory_pane(b, window):
     bars = column(SPACE["lg"])
 
@@ -1151,6 +1264,82 @@ def jobs_pane(b):
         group("Recent jobs", listing, action=refresh))
     p.jarvis_refresh = rebuild
     return p
+
+
+def vcs_pane(b):
+    """How her work reaches GitHub: branch, commit, push, pull request and
+    — only if `auto_merge` is on — merge.
+
+    One dependent block, in the idiom the Ambient and Overlay panes already
+    use: `auto_merge` is the gate, and every row beneath it (which method,
+    whether to delete the branch, whether to wait and for how long, whether
+    a refusal gets a toast) is inert while it is off, dimmed and said so in
+    a sentence rather than left to look broken. `auto_merge` itself carries
+    the pane's one `risk` note, the way `Allow` does on Confirmations and
+    `never` does on Confirmations' own `git_merge` row just above it in the
+    sidebar order — this is the other place that answer's consequences are
+    spelled out, in full, rather than assumed already read.
+    """
+    ed = b.editor
+
+    auto_ctl = b.control_for("vcs.auto_merge")
+    n_auto = state_note("")
+
+    r_prefix = b.bound_row("vcs.branch_prefix")
+    r_auto = b.bound_row("vcs.auto_merge", ctl=auto_ctl, trail=n_auto)
+    r_method = b.bound_row("vcs.merge_method")
+    r_delete = b.bound_row("vcs.delete_branch")
+    r_notify = b.bound_row("vcs.notify_on_refusal")
+    r_wait = b.bound_row("vcs.check_wait_seconds", width=COLUMN["narrow"])
+
+    summary = label("", css=("rowlabel",), wrap=True, measure=COLUMN["note"])
+
+    off_all = label("", css=("rowdoc",), wrap=True, measure=COLUMN["note"])
+    off_all.set_text(
+        "Auto-merge is off, so nothing below this row runs: she opens the "
+        "pull request and stops. Every setting here is still saved, and "
+        "turning auto-merge back on needs no restart.")
+
+    def restate(*_a):
+        on = bool(ed.get("vcs.auto_merge"))
+        off_all.set_visible(not on)
+        for w in (r_method, r_delete, r_notify, r_wait):
+            w.set_sensitive(on)
+
+        if on:
+            summary.set_text(
+                "She merges her own pull requests, unread, the moment CI "
+                "comes back green.")
+        else:
+            summary.set_text(
+                "She opens the pull request and stops there — every merge "
+                "needs a person.")
+
+        n_auto.set_text("merges unread" if on else "opens and stops")
+        n_auto.set_visible(True)
+        if on:
+            n_auto.add_css_class("risk")
+        else:
+            n_auto.remove_css_class("risk")
+
+    auto_ctl.connect("notify::active", restate)
+    restate()
+
+    return pane(
+        head("GitHub workflow",
+             "How her work reaches GitHub. Every piece of it goes branch → "
+             "commit → push → pull request; she never pushes to the "
+             "default branch."),
+        group("Branching", r_prefix),
+        group("Merging", summary, r_auto, off_all, r_method, r_delete,
+              r_wait, r_notify,
+              note="What counts as green is decided in code, in "
+                   "`lunad/vcs.py`, and nothing on this pane can reach it "
+                   "— a repository with no CI configured never auto-merges. "
+                   "`Merge her own pull request` on the Confirmations pane "
+                   "can still put a toast in front of every merge, or "
+                   "refuse them outright, whatever this switch says."),
+    )
 
 
 def about_pane(b, on_start):

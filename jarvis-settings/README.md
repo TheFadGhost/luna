@@ -42,9 +42,10 @@ system.
 | 3 | Listening | `[listen]` — provider, STT model and language, **written through to `~/.config/voxtype/config.toml`**; the on/off switch, which is the router's; and the keybind, **displayed, not editable** (it lives in `~/.config/hypr/bindings.lua`) |
 | 4 | Confirmations | `[confirm]` + `[confirm.prompt]` — a three-way **Allow / Ask first / Refuse** per action class, each row saying in words what its answer does, plus the four immovable denies |
 | 5 | Ambient | `[ambient]` — the three hooks that act unprompted, each next to the argument for why it is on or off. Two ship off because Omarchy already watches crashes and the battery; the pane says which of the two is live by asking `lunad`'s own `CrashWatcher.desktop_already_watching()`, and never blocks you from turning one on |
-| 6 | Memory | `[memory]` caps and decay, live usage bars read from `~/.local/share/luna/memory/`, and a read-only **View memories** window |
-| 7 | Jobs | `[dispatch]` plus the recent job list read from `~/.local/share/luna/jobs/` |
-| 8 | About | daemon status, version, whether an API key exists (never the key), links to the audit and daemon logs, and any config keys Jarvis does not recognise |
+| 6 | Overlay | `[hud]` — the orb the desktop draws for her, and the caption beside it. The only pane whose reader is neither this app nor `lunad`: it is a Quickshell plugin in another process, and these six keys are published to `$XDG_RUNTIME_DIR/luna/hud.json` for it to read |
+| 7 | Memory | `[memory]` caps and decay, live usage bars read from `~/.local/share/luna/memory/`, and a read-only **View memories** window |
+| 8 | Jobs | `[dispatch]` plus the recent job list read from `~/.local/share/luna/jobs/` |
+| 9 | About | daemon status, version, whether an API key exists (never the key), links to the audit and daemon logs, and any config keys Jarvis does not recognise |
 
 ## How a change reaches the daemon
 
@@ -160,7 +161,7 @@ jarvis-settings/
   jarvis-settings        # executable entry point
   jarvis/
     app.py               # Gtk.Application, window chrome, sidebar, --pane
-    panes.py             # the eight panes + the Binder that types every control
+    panes.py             # the nine panes + the Binder that types every control
     widgets.py           # section header, separator, group, row, button, TriToggle
     theme.py             # palette -> GTK4 CSS, design tokens, ThemeWatch
     editor.py            # validate -> coalesce -> apply live -> persist

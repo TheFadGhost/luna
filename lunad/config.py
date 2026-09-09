@@ -67,6 +67,19 @@ STATE_FILE = RUNTIME_DIR / "state"
 # nothing polls and an absent file simply means there is nothing to show.
 HUD_MESSAGE_FILE = RUNTIME_DIR / "message"
 
+# The HUD overlay's *settings*, the third and last file in that directory. One
+# JSON object, written atomically by `lunad/hud.py` on start and on every
+# config reload, removed on shutdown. The orb plugin reads it through the same
+# inotify-backed FileView it uses for the other two.
+#
+# It exists because the overlay is drawn by QML that cannot read
+# ~/.config/jarvis/config.toml: Quickshell has no TOML parser, the file is 0600
+# in a 0700 directory, and a second reader of the user's config would be a
+# second thing to keep in step with the schema. So lunad projects the six
+# `[hud]` keys -- and nothing else -- into a file shaped for the overlay, and
+# the overlay never learns that a config file exists.
+HUD_SETTINGS_FILE = RUNTIME_DIR / "hud.json"
+
 OMARCHY_DEFAULT_AGENT = HOME / ".config" / "omarchy" / "defaults" / "agent"
 
 # --- Jarvis: the app's own configuration home ------------------------------
@@ -285,6 +298,24 @@ CODEX_PERSONA_KEY = "developer_instructions"
 CODEX_HOME = _xdg("CODEX_HOME", HOME / ".codex")
 CODEX_AUTH = CODEX_HOME / "auth.json"
 
+# Where `CodexAdapter.binary()` looks for the real executable, and the name it
+# falls back to on $PATH. These used to be a class attribute (`_CANDIDATES`)
+# and a literal `shutil.which("codex")` baked into `agent.py` — fixed at
+# import, like `TERMINAL_BIN` and the rest of the names
+# `tests/_support.py` disarms, and for the same reason it was a bug there:
+# codex is genuinely installed on this laptop (via mise), so an un-stubbed
+# `CodexAdapter()` in a test silently resolves to the real CLI here and then
+# raises `AgentUnavailable` on every CI runner, which has none of these paths.
+# Living in `config` means the test scaffolding can point both at something
+# that cannot resolve on any machine, the same way it does for every other
+# outward binary.
+CODEX_BIN_CANDIDATES = (
+    HOME / ".local/share/mise/installs/codex/latest/bin/codex",
+    HOME / ".local/share/mise/shims/codex",
+    Path("/usr/bin/codex"),
+)
+CODEX_BIN_NAME = "codex"
+
 # --- Dispatch (ARCHITECTURE.md section 6) ---------------------------------
 #
 # Luna's own special workspace. `scratchpad` is already bound to SUPER+S and
@@ -334,11 +365,60 @@ SPAWN_LEDGER_MAX = 200                             # records kept in spawned.jso
 # job the user cannot see is a job they cannot notice thrashing.
 DISPATCH_MAX_PARALLEL = 1
 
+# The largest fan-out `Dispatcher.dispatch_plan` will accept, and deliberately
+# not a setting. It is not a resource limit — `max_parallel` is the resource
+# limit, and it is what stops six jobs stampeding — it is a limit on how big a
+# thing Luna is allowed to call a plan. Every accepted task costs a job
+# directory, a model session and a report the user has to read, whether or not
+# it ever gets a slot; past eight, a "fan-out" is a to-do list, and the right
+# answer is to say so rather than to let the number grow in a config file.
+DISPATCH_PLAN_MAX = 8
+
+# Fallback default for `[dispatch] requeue_on_start`. On, because the queue is
+# now durable and the alternative is that a `systemctl restart` at three in the
+# morning silently loses unattended work. It governs *queued* jobs only —
+# nothing was spawned, so resuming one cannot repeat anything. A job that was
+# already running when the daemon died is never re-run whatever this says; see
+# `Dispatcher.rehydrate`.
+DISPATCH_REQUEUE_ON_START = True
+
 # Fallback default for `[dispatch] job_retention_days`, and how often the
 # collector wakes. Six hours, not once at startup: this daemon is meant to run
 # for weeks, and a pass that only runs at boot never runs at all.
 JOB_RETENTION_DAYS = 14
 JOB_GC_INTERVAL_S = 21_600.0
+
+# --- Version control: the GitHub workflow ---------------------------------
+#
+# Luna works unattended, so work that only exists on this disk is work nobody
+# can review, revert, or find again. Every piece of it goes branch -> commit
+# -> push -> pull request, and she merges her own pull request only when CI is
+# green. `lunad/vcs.py` holds the gate; `docs/CONFIG-SCHEMA.md` `[vcs]` holds
+# the settings.
+#
+# The two binary names are read *late*, in `Repo.__init__`, for exactly the
+# reason the terminal and the notifier are: a name bound as a signature
+# default is fixed at import and cannot be patched, and a test suite that
+# reached the real `gh` would open pull requests on the user's own account.
+# `tests/_support.py` replaces both with names that cannot resolve, and
+# `tests/test_guards.py` asserts both the values and the shape.
+
+GIT_BIN = "git"
+GH_BIN = "gh"
+
+# Fallback defaults for the `[vcs]` table.
+VCS_BRANCH_PREFIX = "luna"           # branches are `luna/<topic>-<yymmdd>`
+VCS_MERGE_METHOD = "squash"          # squash | merge | rebase
+VCS_AUTO_MERGE = True                # attempt the merge once checks are green
+VCS_DELETE_BRANCH = True             # delete the head branch on merge
+VCS_NOTIFY_ON_REFUSAL = True         # toast when an auto-merge was refused
+VCS_CHECK_WAIT_S = 900               # how long `ship` waits for CI to report
+
+# Not settings, deliberately. One `git` or `gh` call is either quick or
+# wedged, and the poll interval is a rate limit on GitHub's API rather than a
+# preference anybody has.
+VCS_TIMEOUT_S = 120.0
+VCS_CHECK_POLL_S = 20.0
 
 # --- Audit log rotation ---------------------------------------------------
 #
@@ -424,6 +504,59 @@ AMBIENT_CRASH_BURST = 3               # more than this in one tick coalesces
 AMBIENT_RECENT_DUMPS = 64             # dump names remembered for de-duplication
 AMBIENT_HUD_TTL_S = 12.0              # seconds an ambient caption stays up
 AMBIENT_DIAGNOSE_TIMEOUT_S = 900.0    # ceiling on a dispatched crash diagnosis
+
+# --- The HUD overlay ------------------------------------------------------
+#
+# Fallback defaults for the six `[hud]` keys, and the two tuples that say what
+# a string key is allowed to be. Every one of these is paired with its schema
+# default in `tests/test_contract.py::DriftCase`, which is the test that exists
+# because a default and its constant have silently disagreed twice.
+#
+# These are what the *publisher* falls back to, not what the overlay does. The
+# overlay has its own copy of the same six defaults and uses them when the file
+# is absent, which is the normal state on a machine whose daemon is not
+# running -- an absent hud.json must never be an error state on screen.
+
+HUD_ENABLED = True
+HUD_CORNER = "bottom-right"
+HUD_CORNERS = ("top-left", "top-right", "bottom-left", "bottom-right")
+#: Clamped, not merely validated: the schema already refuses a value outside
+#: this range, but the publisher is the last thing between a hand-edited
+#: config file and a sprite drawn ten screens wide.
+HUD_SCALE = 1.0
+HUD_SCALE_MIN = 0.5
+HUD_SCALE_MAX = 3.0
+HUD_IDLE_VISIBLE = False
+HUD_CAPTION = True
+#: Only "orb" exists. The key is here so a second sprite does not need a
+#: schema change to be selectable; anything unrecognised reads as "orb".
+HUD_SPRITE = "orb"
+HUD_SPRITES = ("orb",)
+
+#: How long a spoken caption stays up once she has stopped talking. NOT a
+#: setting: the pane's own contract (HANDOFF-hud.md) says the ttl countdown
+#: does not start while `state` reads `speaking`, so this is reading time
+#: after the last sentence and not a cap on the utterance. Shorter than
+#: AMBIENT_HUD_TTL_S because a caption of something she just said aloud has
+#: already been delivered once, by voice.
+SPEECH_HUD_TTL_S = 8.0
+
+#: Who put the message currently on `HUD_MESSAGE_FILE` there. Two paths write
+#: that one file -- an ambient event, and a spoken reply -- and each may
+#: retract only its own: a `luna hush` mid-answer must not wipe a crash
+#: notice, and lunad shutting down must not wipe a caption the speech path had
+#: just put up. `ambient.HudWriter` carries the tag; it never reaches the file
+#: and the pane has never heard of it.
+#:
+#: They live *here*, rather than beside the writer that uses them, for a
+#: reason that looks pedantic and is not:
+#: `tests/test_ambient.py::NeverSpeaksCase` reads the shipped source of
+#: `lunad/ambient.py` and fails if the word `speech` appears in its code at
+#: all. That guard is the whole of "an ambient event never speaks", it is
+#: worth more than the convenience of a constant in the obvious place, and
+#: naming the tag in `config` keeps both.
+HUD_OWNER_AMBIENT = "ambient"
+HUD_OWNER_SPEECH = "speech"
 
 
 def ensure_dirs() -> None:

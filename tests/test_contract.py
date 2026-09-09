@@ -23,7 +23,7 @@ from pathlib import Path
 from ._support import FakeHyprland, TempMemoryCase
 
 from lunad import audit as audit_mod
-from lunad import config, consolidate, dispatch, memory, speech
+from lunad import config, consolidate, dispatch, hud, memory, speech
 from lunad import settings as settings_mod
 
 
@@ -579,6 +579,268 @@ class NotifyOnFinishCase(TempMemoryCase):
 # =========================================================================
 
 
+# =========================================================================
+# [hud]
+# =========================================================================
+
+
+class HudSettingsCase(TempMemoryCase):
+    """`[hud]` reaches the overlay, or it is six keys that do nothing.
+
+    lunad does not draw the orb and never will -- the overlay is QML, in
+    another process, in the Quickshell engine. So "wired" here cannot mean
+    "the daemon acts on it"; it means the daemon *publishes* it, atomically,
+    into the one file that process can read. That file is the whole of the
+    wiring, which is why every case below asserts against its contents rather
+    than against a setting round-tripping.
+    """
+
+    def publisher(self) -> hud.HudSettings:
+        return hud.HudSettings(self.root / "hud.json", settings=self.settings)
+
+    def written(self) -> dict:
+        return json.loads((self.root / "hud.json").read_text(encoding="utf-8"))
+
+    def test_the_defaults_reach_the_file_exactly_as_the_contract_states_them(self) -> None:
+        pub = self.publisher()
+        self.assertTrue(pub.publish())
+        self.assertEqual(self.written(),
+                         {"enabled": True, "corner": "bottom-right",
+                          "scale": 1.0, "idle_visible": False,
+                          "caption": True, "sprite": "orb"})
+
+    def test_every_key_moves_the_published_file(self) -> None:
+        pub = self.publisher()
+        pub.publish()
+        for dotted, value in (("hud.enabled", False),
+                              ("hud.corner", "top-left"),
+                              ("hud.scale", 2.5),
+                              ("hud.idle_visible", True),
+                              ("hud.caption", False),
+                              ("hud.sprite", "orb")):
+            with self.subTest(dotted):
+                self.settings.set(dotted, value)
+                pub.publish()
+                self.assertEqual(self.written()[dotted.split(".")[1]], value)
+
+    def test_an_unchanged_reload_writes_nothing_at_all(self) -> None:
+        """The overlay watches this file with inotify.
+
+        Republishing an identical object would move the mtime, wake the
+        FileView and cost a QML re-parse -- on every settings reload, none of
+        which touch [hud]. `publish()` returning False here is what keeps the
+        daemon's own config watcher from poking the desktop thirty times an
+        hour for nothing.
+        """
+        pub = self.publisher()
+        self.assertTrue(pub.publish())
+        self.assertFalse(pub.publish())
+        before = (self.root / "hud.json").stat().st_mtime_ns
+        self.assertFalse(pub.publish())
+        self.assertEqual((self.root / "hud.json").stat().st_mtime_ns, before)
+        # ... but a real change still gets through.
+        self.settings.set("hud.corner", "top-right")
+        self.assertTrue(pub.publish())
+
+    def test_the_write_is_atomic_and_leaves_no_temp_file(self) -> None:
+        pub = self.publisher()
+        pub.publish()
+        self.assertFalse((self.root / "hud.json.tmp").exists())
+
+    def test_clearing_removes_the_file_and_is_final(self) -> None:
+        """Shutdown must not be able to un-clear itself.
+
+        Same shape as `Presence.clear`, and for the same measured reason: the
+        settings listener chain runs on the way out, so a clear that could be
+        undone leaves the file behind on every clean stop.
+        """
+        pub = self.publisher()
+        pub.publish()
+        self.assertTrue(pub.clear())
+        self.assertFalse((self.root / "hud.json").exists())
+        self.assertFalse(pub.publish())
+        self.assertFalse((self.root / "hud.json").exists())
+
+    def test_a_garbage_value_becomes_the_default_rather_than_an_error_state(self) -> None:
+        """The overlay has no error state to show, so there is nothing to show.
+
+        The schema already refuses these, so this is the second line: a hand
+        edited file, a newer build's value, or any future caller handing the
+        publisher a raw dict.
+        """
+        self.assertEqual(
+            hud.payload({"corner": "middle", "sprite": "cube",
+                         "scale": "large", "enabled": "yes"}),
+            {"enabled": True, "corner": "bottom-right", "scale": 1.0,
+             "idle_visible": False, "caption": True, "sprite": "orb"})
+
+    def test_scale_is_clamped_rather_than_refused(self) -> None:
+        self.assertEqual(hud.payload({"scale": 99.0})["scale"],
+                         config.HUD_SCALE_MAX)
+        self.assertEqual(hud.payload({"scale": 0.01})["scale"],
+                         config.HUD_SCALE_MIN)
+        # `true` is an int in Python and would otherwise read as 1.0, which
+        # looks like a number somebody meant.
+        self.assertEqual(hud.payload({"scale": True})["scale"],
+                         config.HUD_SCALE)
+
+    def test_one_bad_field_does_not_cost_the_others(self) -> None:
+        got = hud.payload({"corner": "nowhere", "idle_visible": True,
+                           "scale": 1.5})
+        self.assertEqual(got["corner"], "bottom-right")
+        self.assertTrue(got["idle_visible"])
+        self.assertEqual(got["scale"], 1.5)
+
+    def test_an_unwritable_path_costs_the_file_and_not_the_daemon(self) -> None:
+        (self.root / "no").write_text("a file, not a directory")
+        pub = hud.HudSettings(self.root / "no" / "such" / "hud.json",
+                              settings=self.settings)
+        self.assertFalse(pub.publish())
+        # And it does not deduplicate itself into never trying again.
+        self.assertFalse(pub.publish())
+
+
+class HudCaptionCase(TempMemoryCase):
+    """`[hud] caption` decides whether her words reach the HUD.
+
+    Before this, `ambient.HudWriter` was only ever called by the crash,
+    battery and update hooks -- so the one surface built to carry Luna's words
+    carried everything except them. These cases are the proof that an ordinary
+    spoken reply now writes one, that the switch turns it off, and that
+    nothing here can cost a reply.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.writer = None
+
+    def parts(self):
+        from lunad import ambient
+        writer = ambient.HudWriter(self.root / "message")
+        return writer, hud.Caption(writer=writer, settings=self.settings)
+
+    def message(self) -> dict:
+        return json.loads((self.root / "message").read_text(encoding="utf-8"))
+
+    def test_an_ordinary_spoken_reply_reaches_the_pane(self) -> None:
+        _writer, cap = self.parts()
+        self.assertTrue(cap.said("The build finished."))
+        payload = self.message()
+        self.assertEqual(payload["text"], "The build finished.")
+        self.assertEqual(payload["kind"], "say")
+        self.assertEqual(payload["ttl"], config.SPEECH_HUD_TTL_S)
+
+    def test_the_caption_switch_actually_stops_it(self) -> None:
+        _writer, cap = self.parts()
+        self.settings.set("hud.caption", False)
+        self.assertFalse(cap.said("not on screen"))
+        self.assertFalse((self.root / "message").exists())
+
+    def test_the_overlay_being_off_stops_it_too(self) -> None:
+        # Writing for a surface that draws nothing would leave a sentence on
+        # disk to pop up whenever the overlay was switched back on.
+        _writer, cap = self.parts()
+        self.settings.set("hud.enabled", False)
+        self.assertFalse(cap.said("not on screen"))
+        self.assertFalse((self.root / "message").exists())
+
+    def test_a_hush_clears_the_caption_but_not_an_ambient_notice(self) -> None:
+        writer, cap = self.parts()
+        cap.said("something she said")
+        self.assertTrue(cap.clear())
+        self.assertFalse((self.root / "message").exists())
+
+        writer.write("a process crashed", kind="alert",
+                     owner=config.HUD_OWNER_AMBIENT)
+        self.assertFalse(cap.clear())
+        self.assertTrue((self.root / "message").exists())
+
+    def test_a_clear_ignores_the_switch(self) -> None:
+        # Turning captions off mid-sentence must take the one on screen with
+        # it; a clear that consulted `wanted()` first would strand it forever.
+        _writer, cap = self.parts()
+        cap.said("on screen")
+        self.settings.set("hud.caption", False)
+        self.assertTrue(cap.clear())
+        self.assertFalse((self.root / "message").exists())
+
+    def test_a_broken_hud_costs_the_caption_and_never_the_reply(self) -> None:
+        """The rule from HANDOFF-hud.md: do not depend on it being read.
+
+        A writer that raises -- not merely one that returns False -- has to be
+        swallowed, because this is called from the middle of answering a
+        question.
+        """
+        class Exploding:
+            def write(self, *a, **k):
+                raise RuntimeError("the runtime directory went away")
+
+            def clear(self, *a, **k):
+                raise RuntimeError("and it is still gone")
+
+        cap = hud.Caption(writer=Exploding(), settings=self.settings)
+        self.assertFalse(cap.said("this must not raise"))
+        self.assertFalse(cap.clear())
+
+    def test_speech_captions_what_it_actually_says(self) -> None:
+        """The wiring, not the helper: `Speech.say` has to call it.
+
+        Driven through the real `say()` with the piper worker unreachable --
+        `tests/_support.py` sees to that -- because what is being asserted is
+        that the caption is written on the way in, not that speech succeeded.
+        """
+        writer, cap = self.parts()
+        s = speech.Speech(settings=self.settings, caption=cap)
+        self.addCleanup(s.close)
+        # Deliberately carrying markdown. What lands on the pane is the
+        # *spoken* form -- `strip_for_speech`'s output, already capped by
+        # `[voice] max_spoken_chars` -- and not the reply text, because a
+        # caption of a sentence she did not say is a caption that disagrees
+        # with the voice the user is listening to.
+        s.say("The build **finished**.")
+        self.assertEqual(self.message()["text"], "The build finished.")
+
+        # And `luna hush` -- which is `speak.cancel`, which is this -- takes it
+        # back off the screen.
+        s.cancel()
+        self.assertFalse((self.root / "message").exists())
+
+    def test_a_barge_in_replaces_the_caption_without_blanking_it(self) -> None:
+        """One `os.replace`, not an unlink and a write.
+
+        Every `say()` opens with a cancel, and a cancel that retracted would
+        delete the file microseconds before rewriting it -- which the pane
+        reads as "dismiss" and then "show", i.e. a flicker on every reply.
+        """
+        writer, cap = self.parts()
+        s = speech.Speech(settings=self.settings, caption=cap)
+        self.addCleanup(s.close)
+        s.say("The first thing.")
+        first = self.message()
+        s.say("The second thing.")
+        second = self.message()
+        self.assertEqual(second["text"], "The second thing.")
+        # The id is what makes a message new to the pane, so it has to move.
+        self.assertGreater(second["id"], first["id"])
+
+    def test_nothing_speakable_captions_nothing(self) -> None:
+        _writer, cap = self.parts()
+        s = speech.Speech(settings=self.settings, caption=cap)
+        self.addCleanup(s.close)
+        s.say("   ")
+        self.assertFalse((self.root / "message").exists())
+
+    def test_speech_switched_off_captions_nothing_either(self) -> None:
+        # `[voice] enabled = false` returns before anything is spoken, and a
+        # caption of something she did not say would be a lie on screen.
+        _writer, cap = self.parts()
+        self.settings.set("voice.enabled", False)
+        s = speech.Speech(settings=self.settings, caption=cap)
+        self.addCleanup(s.close)
+        s.say("she is muted")
+        self.assertFalse((self.root / "message").exists())
+
+
 class DriftCase(unittest.TestCase):
     """A schema default and its fallback constant must agree.
 
@@ -601,12 +863,36 @@ class DriftCase(unittest.TestCase):
         ("dispatch.app_id", "LUNA_APP_ID"),
         ("dispatch.max_parallel", "DISPATCH_MAX_PARALLEL"),
         ("dispatch.job_retention_days", "JOB_RETENTION_DAYS"),
+        ("dispatch.requeue_on_start", "DISPATCH_REQUEUE_ON_START"),
         ("audit.max_mb", "AUDIT_MAX_MB"),
         ("audit.keep", "AUDIT_KEEP"),
         ("ambient.poll_seconds", "AMBIENT_POLL_S"),
         ("ambient.battery_low_pct", "AMBIENT_BATTERY_LOW_PCT"),
         ("ambient.battery_critical_pct", "AMBIENT_BATTERY_CRITICAL_PCT"),
+        ("hud.enabled", "HUD_ENABLED"),
+        ("hud.corner", "HUD_CORNER"),
+        ("hud.scale", "HUD_SCALE"),
+        ("hud.idle_visible", "HUD_IDLE_VISIBLE"),
+        ("hud.caption", "HUD_CAPTION"),
+        ("hud.sprite", "HUD_SPRITE"),
+        ("vcs.branch_prefix", "VCS_BRANCH_PREFIX"),
+        ("vcs.auto_merge", "VCS_AUTO_MERGE"),
+        ("vcs.merge_method", "VCS_MERGE_METHOD"),
+        ("vcs.delete_branch", "VCS_DELETE_BRANCH"),
+        ("vcs.notify_on_refusal", "VCS_NOTIFY_ON_REFUSAL"),
+        ("vcs.check_wait_seconds", "VCS_CHECK_WAIT_S"),
     )
+
+    #: Sections where *every* key must appear in PAIRS above. A section can
+    #: only be listed here if all of its keys genuinely have a fallback
+    #: constant -- most do not, and inventing one to satisfy a test would be
+    #: worse than the drift it was guarding against.
+    #:
+    #: `[hud]` qualifies because the daemon has to answer for all six with no
+    #: config file at all: it publishes them into `hud.json` at start-up, and
+    #: the constants are what it publishes if the file is missing. Listing it
+    #: is what stops a seventh key being added that escapes the check.
+    FULLY_PAIRED = ("hud",)
 
     def test_every_default_matches_its_fallback_constant(self) -> None:
         for dotted, constant in self.PAIRS:
@@ -620,6 +906,19 @@ class DriftCase(unittest.TestCase):
                     else getattr(config, constant),
                     f"[{dotted}] defaults to {key.default!r} but "
                     f"config.{constant} is {getattr(config, constant)!r}")
+
+    def test_a_fully_paired_section_has_no_key_that_escapes_the_check(self) -> None:
+        paired = {dotted for dotted, _c in self.PAIRS}
+        for name in self.FULLY_PAIRED:
+            section = settings_mod._SECTIONS[name]
+            for key in section.keys:
+                dotted = f"{name}.{key.name}"
+                with self.subTest(key=dotted):
+                    self.assertIn(
+                        dotted, paired,
+                        f"[{dotted}] has no fallback constant in PAIRS, so "
+                        f"its default is unguarded -- add the pair, or take "
+                        f"[{name}] out of FULLY_PAIRED and say why")
 
     def test_the_two_resolved_mismatches_stay_resolved(self) -> None:
         # Named explicitly so a future edit to either number has to come here

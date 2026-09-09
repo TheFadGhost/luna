@@ -1,6 +1,6 @@
 """Jarvis — the settings app for the Luna assistant daemon.
 
-A sidebar and eight panes, drawn from the live Omarchy palette so it sits
+A sidebar and ten panes, drawn from the live Omarchy palette so it sits
 next to Sill rather than next to a stock GTK dialog. The window has no
 GtkHeaderBar: it draws its own title row, the same way every other surface on
 this desktop does.
@@ -31,8 +31,10 @@ PANES = (
     ("listen", "Listening"),
     ("confirm", "Confirmations"),
     ("ambient", "Ambient"),
+    ("hud", "Overlay"),
     ("memory", "Memory"),
     ("jobs", "Jobs"),
+    ("vcs", "GitHub"),
     ("about", "About"),
 )
 
@@ -237,12 +239,13 @@ class JarvisApp(Gtk.Application):
         return bar
 
     def _sidebar(self):
-        """Eight names, and nothing else.
+        """Ten names, and nothing else.
 
         The order is a sentence: who she is, how she hears and speaks, what
         she may do when you ask, what she notices when you do not, what she
-        remembers, what she ran, and where it all lives. Ambient sits next to
-        Confirmations because they are the two halves of one question —
+        remembers, what she ran, how her work reaches GitHub, and where it
+        all lives. Ambient sits next to Confirmations because they are the
+        two halves of one question —
         Confirmations governs what she may do unattended once you have asked
         her for something, Ambient governs the only things she does when
         nobody has asked her for anything at all.
@@ -289,10 +292,14 @@ class JarvisApp(Gtk.Application):
             return panes.confirm_pane(b)
         if key == "ambient":
             return panes.ambient_pane(b)
+        if key == "hud":
+            return panes.hud_pane(b)
         if key == "memory":
             return panes.memory_pane(b, self.win)
         if key == "jobs":
             return panes.jobs_pane(b)
+        if key == "vcs":
+            return panes.vcs_pane(b)
         return panes.about_pane(b, self.start_daemon)
 
     # ------------------------------------------------------------ behaviour

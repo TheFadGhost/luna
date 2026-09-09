@@ -127,6 +127,51 @@ class SpecReportingCase(unittest.TestCase):
         self.assertIn("No job id means no job.", self.spec)
 
 
+class SpecFanOutCase(unittest.TestCase):
+    """The fan-out criterion, which is a persona change and not plumbing.
+
+    The gate and the queue were built long before this; what was missing was
+    Luna ever *deciding* to split a task. A criterion that only lives in a
+    commit message is not a criterion, so these assert the spec still says the
+    load-bearing half of it — that the default answer is no, and why.
+    """
+
+    def setUp(self) -> None:
+        self.spec = persona.load_spec()
+
+    def test_the_default_answer_is_no(self) -> None:
+        self.assertIn("Usually it is not worth it, and she says so", self.spec)
+
+    def test_the_test_is_independence_and_substance(self) -> None:
+        self.assertIn("genuinely independent", self.spec)
+        self.assertIn("substantial enough to earn its own", self.spec)
+
+    def test_the_two_failure_modes_are_named(self) -> None:
+        """The merge conflict and the queue with extra steps."""
+        self.assertIn("conflict she asked for", self.spec)
+        self.assertIn("queue with extra steps", self.spec)
+
+    def test_the_split_is_priced_against_the_serial_version(self) -> None:
+        self.assertIn("what the serial version costs", self.spec)
+
+    def test_she_pushes_back_on_a_fan_out_the_user_asks_for(self) -> None:
+        """Anti-sycophancy applies here exactly as it applies anywhere."""
+        self.assertIn("same test to a fan-out the *user*", self.spec)
+        self.assertIn("then their call", self.spec)
+
+    def test_the_group_is_reported_once_not_job_by_job(self) -> None:
+        self.assertIn("under one plan id", self.spec)
+        self.assertIn("reports the group's outcome once", self.spec)
+
+    def test_the_notes_name_the_flag_that_makes_it_real(self) -> None:
+        """A command she is never told about may as well not be built."""
+        notes = persona.operating_notes(cli="/bin/luna", specialist="Sol")
+        self.assertIn('--and "<task>"', notes)
+        self.assertIn("one plan id", notes)
+        self.assertIn("--cancel <plan>", notes)
+        self.assertIn("this is not worth it", notes)
+
+
 class OperatingNotesGateCase(unittest.TestCase):
     """The same two rules where the capability is granted.
 

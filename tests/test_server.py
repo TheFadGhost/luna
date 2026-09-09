@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 import uuid
+from pathlib import Path
 from typing import Any
 
 from lunad import agent, config, dispatch, protocol
@@ -484,6 +485,58 @@ class DispatchTests(DaemonCase):
         self.assertEqual(resp["cancelled"], 0)
 
 
+class StartupRehydrationTests(DaemonCase):
+    """The daemon resolves what the last one left behind, before it serves.
+
+    Nothing here opens a terminal: ``build_daemon`` pins the dispatcher's
+    terminal to ``/bin/bash`` and its agent to ``/bin/true``, so the resumed
+    job runs headlessly in the temporary tree.
+    """
+
+    def stale_job(self, job_id: str, **fields) -> Path:
+        job_dir = self.root / "jobs" / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        data = {"id": job_id, "task": f"the {job_id} task", "to": "worker",
+                "state": "queued", "pid": None, "started": time.time(),
+                "iso": "x", "elapsed_s": 0.0, "exit_code": None,
+                "dir": str(job_dir)}
+        data.update(fields)
+        (job_dir / "job.json").write_text(json.dumps(data), encoding="utf-8")
+        return job_dir
+
+    def test_the_daemon_resumes_queued_work_it_did_not_accept(self):
+        job_dir = self.stale_job("a1b2")
+        (job_dir / "run.sh").write_text("#!/bin/bash\nexit 0\n",
+                                        encoding="utf-8")
+        (job_dir / "queued.json").write_text(
+            json.dumps({"id": "a1b2", "timeout": 30.0, "confirmed": None}),
+            encoding="utf-8")
+        d = self.build_daemon()
+        d.speech.close()
+        d.speech = MuteSpeech()
+        listed = {j["id"]: j for j in d.dispatch({"op": "jobs"})["jobs"]}
+        self.assertIn("a1b2", listed)
+        self.assertTrue(listed["a1b2"]["rehydrated"])
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            state = d.dispatcher._jobs["a1b2"].state
+            if state != "running":
+                break
+            time.sleep(0.05)
+        self.assertIn(d.dispatcher._jobs["a1b2"].state,
+                      ("finished", "failed"), "the resumed job must have run")
+
+    def test_a_job_that_was_running_is_reported_interrupted_not_restarted(self):
+        self.stale_job("c3d4", state="running", pid=1)
+        d = self.build_daemon()
+        d.speech.close()
+        d.speech = MuteSpeech()
+        listed = {j["id"]: j for j in d.dispatch({"op": "jobs"})["jobs"]}
+        self.assertEqual(listed["c3d4"]["state"], "interrupted")
+        self.assertEqual(len(self.ledger), 0,
+                         "an interrupted job must not be re-run at boot")
+
+
 class SocketTests(DaemonCase):
     """End-to-end over a real Unix socket, including concurrency."""
 
@@ -598,6 +651,58 @@ class Phase2OpTests(DaemonCase):
 
     def test_dispatch_requires_a_task(self):
         resp = self.daemon().dispatch({"op": "dispatch", "task": "  "})
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"], "ProtocolError")
+
+    def test_a_tasks_list_is_a_fan_out_under_one_plan_id(self):
+        """The wire shape. How many of them *run* is the gate's business and
+        is asserted in tests/test_dispatch.py, where a job can be held open;
+        here the stub terminal exits at once, so counting runners would be
+        counting the scheduler's timing."""
+        d = self.daemon()
+        resp = d.dispatch({"op": "dispatch",
+                           "tasks": ["survey the css", "survey the js"]})
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["count"], 2)
+        self.assertEqual({j["plan"] for j in resp["jobs"]}, {resp["plan"]})
+        self.assertEqual([j["plan_index"] for j in resp["jobs"]], [1, 2])
+        self.assertIn(resp["plan"], resp["announce"])
+        self.assertEqual(resp["errors"], [])
+        d.dispatcher.cancel_plan(resp["plan"])
+
+    def test_the_plan_id_cancels_the_whole_group_through_jobs(self):
+        d = self.daemon()
+        plan = d.dispatch({"op": "dispatch",
+                           "tasks": ["one", "two", "three"]})["plan"]
+        resp = d.dispatch({"op": "jobs", "cancel": plan})
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["found"], 3, "one id has to reach all three")
+        # Deliberately not "all three were cancelled", and deliberately not
+        # asserted the instant the call returns. Members leave the group by
+        # three different routes: cancelled outright; stopped at the admission
+        # gate by the thread that a cancel freed a slot on, a beat later; or
+        # refused by the spawn firewall because the job finished and was
+        # reaped first, which is the firewall working. What the group cancel
+        # promises is the state the group settles in.
+        members = [j for j in d.dispatcher._jobs.values() if j.plan == plan]
+        self.assertEqual(len(members), 3)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if not any(j.state in ("queued", "running") for j in members):
+                break
+            time.sleep(0.05)
+        self.assertEqual([j.state in ("queued", "running") for j in members],
+                         [False] * 3,
+                         "a cancelled plan must leave nothing waiting or running")
+
+    def test_a_plan_of_one_is_refused_rather_than_quietly_dispatched(self):
+        resp = self.daemon().dispatch({"op": "dispatch", "tasks": ["just this"]})
+        self.assertFalse(resp["ok"])
+        self.assertIn("at least two", resp["message"])
+
+    def test_a_blank_entry_in_a_plan_is_a_protocol_error(self):
+        resp = self.daemon().dispatch({"op": "dispatch",
+                                       "tasks": ["real", "   "]})
         self.assertFalse(resp["ok"])
         self.assertEqual(resp["error"], "ProtocolError")
 

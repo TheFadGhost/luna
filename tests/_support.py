@@ -80,25 +80,53 @@ config.TERMINAL_BIN = FORBIDDEN_TERMINAL
 #:   VENV_PYTHON  - forks a real 331 MB piper worker
 #:   JOBS_DIR     - lets the job collector delete the user's own job records
 #:                  (see FORBIDDEN_JOBS_DIR below; that one has to resolve)
-#: ``GRIM_BIN`` is the sharpest of these and the newest. It is the one name in
-#: this list that, left alone, does not merely open a window or make a noise:
-#: it photographs whatever the person running the suite has on screen. grim is
+#:   GIT_BIN      - pushes to a real remote
+#:   GH_BIN       - opens pull requests, merges them and files issues on the
+#:                  user's own GitHub account
+#:   CODEX_BIN_*  - spawns a real codex CLI turn, burning the user's own
+#:                  ChatGPT session, and only on machines that happen to have
+#:                  codex installed — which is exactly how this one broke: a
+#:                  test that forgot to stub `CodexAdapter.binary()` passed
+#:                  here (codex is on this laptop via mise) and errored on
+#:                  every CI runner (it is not), instead of failing the same
+#:                  way everywhere.
+#:
+#: ``GRIM_BIN`` and ``GH_BIN`` are the sharpest of these and the newest.
+#: ``GRIM_BIN``, left alone, does not merely open a window or make a noise: it
+#: photographs whatever the person running the suite has on screen. grim is
 #: genuinely installed here, so an unstubbed default would *work* — a test
 #: asserting that a look produces a PNG would produce a real picture of the
 #: user's desktop, and then hand the path to whatever the test did next.
 #: Replaced process-wide with a name `shutil.which` cannot resolve, which is
 #: what `context.capture` turns into a `LookUnavailable` naming the fix.
+#:
+#: ``GH_BIN`` is worse still, and it is the only one whose damage cannot be
+#: undone by closing something. Every other name here reaches this desktop; a
+#: pull request opened by a test run is visible to everyone with access to the
+#: repository, and a merge cannot be taken back at all. `gh` is authenticated
+#: on this machine, so nothing but this sentinel stands between a case that
+#: forgot to inject a runner and a real merge.
 FORBIDDEN_GRIM = "luna-tests-must-pass-grim=/bin/true"
 FORBIDDEN_NOTIFIER = "luna-tests-must-pass-notify_bin=/bin/true"
 FORBIDDEN_APLAY = "luna-tests-must-pass-aplay=/bin/true"
 FORBIDDEN_HYPRCTL = "luna-tests-must-pass-hypr=FakeHyprland"
 FORBIDDEN_PYTHON = Path("/nonexistent/luna-tests-must-pass-python")
+FORBIDDEN_GIT = "luna-tests-must-pass-git_bin=fake-runner"
+FORBIDDEN_GH = "luna-tests-must-pass-gh_bin=fake-runner"
+FORBIDDEN_CODEX_BIN = "luna-tests-must-pass-codex_bin=fake-runner"
 
 config.GRIM_BIN = FORBIDDEN_GRIM
 config.NOTIFY_BIN = FORBIDDEN_NOTIFIER
 config.APLAY_BIN = FORBIDDEN_APLAY
 config.HYPRCTL_BIN = FORBIDDEN_HYPRCTL
 config.VENV_PYTHON = FORBIDDEN_PYTHON
+config.GIT_BIN = FORBIDDEN_GIT
+config.GH_BIN = FORBIDDEN_GH
+#: `CODEX_BIN_CANDIDATES` has to be emptied rather than pointed at a sentinel
+#: name: it is a tuple of *paths* `CodexAdapter.binary()` stats directly, not
+#: a name handed to `shutil.which`. `CODEX_BIN_NAME` is that name.
+config.CODEX_BIN_CANDIDATES = ()
+config.CODEX_BIN_NAME = FORBIDDEN_CODEX_BIN
 
 #: The same class of bug, one step further out: not a binary but a *file the
 #: desktop is reading*. ``config.STATE_FILE`` is what the Luna bar widget
@@ -168,6 +196,14 @@ FORBIDDEN_OMARCHY_UPDATE_LOG = _AMBIENT_DIR / "omarchy-update.log"
 FORBIDDEN_AMBIENT_STATE = _AMBIENT_DIR / "ambient.json"
 FORBIDDEN_HUD_MESSAGE = _STATE_DIR / "message"
 
+#: The third file in that runtime directory, and the third thing the desktop
+#: reads. `lunad/hud.py` publishes the six `[hud]` keys here for the orb
+#: overlay; against the real path a test would rewrite the running desktop's
+#: overlay settings -- moving the orb into another corner, resizing it, or
+#: switching it off entirely -- with nothing on screen to say a suite did it,
+#: and it would stay that way until the next real settings change.
+FORBIDDEN_HUD_SETTINGS = _STATE_DIR / "hud.json"
+
 FORBIDDEN_COREDUMP_DIR.mkdir(parents=True, exist_ok=True)
 FORBIDDEN_POWER_SUPPLY_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -188,6 +224,7 @@ config.OMARCHY_VERSION_FILE = FORBIDDEN_OMARCHY_VERSION
 config.OMARCHY_UPDATE_LOG = FORBIDDEN_OMARCHY_UPDATE_LOG
 config.AMBIENT_STATE_PATH = FORBIDDEN_AMBIENT_STATE
 config.HUD_MESSAGE_FILE = FORBIDDEN_HUD_MESSAGE
+config.HUD_SETTINGS_FILE = FORBIDDEN_HUD_SETTINGS
 
 
 class FakeHyprland:

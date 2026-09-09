@@ -60,6 +60,7 @@ write_outside_home = "ask"
 system_config      = "ask"   # /etc, systemd units, hyprland config
 network_send       = "ask"   # posting data off the machine
 git_push           = "ask"
+git_merge          = "never" # merging her own PR; the green-checks gate is in code, not here
 long_job           = "ask"   # anything estimated over `long_job_seconds`
 long_job_seconds   = 300
 spend              = "ask"   # anything with a metered cost over `spend_threshold`
@@ -88,6 +89,21 @@ workspace          = "luna"  # hyprland special workspace name
 app_id             = "org.omarchy.luna"
 max_parallel       = 1       # jobs running at once; the rest queue
 job_retention_days = 14      # finished job directories older than this are collected; 0 = never
+requeue_on_start   = true    # queued jobs are picked back up after a restart; running ones are never re-run
+
+# How her work reaches GitHub. Every piece of it goes branch -> commit -> push
+# -> pull request; she never pushes to the default branch, and she merges her
+# own pull request only when CI is green. What "green" means is in
+# `lunad/vcs.py` and is not a setting: all checks concluded successfully, none
+# pending, none missing, not a draft, mergeable. A repository with no CI
+# configured therefore never auto-merges.
+[vcs]
+branch_prefix        = "luna"     # branches are `<prefix>/<topic>-<yymmdd>`
+auto_merge           = true       # attempt the merge once the checks are green
+merge_method         = "squash"   # squash | merge | rebase
+delete_branch        = true       # delete the head branch when the merge lands
+notify_on_refusal    = true       # toast when an auto-merge was refused
+check_wait_seconds   = 900        # how long `luna vcs ship` waits for CI; 0 = do not wait
 
 # The append-only record. Rotation moves bytes, it never drops them:
 # audit.jsonl -> audit.jsonl.1 -> ... -> audit.jsonl.N, oldest deleted last.
@@ -109,6 +125,21 @@ update                 = true   # an omarchy update landed and rewrote /usr/shar
 # 'An update is available' is deliberately NOT checked here: that costs a
 # network sync (checkupdates), and Omarchy's own bar widget already polls it
 # every six hours and shows the answer.
+
+# The orb overlay -- the sprite the desktop draws for her, and the caption
+# beside it. Read by the Quickshell plugin, NOT by lunad: the daemon's only
+# job here is to project these six keys into $XDG_RUNTIME_DIR/luna/hud.json,
+# which is a file QML can actually read. See docs/CONFIG-SCHEMA.md [hud].
+[hud]
+enabled        = true            # false draws nothing and unmasks nothing
+corner         = "bottom-right"  # top-left | top-right | bottom-left | bottom-right
+scale          = 1.0             # multiplier on the sprite's base size
+idle_visible   = false           # true keeps the sprite on screen while she is idle
+caption        = true            # draw what she says beside the sprite
+sprite         = "orb"           # only "orb" exists; anything else falls back to it
+# There is no ttl key. How long a caption stays up is the pane's own contract
+# (HANDOFF-hud.md): the countdown does not even start while she is still
+# speaking, so a number here would not mean what it looked like it meant.
 
 [ui]
 theme_follows_omarchy = true
@@ -192,9 +223,33 @@ restarting voxtype — so that route creates drift the pane will then show.
 
 ### `[confirm]`, `[confirm.prompt]`
 
-Read by `confirm.ConfirmBroker` on every gate, live. Eight policy classes plus
+Read by `confirm.ConfirmBroker` on every gate, live. Nine policy classes plus
 the prompt's timeout, default and channel. The four hard denies are not in the
 file and the file cannot re-enable them.
+
+`git_merge` is the newest and the only one that defaults to `never`. It is
+separate from `git_push` because the two actions are not comparable: pushing a
+branch is reversible with one command and nobody else sees it, while merging
+writes to the default branch, closes the review and — by default — deletes the
+branch that held the evidence. `never` is what the user chose (auto-merge on
+green); `ask` puts a toast up before each merge; `deny` makes her open the pull
+request and stop. **None of the three can make her merge a pull request that is
+not green** — that gate is in `lunad/vcs.py`, in code, and this file cannot
+reach it.
+
+### `[vcs]`
+
+Read by `vcs.Repo`, live, per operation — a `Repo` is built for each request
+rather than held, so nothing here is ever captured.
+
+| key | read by | effect |
+|---|---|---|
+| `branch_prefix` | `vcs.branch_name`, `vcs.Repo.branch` | Live. Branches are `<prefix>/<topic>-<yymmdd>`. The date is not a random suffix on purpose: a job re-run on the same day lands on the branch it was already using, which is the resume case, instead of leaving a repository full of near-identical abandoned branches. |
+| `auto_merge` | `vcs.Repo.ship` | Live. Off, she branches, commits, pushes and opens the pull request and then stops, and the report says she stopped on purpose. On, she reads the checks and merges **only** if they are green. It is not a way to merge without checks; there is no such way. |
+| `merge_method` | `vcs.Repo.merge` | Live, per merge. Passed to `gh pr merge` as `--squash`, `--merge` or `--rebase`. Anything else is refused before `gh` is reached. |
+| `delete_branch` | `vcs.Repo.merge` | Live. `--delete-branch` on a successful merge. Never on a refused one — a refused merge changes nothing at all. |
+| `notify_on_refusal` | `vcs.Repo.notify_refusal` | Live. A refused auto-merge is the one outcome here that needs a person: a green merge needs nobody, and a pull request that quietly stayed open is one the user finds out about days later. `critical` urgency, carrying the refusal reasons. A missing `omarchy-notification-send` is logged and swallowed — a desktop that cannot toast is not a merge that should have happened. |
+| `check_wait_seconds` | `vcs.Repo.ship` | Live. How long `ship` waits for CI to finish before deciding. Waiting stops early as soon as the verdict can no longer change. **`0` means do not wait, not wait forever**, and it is not an off switch for the gate: a `ship` with `0` refuses anything CI has not finished reporting, which is the safe direction. A pull request whose checks never start costs the full wait and is then refused, deliberately — an unattended merge that gave up waiting and merged anyway is the failure the whole module exists to prevent. |
 
 ### `[memory]`
 
@@ -217,6 +272,7 @@ namespace is deliberately outside the user-facing contract.
 | `app_id` | `dispatch.Hyprland`, `dispatch.Dispatcher` | Live, for the **next** job. Windows already open keep the app-id they were born with: an app-id is set at map time and cannot be changed afterwards, so a running job stays where it is. |
 | `max_parallel` | `dispatch.Dispatcher.max_parallel` | Live, at every admission decision — never captured. A dispatch over the limit is **queued**, not refused: it gets its id, its directory and its prompt straight away, shows in `luna jobs` as `queued`, and can be cancelled there, it just has no pid until a slot frees. Lowering it below the number of running jobs kills nothing; it stops admitting and the count drains. Raising it releases waiting work at once, because the daemon's settings listener calls `admit_ready()` on the change rather than waiting for the next job to end. The queue is FIFO even when a slot is free — admitting a newcomer past jobs already waiting would make it a lottery. |
 | `job_retention_days` | `dispatch.Dispatcher.collect` | Live, at the next pass. A job directory is aged from when the job **stopped**: `finished` out of its `job.json`, falling back to `started`, and to the file's mtime if the JSON is unreadable. Retention is how long the *record* is kept, and a six-hour job's record begins when it ends. Nothing `running` or `queued` is collected at any age; an `orphaned` job — one whose daemon died — is, once past the window, because it will never finish and one crash should not pin a directory forever. **`0` means never collect**, and that is deliberate: read as a duration, zero days would mean "delete everything", which is the one thing a user typing the smallest allowed number cannot want. Every deletion is an audit entry (`job.collected`) with no `undo`, because there is not one. The pass runs on a six-hour timer in its own thread, plus once at start-up, and never on the request path. |
+| `requeue_on_start` | `dispatch.Dispatcher.rehydrate`, `dispatch.Dispatcher.close` | Live, and read at both ends of a restart. On (the default), a job still **queued** when `lunad` stops is left on disk exactly as it is — `job.json` plus the `queued.json` beside it — and the next daemon puts it back in the queue in its original order, keeping the confirmations the user gave when they asked rather than re-asking against a policy that may have changed since. It shows in `luna jobs` as `queued` with `rehydrated` set, so a resurrected job never looks like a fresh one, and there is a `dispatch.rehydrated` entry in the audit log for each. Off, the old behaviour is exactly what happens: the queue is cancelled on shutdown with the reason, and a restart means a clean slate. **It has no say over a job that was running.** That job's process is gone and its side effects are not — it may have written half a file or pushed a branch, and nothing on disk records how far it got — so it is never re-run; it is recorded as `interrupted` with the outcome stated as unknown, or, if its `exit` file is there, with the exit code it actually returned. Re-dispatching it is a decision for someone who can look at what it left behind. |
 
 ### `[audit]`
 
@@ -257,6 +313,61 @@ runs it on a six-hour timer and shows the result, so a second poller would cost
 the network and the battery to duplicate a light the user is already looking
 at. The half worth having is the half the bar does *not* show: that an update
 already landed and took `/usr/share/omarchy` with it.
+
+### `[hud]`
+
+Read by **the orb overlay**, `~/.config/omarchy/plugins/ghost.lunaorb`, which
+is QML in the Quickshell engine and not part of `lunad` at all. This is the
+first table in this file whose reader is another *process*, in another
+language, and it is wired the way `[listen]` is: not by pretending the daemon
+acts on it, but by writing it through to a file the real reader can read.
+
+**How it gets there.** `lunad/hud.py` projects these six keys — and nothing
+else in this file — into `$XDG_RUNTIME_DIR/luna/hud.json`, one JSON object,
+written atomically (`hud.json.tmp` then `os.replace`, the same idiom
+`presence.py` uses for `state`) on daemon start and on every settings reload,
+and removed on shutdown. The overlay watches it with the same inotify-backed
+`FileView` it already uses for `state` and `message`, so nothing polls, and a
+change made in the GUI reaches the screen on the next reload tick.
+
+**Why a projection and not the config file itself.** Quickshell has no TOML
+parser; `config.toml` is 0600 inside a 0700 directory next to `secrets.env`,
+and widening either for a cosmetic feature is not a trade worth making; and a
+second reader of this schema is a second thing that drifts from it. The
+projection is one-way — nothing reads `hud.json` back — and it is
+deduplicated, because writing an identical object would wake the overlay's
+file watcher and cost a QML re-parse on every one of the reloads that do not
+touch this table.
+
+**An absent file is not an error and never shows as one.** The overlay carries
+its own copy of the same six defaults, so it draws correctly before lunad has
+ever run and after it has stopped. A torn or unparseable file leaves the
+settings it already had; a missing field, or one of the wrong type or out of
+range, falls back to that field's default and the rest of the object still
+applies. There is no error card, no placeholder, and no "waiting for Luna".
+
+| key | read by | effect |
+|---|---|---|
+| `enabled` | the orb overlay, via `hud.json` | Live, next reload. `false` draws nothing at all and unmasks nothing — the overlay is a click-through layer, and off means it is not there rather than there and transparent. It also stops the caption being written on this side: a caption published for a surface that draws nothing is a sentence left on disk to pop up whenever the overlay is next switched on. |
+| `corner` | the orb overlay, via `hud.json` | Live, next reload. One of `top-left`, `top-right`, `bottom-left`, `bottom-right`. Anything else is the default, silently — the overlay has nowhere to report a bad value to. |
+| `scale` | the orb overlay, via `hud.json` | Live, next reload. A multiplier on the sprite's base size, **clamped** to 0.5–3.0 rather than refused. The schema minimum and maximum are the same two numbers, so the GUI reports out of range before it is ever written; the clamp in `hud.payload` is the second line, for a hand-edited file. |
+| `idle_visible` | the orb overlay, via `hud.json` | Live, next reload. `false` — the default — hides the overlay entirely while the composed phase is `idle` or `down`; it appears when she starts listening, thinking or speaking and fades out after. `true` keeps it on screen always. Off by default because the bar icon is already the always-on surface and a second permanent one is clutter until somebody asks for it. |
+| `caption` | the orb overlay, via `hud.json`; **`lunad/hud.py::Caption`** | Live. The one key here with a reader on *both* sides of the boundary: the overlay decides whether to draw the caption, and the daemon decides whether to write one. `true` and an ordinary spoken reply publishes its spoken form to `$XDG_RUNTIME_DIR/luna/message` — the *spoken* form, already capped by `[voice] max_spoken_chars` and cut at a sentence boundary, one message per utterance and never one per sentence. A `luna hush` removes it, which is what dismisses it on screen. Writing it can never fail a reply: every failure is swallowed and logged once per process, not once per sentence. |
+| `sprite` | the orb overlay, via `hud.json` | Live, next reload. Reserved for a second sprite; only `"orb"` exists and anything unrecognised falls back to it. The key is here so a future sprite needs no schema change to be selectable. |
+
+**There is no `ttl` key, on purpose.** How long a caption stays up is the
+pane's own contract (`HANDOFF-hud.md`), and the countdown does not start while
+`state` reads `speaking` — so a long spoken answer is not outlived by its own
+caption. A number in this table would look like "how long the caption shows"
+and would not mean that. The daemon uses `config.SPEECH_HUD_TTL_S` for the
+reading time after she stops talking, and `config.AMBIENT_HUD_TTL_S` for an
+ambient event, and neither is offered as a setting.
+
+**The three files, and who removes them.** `state`, `message` and `hud.json`
+all live in `$XDG_RUNTIME_DIR/luna`. `lunad` removes all three on a clean
+shutdown, and `~/.config/systemd/user/lunad.service.d/20-presence.conf` names
+all three in its `ExecStopPost` so a `SIGKILL`ed daemon does not leave the
+desktop reading settings and a sentence belonging to a process that is gone.
 
 ### `[ui]`
 

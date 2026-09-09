@@ -216,6 +216,16 @@ SCHEMA: tuple[Section, ...] = (
             Key("network_send", "ask", "policy",
                 comment="posting data off the machine"),
             Key("git_push", "ask", "policy"),
+            # "never" — just do it — because the user chose branch, commit,
+            # PR, wait for CI, auto-merge on green. The *green* half of that
+            # is not a policy and cannot be turned off here: `lunad.vcs`
+            # refuses a merge whose checks have not all concluded
+            # successfully whatever this key says. Set it to "ask" to be
+            # consulted before each merge, or "deny" to have her open the
+            # pull request and stop.
+            Key("git_merge", "never", "policy",
+                comment="merging her own PR; the green-checks gate is in "
+                        "code, not here"),
             Key("long_job", "ask", "policy",
                 comment="anything estimated over `long_job_seconds`"),
             Key("long_job_seconds", 300, "int", minimum=1, maximum=86_400),
@@ -271,6 +281,46 @@ SCHEMA: tuple[Section, ...] = (
             Key("job_retention_days", 14, "int", minimum=0, maximum=3650,
                 comment="finished job directories older than this are "
                         "collected; 0 = never"),
+            # Queued only. A job that was *running* when the daemon died is
+            # never re-run whatever this says: its process is gone but its
+            # side effects are not, and nothing on disk records how far it
+            # got. Off restores the old behaviour, where a restart meant a
+            # clean slate and the wait was simply lost.
+            Key("requeue_on_start", True, "bool",
+                comment="queued jobs are picked back up after a restart; "
+                        "running ones are never re-run"),
+        ),
+    ),
+    Section(
+        "vcs",
+        align=20,
+        header=(
+            "How her work reaches GitHub. Every piece of it goes branch ->",
+            "commit -> push -> pull request; she never pushes to the default",
+            "branch, and she merges her own pull request only when CI is",
+            "green. What \"green\" means is in `lunad/vcs.py` and is not a",
+            "setting: all checks concluded successfully, none pending, none",
+            "missing, not a draft, mergeable. A repository with no CI",
+            "configured therefore never auto-merges.",
+        ),
+        keys=(
+            Key("branch_prefix", "luna", "str",
+                comment="branches are `<prefix>/<topic>-<yymmdd>`"),
+            Key("auto_merge", True, "bool",
+                comment="attempt the merge once the checks are green"),
+            Key("merge_method", "squash", "str",
+                choices=("squash", "merge", "rebase")),
+            Key("delete_branch", True, "bool",
+                comment="delete the head branch when the merge lands"),
+            Key("notify_on_refusal", True, "bool",
+                comment="toast when an auto-merge was refused"),
+            # 0 means do not wait: read the checks once and decide. It does
+            # not mean "wait forever", and it is not an off switch for the
+            # gate — a `ship` with 0 simply refuses anything CI has not
+            # finished reporting on yet, which is the safe direction.
+            Key("check_wait_seconds", 900, "int", minimum=0, maximum=21_600,
+                comment="how long `luna vcs ship` waits for CI; 0 = do not "
+                        "wait"),
         ),
     ),
     Section(
@@ -338,6 +388,49 @@ SCHEMA: tuple[Section, ...] = (
             "network sync (checkupdates), and Omarchy's own bar widget "
             "already polls it",
             "every six hours and shows the answer.",
+        ),
+    ),
+    Section(
+        "hud",
+        align=14,
+        header=(
+            "The orb overlay -- the sprite the desktop draws for her, and the "
+            "caption",
+            "beside it. Read by the Quickshell plugin, NOT by lunad: the "
+            "daemon's only",
+            "job here is to project these six keys into "
+            "$XDG_RUNTIME_DIR/luna/hud.json,",
+            "which is a file QML can actually read. See docs/CONFIG-SCHEMA.md "
+            "[hud].",
+        ),
+        keys=(
+            Key("enabled", config.HUD_ENABLED, "bool",
+                comment="false draws nothing and unmasks nothing"),
+            Key("corner", config.HUD_CORNER, "str",
+                choices=config.HUD_CORNERS,
+                comment="top-left | top-right | bottom-left | bottom-right"),
+            Key("scale", config.HUD_SCALE, "float",
+                minimum=config.HUD_SCALE_MIN, maximum=config.HUD_SCALE_MAX,
+                comment="multiplier on the sprite's base size"),
+            # False, so the overlay is a thing that appears when she is doing
+            # something rather than a thing that is always on the screen. The
+            # bar icon is the always-on surface and it already exists; a second
+            # permanent one is clutter until somebody asks for it.
+            Key("idle_visible", config.HUD_IDLE_VISIBLE, "bool",
+                comment="true keeps the sprite on screen while she is idle"),
+            Key("caption", config.HUD_CAPTION, "bool",
+                comment="draw what she says beside the sprite"),
+            Key("sprite", config.HUD_SPRITE, "str",
+                choices=config.HUD_SPRITES,
+                comment="only \"orb\" exists; anything else falls back to it"),
+        ),
+        footer=(
+            "There is no ttl key. How long a caption stays up is the pane's "
+            "own contract",
+            "(HANDOFF-hud.md): the countdown does not even start while she is "
+            "still",
+            "speaking, so a number here would not mean what it looked like it "
+            "meant.",
         ),
     ),
     Section(

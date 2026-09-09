@@ -152,21 +152,45 @@ saves. It is kept for conversational continuity, not for money.
 ## Next
 Everything that was on this list under the "Phase 3" heading is now built:
 the bar widget, all three ambient hooks, semantic recall and the `SUPER+F10`
-hush keybind — see the phase sections below for each. What is genuinely still
-unbuilt:
-
-1. **Worker fan-out as a *plan*.** The admission gate and the queue are built,
-   so several jobs can be in flight and the number is bounded, but Luna still
-   does not decide on her own to split a task across workers. That is a
-   planning change in the persona and the ask path, not plumbing.
+hush keybind — see the phase sections below for each.
 
 **CORRECTED:** the second item that used to sit here — no Jarvis GUI pane for
 the `[ambient]` table, and the `jarvis-settings` suite red because of it — is
 done; see "Persona: the gate is on action, not manner" and "Jarvis — typeset,
 not boxed" below, and "Verify, and what is currently broken" for the counts.
 
+**CORRECTED:** the item that used to be the sole entry here — "Worker fan-out
+as a *plan*" — is done. `Dispatcher.dispatch_plan` and `luna dispatch "a"
+--and "b"` exist, priced and refused by the persona's own criterion for when
+splitting work is worth it at all; see "Phase 4" below.
+
 Tier 3, the consolidation pass, the admission gate and the job GC were all on
 this list. They are done — see Phase 2d and Phase 2e below.
+
+What is genuinely still unbuilt, as of Phase 4:
+
+1. **No retry or backoff on a transient `gh` failure.** A rate limit or a
+   flaky 502 inside `checks()`/`merge()` surfaces as whatever `Ran` it
+   produced; there is no distinction yet between "gh said no" and "the
+   network hiccuped once." `existing_pr()`/`slug()` still assume `gh` is
+   reachable and don't degrade offline the way `default_branch()` now does.
+2. **No merge-queue support**, no required-reviewers beyond the single
+   `reviewDecision` field GitHub returns, and no ruleset-based repositories —
+   `vcs.evaluate()` reads exactly the fields in `PR_FIELDS` and nothing else.
+   `[vcs] check_wait_seconds` is one global default with no per-repo override.
+3. **No adoption of a job that outlived its daemon.** A job whose process is
+   still running when `lunad` restarts is left alone, reported `running` then
+   `orphaned` once it dies — the daemon never owned its pid and does not poll
+   it back into its own bookkeeping.
+4. **No plan-level cost gate.** `estimate_seconds`/`estimate_usd` are priced
+   per task; a plan of six costs six times what one task says, and no caller
+   yet makes a plan-level estimate before dispatching one. Also still
+   missing: dependency ordering between plan members (a plan is a set, not a
+   graph) and cross-daemon queue support (rehydration is start-up only).
+5. **No pane-construction tests in `jarvis-settings`.** Nothing in
+   `jarvis-settings/tests` builds a pane, so the Overlay and GitHub panes'
+   construction and dependent-row handling were verified by hand — true of
+   all ten panes now, not just the two newest.
 
 ### Phase 3 — presence, and the bar widget (2026-08-30)
 
@@ -556,10 +580,27 @@ is not under `$HOME` instead.
   says so in its note.
 - **`dispatch` does not fan out *by itself*.** One call is one job. Several can
   be in flight and `[dispatch] max_parallel` bounds them, but Luna does not
-  plan a fan-out for you.
+  plan a fan-out for you. **CORRECTED:** `Dispatcher.dispatch_plan` and `luna
+  dispatch "a" --and "b"` now exist (Phase 4 below), gated by the same
+  admission bounds and by a persona criterion that refuses to split work that
+  shares state. Left as a limitations entry because the split is still priced
+  per task, not per plan — see "Next."
 - **A queued job does not survive the daemon.** It is cancelled on shutdown
   with the reason recorded, rather than left as a promise a restarted daemon
   has no queue to keep. Nothing was spawned, so nothing is lost but the wait.
+  **CORRECTED:** `[dispatch] requeue_on_start` (default on, Phase 4 below) now
+  rehydrates a job that was only ever queued; a job whose process was actually
+  running when the daemon died is still never re-run — its side effects are
+  unknown, and re-running would repeat them unattended.
+- **A cancelled job can be relabelled `FAIL`.** `Dispatcher._watch` overwrites
+  a job's state with `finished`/`failed` from its exit code whenever the
+  terminal exits, including one the user just cancelled — the watcher wakes
+  after the fact and stamps `FAIL` over `cancelled`. Pre-existing, found
+  while building Phase 4's fan-out plans, not introduced by them; the fix
+  touches a finish path several other tests and the `dispatch.finish` audit
+  entry depend on, so it was left alone. What a plan-cancel actually
+  guarantees (nothing left queued or running) is asserted directly rather
+  than relying on the state label.
 - **Rotation retains a bounded history**, `[audit] keep` files of
   `[audit] max_mb` — 48 MB by default. Past that the oldest file *is* deleted;
   the deletion is recorded but the bytes are gone. Set `max_mb = 0` to keep the
@@ -1211,13 +1252,249 @@ as much as what does:**
    command" pushback the decision rule calls for when the job is genuinely
    trivial.
 
+### Phase 4 — the HUD caption, the GitHub workflow, fan-out plans, and a durable queue (2026-09-09)
+
+Four streams, four branches, each with the same reason for writing its notes
+to a scratch file instead of here: `docs/STATE-OF-PLAY.md` is the one file
+every agent would have collided on. This section folds all four in.
+
+**The stale-worktree incident.** At least one agent's worktree was cut from
+`91d971b`, 55 commits behind `luna-codex-brain` at `35e89cc` — invisible to it
+were the persona gate, the Jarvis typeset pass and everything else above dated
+2026-08-30/31. Two agents had to notice the gap and rebase onto `35e89cc`
+before their branch or their test counts meant anything; one came close to
+finishing a durable-jobs implementation against dispatch and CLI code that had
+already been rewritten twice since. The lesson is procedural, not code: check
+a new worktree against the integration branch's tip before trusting the branch
+it says it forked from.
+
+**HUD: a `[hud]` table, `hud.json`, and the caption that was missing.** The
+orb overlay is QML in the Quickshell engine — another process, another
+language, no TOML parser — so `lunad` does not hand it `config.toml`; it
+projects six keys (`enabled`, `corner`, `scale`, `idle_visible`, `caption`,
+`sprite`) into `$XDG_RUNTIME_DIR/luna/hud.json`, written atomically on start
+and on every reload, removed on shutdown. The publisher (`lunad/hud.py`)
+diffs against what it last wrote so an unrelated reload doesn't move the
+file's mtime and force a QML re-parse for nothing.
+
+- **Spoken replies now reach the HUD.** `ambient.HudWriter` had only ever been
+  called by the crash/battery/update hooks, so the one surface built to show
+  Luna's words showed everything except them. `hud.py::Caption` is the speech
+  path's user of that same writer, hooked into `Speech.say`, carrying the
+  spoken (already-capped) text, one message per utterance. `Speech.cancel`
+  retracts it — `luna hush` now clears the screen as well as the air — except
+  the barge-in cancel that opens every `say()`, which passes `retract=False`:
+  a real retract there would unlink the file microseconds before the rewrite,
+  which the pane reads as dismiss-then-show and flickers on every reply.
+- **`clear(only_mine=True)` was silently broken before this work.** Two paths
+  now write one message file and each may retract only its own, but `_mine`
+  was set true by *any* write to the shared writer — once speech started
+  writing, either path's clear took whatever was on screen, regardless of who
+  put it there. Fixed with an owner tag rather than a boolean. The tag lives
+  in `lunad/config.py`, not next to the writer that reads it, because
+  `tests/test_ambient.py::NeverSpeaksCase` reads the shipped source of
+  `lunad/ambient.py` and fails on the literal word `speech` appearing in it —
+  a `SPEECH_OWNER` constant defined in `ambient.py` tripped that guard on the
+  first run.
+- **A Jarvis pane, "Overlay"**, between Ambient and Memory, all six keys built
+  from the existing `Binder.control_for`; `scale` is a spin button, the same
+  choice already made for `[voice] speed`, rather than inventing a slider
+  widget for one row.
+- **`hud.json` has no staleness rule, on purpose and unlike the other two
+  runtime files** — it is settings, not an event, and the overlay is meant to
+  keep using it while `lunad` isn't running. That makes a `SIGKILL` between a
+  settings change and the next start a real failure mode (the overlay pins to
+  the stale corner/size forever), so it now joins `hud.service.d/
+  20-presence.conf`'s `ExecStopPost`, which removes three files instead of
+  two. Needs `systemctl --user daemon-reload`; recorded in
+  `~/.config/omarchy/CUSTOMISATIONS.md` §8a.14.
+- **`HANDOFF-hud.md` was stale** — it still described itself as an
+  unimplemented spec while `lunad/ambient.py::HudWriter` had, in fact,
+  implemented it. The header is corrected rather than the file retired,
+  because `docs/STATE-OF-PLAY.md`, `docs/ARCHITECTURE.md` and the QML side
+  outside this repository all cite it by name.
+- Left undone: no test in `jarvis-settings/tests` builds a pane at all — true
+  of every pane, not just this one — so Overlay's construction and its
+  dependent-row handling were checked with a throwaway headless script, and
+  there is no screenshot of it. Carried to "Next" below.
+
+**The GitHub workflow: branch → commit → push → PR → CI → merge.**
+`lunad/vcs.py` (new, ~1.3k lines) gives `luna vcs status|branch|commit|push|
+pr|checks|merge|issue|comment|ship` a `Repo` built against the caller's
+working directory, plus the daemon op `vcs` the CLI talks to. `merge()`
+refuses anything not green and checks the green gate *before* the
+confirmation gate — asking permission for an action whose answer cannot
+matter trains the user to click through it. What "green" means lives in code
+(`vcs.evaluate()`), not in settings, and nothing in `settings.py` can turn it
+off: not `OPEN`, not a draft, `mergeable != MERGEABLE`, `mergeStateStatus !=
+CLEAN`, changes requested, any check failing/pending/unrecognised, or **no
+check reported at all** — a repo with no CI never auto-merges. `checks()`'s
+poll loop is bounded by `[vcs] check_wait_seconds` (default 900s, `0` = read
+once and decide) and is the only `while True` in the module; every
+subprocess call under it carries its own timeout.
+
+- **Two real bugs found while finishing this branch, and one test-only one.**
+  `RealGitCase` (real `git`, against a throwaway repo with no remote, `gh`
+  deliberately unreachable) caught a genuine production bug: `default_branch()`
+  called `gh` with `check=False`, which suppresses a bad exit code but not
+  `VcsUnavailable` — the exception `run_process()` raises when the binary
+  itself can't be found. So the documented three-tier fallback
+  (`origin/HEAD` → `gh repo view` → guess `main`/`master`/`trunk`) crashed
+  outright on a repo with no remote and no reachable `gh`, and every caller
+  (`branch()`, `commit()`, `push()`, `status()`) crashed with it. Fixed by
+  catching `VcsUnavailable` around that one call. Separately, and
+  unrelated: `test_ship_that_cannot_merge_still_leaves_the_pull_request`
+  looked like an infinite loop under a 120s test timeout but wasn't one —
+  it gave `ship()` an eternally-empty check rollup, which `_still_settling()`
+  correctly treats as always worth waiting on, and with no `wait=` argument
+  `ship()` used the real 900s default and genuinely slept in wall-clock time.
+  Fixed by passing `wait=0.0` in that one test; no production code changed.
+  A third, purely mechanical bug: a test tried to override `setUp`'s canned
+  `gh` answer with a shorter command prefix, and `FakeRunner` matches
+  longest-prefix-first so the shorter override never took effect — fixed by
+  matching the same fully-specific prefix.
+- **Verified, not assumed, that nothing real can fire in tests.** `GIT_BIN`/
+  `GH_BIN` are unresolvable sentinels, `Repo.__init__`'s binary parameters are
+  asserted (by signature inspection) to default to `None` rather than resolve
+  at import — the actual failure mode that once put three real `foot`
+  windows and ten real toasts on the desktop. `subprocess.Popen`/`.run` were
+  instrumented process-wide across all 137 tests in `test_vcs.py`: only real
+  `git` (against a throwaway temp repo) and the forbidden sentinels
+  (immediately failing, as intended) were ever invoked. The real `gh` never
+  appears.
+- **The `jarvis-settings` contract test caught the `[vcs]`/`git_merge` keys
+  with no GUI control**, the same way it once caught the `[ambient]` keys —
+  the fix was a "GitHub" pane and two new controls in `jarvis/widgets.py`,
+  not an exemption. **Eight keys, not seven**: the six `[vcs]` keys and
+  `[policy] git_merge` are the obvious ones, but `[dispatch]
+  requeue_on_start` — added by the fan-out branch, not the GitHub one — was
+  in the same failing run and is easy to miss when counting from
+  `CONFIG-SCHEMA.md`'s `[vcs]` table alone. The failing run named all eight;
+  that is the number to trust.
+- Left unbuilt, out of scope for this branch: no retry/backoff on a transient
+  `gh` failure (rate limit, a flaky 502); `existing_pr()`/`slug()` still
+  assume `gh` is reachable and don't degrade offline the way `default_branch()`
+  now does; no merge-queue support, no required-reviewers beyond the single
+  `reviewDecision` field, no ruleset-based repositories; `check_wait_seconds`
+  is one global default with no per-repo override. Carried to "Next" below.
+- Test count for this stream alone: 1006 → 1145 (+139), the module's own
+  `test_vcs.py` contributing 137 of them; three consecutive full-suite runs,
+  all green, ~19s each, no flakes.
+
+**Fan-out as a plan, and a job queue that survives a restart.**
+`data/persona.md` gained its own criterion for when splitting work across
+workers is worth it at all: genuinely independent pieces, each substantial
+enough to earn its own session — "two workers on one file is a merge conflict
+she asked for; four two-minute jobs behind `max_parallel = 1` is a queue with
+extra steps." `Dispatcher.dispatch_plan(tasks, to=...)` dispatches each task
+through the ordinary `dispatch()` under one `plan-xxxxxx` id; `luna dispatch
+"a" --and "b" --and "c"` is the CLI surface, `--and` repeatable. A plan of one
+is refused (that's a dispatch, not a plan) and a plan over
+`config.DISPATCH_PLAN_MAX` (8, deliberately not a setting) is refused as a
+to-do list rather than a plan. A plan is not atomic — the first refusal stops
+the fan-out where it is, earlier dispatches stand, and the reason lands in
+`Plan.errors` and the audit log — and it does not bypass the admission gate:
+six tasks against `max_parallel = 2` starts two and queues four, same as any
+other dispatch.
+
+- **A race found while building this:** cancelling a plan job-by-job frees a
+  slot per cancel, and a freed slot can admit the *next member of the same
+  plan being cancelled* while it's still sitting in `_admitting`, invisible to
+  `cancel()`. Fixed by marking the plan cancelled under the lock before
+  touching any member, and refusing to fork a job whose plan is in
+  `_cancelled_plans` (never cleared — a cancelled plan stays cancelled).
+- **The durable queue extends the existing job directory rather than adding a
+  second store.** A queued job writes `queued.json` holding only what lives
+  nowhere else — the watcher's timeout and the confirmations already given —
+  and its mere presence is the claim: removed on admission, cancel, or drop.
+  `Dispatcher.rehydrate(admit=True)` runs once at `Daemon.__init__`, after
+  construction and before the GC thread, deliberately not inside
+  `Dispatcher.__init__` (a constructor that can spawn terminals is one no
+  test can build safely).
+- **The rule is interrupted ≠ queued, in both directions.** A job that was
+  only ever queued — nothing spawned, no side effect exists — is requeued in
+  original order with its confirmations carried verbatim, marked `rehydrated`.
+  A job that was actually *running* when the daemon died is never re-run,
+  whatever the setting says: its process is gone but its side effects are
+  not, and nothing on disk records how far it got, so re-running would repeat
+  unknown work unattended. It's recorded `interrupted` and left for a human
+  to inspect. (A running job whose `run.sh` had already written `exit` before
+  the daemon died is neither of these — it's recorded as its own real
+  `finished`/`failed`, not libelled interrupted.) Adopting a still-running
+  job by polling its pid back into the daemon's own bookkeeping was
+  considered and rejected — it would be a second, weaker watcher for a
+  process this daemon never owned.
+- `[dispatch] requeue_on_start` (default on) gates all of this; off restores
+  the exact old behaviour (cancel on shutdown, drop on rehydrate). `luna jobs`
+  shows `[resumed]` and `INTR` in alert colour.
+- **Found, not fixed:** `Dispatcher._watch` relabels a job `finished`/`failed`
+  from its exit code whenever the terminal exits — including a job the user
+  just cancelled, whose watcher wakes after the fact and overwrites
+  `cancelled` with `FAIL`. Pre-existing, not introduced here; the fix touches
+  a finish path several other tests and the `dispatch.finish` audit entry
+  depend on, so it was left alone. `PlanTests.test_one_cancel_stops_the_whole_
+  group` asserts the guarantee that actually matters (nothing left queued or
+  running) rather than the state label. Recorded below under "Known
+  limitations."
+- Left unbuilt: no plan-level cost gate (estimates are per task; a plan of
+  six costs six times what one task says); no dependencies between plan
+  members (a plan is a set, not a graph, by the same criterion that gates
+  fan-out at all); no cross-daemon queue (rehydration is start-up only); no
+  `luna status` line for plans. Carried to "Next" below.
+- **Rebased onto `35e89cc`** from a worktree cut at `91d971b`, 55 commits
+  behind — the stale-worktree incident above. Two merge conflicts
+  (`lunad/dispatch.py`'s `_start`, `bin/luna`'s CLI rendering having moved to
+  `lunad/render.Style` in the meantime), both resolved onto the newer base.
+  `git grep` against `35e89cc` confirmed nothing in those 55 commits
+  duplicated this work.
+- Test count for this stream alone: 1006 → 1046 (+40), verified end to end —
+  1006 on `35e89cc` with this branch's tree checked out to the base, 1046 on
+  the branch. Desktop guard checked the same way as always: 166 forks across
+  276 tests in the four touched modules, only `/bin/bash` and the unresolvable
+  sentinels, nothing real.
+
+**`_wait_dead`'s zero-grace race.**
+`test_terminate_gives_up_cleanly_on_a_process_that_will_not_die` failed
+5-9% of the time over 80-300 loop runs. `lunad/safety.py::_wait_dead(proc,
+grace)` did one unconditional `proc.poll()` at the end even when `grace <= 0`
+— and with `grace=0.0` (a value only this test ever passes; production always
+passes 1.5-5.0s) that "free" check raced the kernel's own signal delivery and
+reap. Measured with an instrumented harness: 16/300 races landed on the
+post-SIGKILL `_wait_dead` call, 1/300 on the post-SIGTERM one. Fixed in
+`_wait_dead` itself — it now returns `False` immediately, with no poll at
+all, when `grace <= 0`, so "no time budget to observe death" means exactly
+that instead of "usually no time, unless the kernel got there first." No
+production call site passes `grace=0`, so nothing there changes. Verified
+200/200 on the target test and three consecutive 1006/1006 full-suite runs
+(the rest of `tests/test_safety.py` was grepped for the same pattern; no
+other call site uses a zero grace, and the sibling race in
+`test_terminate_confirms_death_even_when_it_has_to_escalate` was loop-tested
+80x with no failures — its assertion holds either way that race resolves, so
+it was left alone).
+
+**Test counts, verified on the merged integration branch, multiple
+consecutive runs each:** root suite **1210 tests, OK** (base 1006 at
+`35e89cc`, itself up from 649); `jarvis-settings` **115 tests, OK**.
+Per-stream contribution to the root suite: HUD +25, fan-out and the durable
+queue +40, the GitHub workflow +139 — 1006 + 25 + 40 + 139 = 1210.
+
+
 ## Verify, and what is currently broken
 
-- **Root suite: 1006 tests pass** (`python3 -m unittest discover` from the
-  repository root). Up from 649.
+- **Root suite: 1210 tests pass** (`python3 -m unittest discover` from the
+  repository root), run multiple consecutive times on the merged integration
+  branch. **CORRECTED:** up from 1006 at the base this integration branch
+  forked from (`35e89cc`), itself up from 649. Per-stream contribution: HUD
+  +25, fan-out and the durable queue +40, the GitHub workflow +139 (see
+  Phase 4 below).
 - **`jarvis-settings`: 115 tests pass.** **CORRECTED:** this was red for a
   stretch — `tests.test_schema.ContractTest` asserts every key in
   `docs/CONFIG-SCHEMA.md` has a live GUI control and a default that matches,
   and the eight `[ambient]` keys had neither, because there was no Ambient
   pane. The pane landed (between Confirmations and Memory, "Jarvis — typeset,
-  not boxed" above) and the suite is green again.
+  not boxed" above) and the suite is green again. **CORRECTED again:** Phase 4
+  added the `[hud]` and `[vcs]`/`git_merge` keys and the same contract test
+  caught the new ones with no GUI control; the fix was the Overlay and GitHub
+  panes plus two new controls in `jarvis/widgets.py`, not an exemption, and
+  the suite is still 115/115 green — the contract test itself is one case, so
+  covering new keys with existing controls doesn't move the count.
