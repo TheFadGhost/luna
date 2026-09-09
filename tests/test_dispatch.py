@@ -363,7 +363,9 @@ class QueueTests(DispatcherCase):
         third = d.dispatch("waits for the count to drain", timeout=30, linger=0)
         self.assertEqual(third.state, "queued")
 
-    def test_a_queued_job_is_dropped_on_shutdown_rather_than_left_promised(self):
+    def test_a_queued_job_is_dropped_on_shutdown_when_requeue_is_off(self):
+        """The old behaviour, still available and still exactly as it was."""
+        self.settings.set("dispatch.requeue_on_start", False)
         d = self.dispatcher()
         first = self.blocker(d)
         # Held so the job can be stopped *after* close(), which has already
@@ -376,12 +378,35 @@ class QueueTests(DispatcherCase):
         self.assertIn("daemon stopped", second.note)
         on_disk = json.loads((second.dir / "job.json").read_text())
         self.assertEqual(on_disk["state"], "cancelled")
+        self.assertFalse((second.dir / "queued.json").exists(),
+                         "a dropped job must not look like it is still waiting")
         self.assertEqual(d.queued(), [])
         self.assertTrue(safety.is_alive(first.pid),
                         "close() must not have touched the running job")
         # And now stop it, and wait for its watcher to finish writing, so
         # nothing is still holding the temporary tree teardown is about to
         # delete. That stray-directory bug is on the record already.
+        safety.terminate(proc, reason="test teardown")
+        self.wait_for(first, "finished", "failed", "cancelled")
+
+    def test_a_queued_job_is_left_on_disk_for_the_next_daemon_by_default(self):
+        """`[dispatch] requeue_on_start` is on: shutdown defers, never drops."""
+        d = self.dispatcher()
+        first = self.blocker(d)
+        proc = d._procs[first.id]
+        second = d.dispatch("still going to run, later", timeout=30, linger=0)
+        d.close(join_timeout=0.5)
+        self.assertEqual(second.state, "queued")
+        on_disk = json.loads((second.dir / "job.json").read_text())
+        self.assertEqual(on_disk["state"], "queued")
+        self.assertTrue((second.dir / "queued.json").exists(),
+                        "the marker is what the next daemon reads")
+        self.assertEqual(d.queued(), [], "the in-memory queue still drains")
+        [entry] = self.audit.read(action="dispatch.deferred")
+        self.assertEqual(entry["job_id"], second.id)
+        self.assertEqual(
+            self.audit.read(action="dispatch.cancel"), [],
+            "nothing was cancelled, so nothing may claim it was")
         safety.terminate(proc, reason="test teardown")
         self.wait_for(first, "finished", "failed", "cancelled")
 
@@ -833,6 +858,364 @@ class BoundaryPromptTests(unittest.TestCase):
 
     def test_a_worker_is_not_given_sols_persona(self):
         self.assertNotIn("Sol", self.prompt("worker"))
+
+
+class PlanTests(DispatcherCase):
+    """Fan-out as a plan: one id, one cancel, and the same admission gate.
+
+    None of this is a scheduler. Every job in a plan goes through the ordinary
+    ``dispatch()``, so what these cases are really checking is that grouping
+    them changed nothing about how many of them get to run.
+    """
+
+    def wait_for(self, job: dispatch.Job, *states: str,
+                 timeout: float = 20.0) -> str:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if job.state in states:
+                return job.state
+            time.sleep(0.05)
+        self.fail(f"job {job.id} stayed {job.state!r}, never reached {states}")
+
+    def test_a_plan_of_one_is_refused_because_that_is_a_dispatch(self):
+        d = self.dispatcher()
+        with self.assertRaises(dispatch.DispatchError) as caught:
+            d.dispatch_plan(["only the one thing"])
+        self.assertIn("at least two", str(caught.exception))
+        self.assertEqual(len(self.ledger), 0, "nothing may have been spawned")
+
+    def test_a_plan_bigger_than_the_cap_is_refused_as_a_to_do_list(self):
+        d = self.dispatcher()
+        tasks = [f"task {n}" for n in range(config.DISPATCH_PLAN_MAX + 1)]
+        with self.assertRaises(dispatch.DispatchError) as caught:
+            d.dispatch_plan(tasks)
+        self.assertIn("to-do list", str(caught.exception))
+        self.assertEqual(len(self.ledger), 0)
+
+    def test_every_job_carries_the_plan_id_and_its_position(self):
+        self.settings.set("dispatch.max_parallel", 1)
+        d = self.dispatcher()
+        plan = d.dispatch_plan(["alpha", "bravo", "charlie"], linger=0)
+        self.addCleanup(d.cancel_plan, plan.id)
+        self.assertEqual(len(plan.jobs), 3)
+        self.assertEqual({j.plan for j in plan.jobs}, {plan.id})
+        self.assertEqual([j.plan_index for j in plan.jobs], [1, 2, 3])
+        self.assertEqual({j.plan_size for j in plan.jobs}, {3})
+        self.assertEqual(d.plan_jobs(plan.id), [j.id for j in plan.jobs])
+
+    def test_the_plan_id_reaches_disk_so_the_group_survives_a_restart(self):
+        self.settings.set("dispatch.max_parallel", 1)
+        d = self.dispatcher()
+        plan = d.dispatch_plan(["alpha", "bravo"], linger=0)
+        self.addCleanup(d.cancel_plan, plan.id)
+        queued = [j for j in plan.jobs if j.state == "queued"]
+        self.assertTrue(queued, "one of the two must have been held back")
+        on_disk = json.loads((queued[0].dir / "job.json").read_text())
+        self.assertEqual(on_disk["plan"], plan.id)
+        self.assertEqual(on_disk["plan_size"], 2)
+
+    def test_a_fan_out_past_the_limit_queues_rather_than_stampedes(self):
+        """Six against `max_parallel = 2` is the case this exists to prove."""
+        self.settings.set("dispatch.max_parallel", 2)
+        d = self.dispatcher()
+        plan = d.dispatch_plan([f"piece {n}" for n in range(6)],
+                               timeout=30, linger=20)
+        self.addCleanup(d.cancel_plan, plan.id)
+        states = [j.state for j in plan.jobs]
+        self.assertEqual(states.count("running"), 2,
+                         f"the gate must still bound the plan: {states}")
+        self.assertEqual(states.count("queued"), 4)
+        self.assertEqual(len(self.ledger), 2,
+                         "a fan-out must not fork past the limit")
+
+    def test_one_cancel_stops_the_whole_group(self):
+        self.settings.set("dispatch.max_parallel", 2)
+        d = self.dispatcher()
+        plan = d.dispatch_plan([f"piece {n}" for n in range(4)],
+                               timeout=30, linger=20)
+        result = d.cancel_plan(plan.id)
+        self.assertEqual(result["found"], 4, "one id reaches every member")
+        # Deliberately not "all four were cancelled". Cancelling the running
+        # pair frees their slots, and a freed slot tries to admit the next
+        # member of this very plan — those are stopped at the admission gate
+        # instead of by `cancel`, and a member that finished and was reaped
+        # first is refused by the firewall, correctly. What the group cancel
+        # promises is the state the group ends in, not the route each member
+        # took to get there.
+        self.assertEqual(result["cancelled"] + len(result["already_over"])
+                         + len(result["refused"]), 4)
+        for job in plan.jobs:
+            self.wait_for(job, "cancelled", "finished", "failed")
+        self.assertEqual(d.queued(), [])
+        # Not "all four say cancelled": `_watch` overwrites a cancelled job's
+        # state with the exit code its terminal returned, so a member whose
+        # watcher wakes first reads `failed`. That is pre-existing behaviour
+        # and is not what this case is about. The guarantee a group cancel
+        # makes is that nothing is left waiting or running.
+        self.assertEqual([j.state in ("queued", "running") for j in plan.jobs],
+                         [False] * 4)
+
+    def test_a_plan_cancel_beats_a_job_that_is_already_being_admitted(self):
+        """The window `cancel()` alone cannot see, and the group must not lose.
+
+        Between the queue popping a job and that job holding a pid it is in
+        ``_admitting``: not queued, not running, invisible to ``cancel``. The
+        first version of ``cancel_plan`` cancelled job by job, and every
+        cancel freed a slot — which admitted the *next* member of the plan
+        being cancelled. The window is reproduced by hand here rather than
+        raced for, because a test that has to win a race is a test that fails
+        on somebody else's machine.
+        """
+        self.settings.set("dispatch.max_parallel", 2)
+        d = self.dispatcher()
+        plan = d.dispatch_plan(["one", "two", "three"], timeout=30, linger=20)
+        victim = next(j for j in plan.jobs if j.state == "queued")
+        with d._lock:
+            pending = next(p for p in d._queue if p.job.id == victim.id)
+            d._queue.remove(pending)
+            d._admitting.add(victim.id)
+        d.cancel_plan(plan.id)
+        with self.assertRaises(dispatch.DispatchUnavailable):
+            d._start(pending)
+        self.assertEqual(victim.state, "cancelled")
+        self.assertIn("plan it belongs to was cancelled", victim.note)
+        # Counted from the audit rather than the ledger: `terminate` releases
+        # a pid, so the ledger has already forgotten the two that did run.
+        self.assertEqual(len(self.audit.read(action="dispatch.spawn")), 2,
+                         "the cancelled plan's third job must never fork")
+        for job in plan.jobs:
+            self.wait_for(job, "cancelled", "finished", "failed")
+
+    def test_cancelling_an_unknown_plan_is_not_an_error(self):
+        d = self.dispatcher()
+        result = d.cancel_plan("plan-nothing")
+        self.assertEqual(result["cancelled"], 0)
+        self.assertIn("no plan", result["note"])
+
+    def test_the_plan_is_audited_with_the_one_command_that_undoes_it(self):
+        self.settings.set("dispatch.max_parallel", 1)
+        d = self.dispatcher()
+        plan = d.dispatch_plan(["alpha", "bravo"], linger=0)
+        self.addCleanup(d.cancel_plan, plan.id)
+        [entry] = self.audit.read(action="dispatch.plan")
+        self.assertEqual(entry["plan"], plan.id)
+        self.assertEqual(entry["asked"], 2)
+        self.assertEqual(entry["dispatched"], 2)
+        self.assertEqual(entry["undo"]["cmd"],
+                         ["luna", "jobs", "--cancel", plan.id])
+
+    def test_the_announcement_names_the_group_not_each_job(self):
+        self.settings.set("dispatch.max_parallel", 1)
+        d = self.dispatcher()
+        plan = d.dispatch_plan(["alpha", "bravo"], linger=0)
+        self.addCleanup(d.cancel_plan, plan.id)
+        line = d.announce_plan(plan)
+        self.assertIn(plan.id, line)
+        self.assertEqual(len(line.splitlines()), 1, "one line, as the spec says")
+        for job in plan.jobs:
+            self.assertNotIn(job.id, line)
+
+
+class RehydrateTests(DispatcherCase):
+    """What a daemon that died left behind, and which half of it may resume.
+
+    These cases build job directories by hand rather than by killing a real
+    daemon, because the thing under test is the *reading*: given a tree in a
+    particular state, which jobs come back and which are recorded as over.
+
+    Nothing here opens a terminal. The dispatcher's terminal is ``/bin/bash``
+    and its agent is the fixture script, exactly as in every other case in
+    this file, and the cases that assert the queue never admit anything at
+    all (``rehydrate(admit=False)``), so no process is forked and no
+    finish-notification path is reached.
+    """
+
+    def write_job(self, job_id: str, **fields) -> Path:
+        job_dir = self.root / "jobs" / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        data = {"id": job_id, "task": f"the {job_id} task", "to": "worker",
+                "state": "queued", "pid": None, "started": time.time(),
+                "iso": "x", "elapsed_s": 0.0, "exit_code": None,
+                "dir": str(job_dir)}
+        data.update(fields)
+        (job_dir / "job.json").write_text(json.dumps(data), encoding="utf-8")
+        return job_dir
+
+    def mark_queued(self, job_dir: Path, timeout: float = 30.0,
+                    confirmed=None) -> None:
+        (job_dir / "run.sh").write_text("#!/bin/bash\nexit 0\n",
+                                        encoding="utf-8")
+        (job_dir / "queued.json").write_text(json.dumps(
+            {"id": job_dir.name, "timeout": timeout, "confirmed": confirmed,
+             "queued_at": time.time(), "daemon_pid": 999_999}),
+            encoding="utf-8")
+
+    # -- the queued half, which may come back ----------------------------
+
+    def test_a_queued_job_left_by_a_dead_daemon_is_put_back_in_the_queue(self):
+        job_dir = self.write_job("aa11")
+        self.mark_queued(job_dir)
+        d = self.dispatcher()
+        summary = d.rehydrate(admit=False)
+        self.assertEqual(summary["requeued"], ["aa11"])
+        [pending] = d.queued()
+        self.assertEqual(pending.state, "queued")
+        self.assertTrue(pending.rehydrated)
+        self.assertEqual(len(self.ledger), 0, "resuming must fork nothing")
+
+    def test_a_resumed_job_never_reads_as_a_fresh_one(self):
+        job_dir = self.write_job("aa22")
+        self.mark_queued(job_dir)
+        d = self.dispatcher()
+        d.rehydrate(admit=False)
+        listed = {j["id"]: j for j in d.jobs()}
+        self.assertTrue(listed["aa22"]["rehydrated"])
+        self.assertEqual(listed["aa22"]["state"], "queued")
+        self.assertIn("restart", listed["aa22"]["note"])
+        self.assertTrue(json.loads((job_dir / "job.json").read_text())
+                        ["rehydrated"], "the flag has to survive to disk too")
+
+    def test_the_confirmations_given_at_accept_time_are_carried_forward(self):
+        """Re-gating would date a human decision to a restart."""
+        job_dir = self.write_job("aa33")
+        self.mark_queued(job_dir, confirmed=["delete_files"])
+        d = self.dispatcher()
+        d.rehydrate(admit=False)
+        [pending] = d._queue
+        self.assertEqual(pending.confirmed, ["delete_files"])
+        self.assertEqual(pending.timeout, 30.0)
+        [entry] = self.audit.read(action="dispatch.rehydrated")
+        self.assertEqual(entry["job_id"], "aa33")
+        self.assertEqual(entry["confirmed"], ["delete_files"])
+        self.assertEqual(entry["undo"]["cmd"][:3], ["luna", "jobs", "--cancel"])
+
+    def test_the_resumed_queue_keeps_the_order_it_had(self):
+        for n, job_id in enumerate(("cc11", "cc22", "cc33")):
+            job_dir = self.write_job(job_id, started=1000.0 + n)
+            self.mark_queued(job_dir)
+        d = self.dispatcher()
+        d.rehydrate(admit=False)
+        self.assertEqual([j.id for j in d.queued()], ["cc11", "cc22", "cc33"])
+
+    def test_a_resumed_plan_is_still_cancellable_as_a_group(self):
+        for n, job_id in enumerate(("dd11", "dd22")):
+            job_dir = self.write_job(job_id, plan="plan-abc123",
+                                     plan_index=n + 1, plan_size=2,
+                                     started=1000.0 + n)
+            self.mark_queued(job_dir)
+        d = self.dispatcher()
+        d.rehydrate(admit=False)
+        self.assertEqual(d.plan_jobs("plan-abc123"), ["dd11", "dd22"])
+        self.assertEqual(d.cancel_plan("plan-abc123")["cancelled"], 2)
+
+    def test_requeue_off_records_the_job_as_cancelled_instead(self):
+        self.settings.set("dispatch.requeue_on_start", False)
+        job_dir = self.write_job("bb11")
+        self.mark_queued(job_dir)
+        d = self.dispatcher()
+        summary = d.rehydrate(admit=False)
+        self.assertEqual(summary["dropped"], ["bb11"])
+        self.assertEqual(d.queued(), [])
+        on_disk = json.loads((job_dir / "job.json").read_text())
+        self.assertEqual(on_disk["state"], "cancelled")
+        self.assertIn("requeue_on_start", on_disk["note"])
+        self.assertFalse((job_dir / "queued.json").exists())
+
+    def test_a_queued_job_with_no_marker_is_not_resumed_on_a_guess(self):
+        """Without the marker the terms it was accepted on are unknown."""
+        job_dir = self.write_job("bb22")     # no queued.json, no run.sh
+        d = self.dispatcher()
+        summary = d.rehydrate(admit=False)
+        self.assertEqual(summary["dropped"], ["bb22"])
+        self.assertIn("queue record",
+                      json.loads((job_dir / "job.json").read_text())["note"])
+
+    # -- the running half, which never comes back ------------------------
+
+    def test_a_job_that_was_running_is_interrupted_and_never_re_run(self):
+        job_dir = self.write_job("ee11", state="running", pid=1,
+                                 admitted=time.time())
+        (job_dir / "run.sh").write_text("#!/bin/bash\nexit 0\n",
+                                        encoding="utf-8")
+        d = self.dispatcher()
+        summary = d.rehydrate(admit=True)
+        self.assertEqual(summary["interrupted"], ["ee11"])
+        self.assertEqual(summary["requeued"], [])
+        self.assertEqual(d.queued(), [])
+        self.assertEqual(len(self.ledger), 0,
+                         "re-running it would repeat its side effects")
+        on_disk = json.loads((job_dir / "job.json").read_text())
+        self.assertEqual(on_disk["state"], "interrupted")
+        self.assertIn("not re-run", on_disk["note"])
+        self.assertTrue(on_disk["rehydrated"])
+
+    def test_an_interrupted_job_is_visible_in_the_listing_and_the_log(self):
+        self.write_job("ee22", state="running", pid=1)
+        d = self.dispatcher()
+        d.rehydrate(admit=False)
+        listed = {j["id"]: j for j in d.jobs()}
+        self.assertEqual(listed["ee22"]["state"], "interrupted")
+        [entry] = self.audit.read(action="job.interrupted")
+        self.assertEqual(entry["job_id"], "ee22")
+        self.assertIn("not re-run", entry["resolution"])
+
+    def test_a_job_that_had_actually_finished_keeps_its_own_exit_code(self):
+        """`run.sh` writes `exit` after the agent returns, so this one ran."""
+        job_dir = self.write_job("ee33", state="running", pid=1)
+        (job_dir / "exit").write_text("3", encoding="utf-8")
+        d = self.dispatcher()
+        summary = d.rehydrate(admit=False)
+        self.assertEqual(summary["completed"], ["ee33"])
+        self.assertEqual(summary["interrupted"], [])
+        on_disk = json.loads((job_dir / "job.json").read_text())
+        self.assertEqual(on_disk["state"], "failed")
+        self.assertEqual(on_disk["exit_code"], 3)
+
+    def test_a_job_whose_process_is_still_alive_is_left_completely_alone(self):
+        job_dir = self.write_job("ee44", state="running", pid=os.getpid())
+        d = self.dispatcher()
+        summary = d.rehydrate(admit=False)
+        self.assertEqual(summary["left_running"], ["ee44"])
+        self.assertEqual(summary["interrupted"], [])
+        self.assertEqual(json.loads((job_dir / "job.json").read_text())["state"],
+                         "running", "a live job must not be rewritten")
+
+    def test_a_finished_job_is_not_touched_at_all(self):
+        job_dir = self.write_job("ff11", state="finished", exit_code=0,
+                                 finished=time.time())
+        before = (job_dir / "job.json").read_text()
+        d = self.dispatcher()
+        summary = d.rehydrate(admit=False)
+        self.assertEqual(summary["requeued"], [])
+        self.assertEqual(summary["interrupted"], [])
+        self.assertEqual((job_dir / "job.json").read_text(), before)
+
+    # -- the round trip, with real processes ------------------------------
+
+    def test_a_real_shutdown_and_restart_runs_the_job_that_was_waiting(self):
+        """The whole point, end to end: a queued job outlives its daemon."""
+        first = self.dispatcher()
+        blocker = first.dispatch("hold the only slot", timeout=30, linger=20)
+        self.assertEqual(blocker.state, "running")
+        proc = first._procs[blocker.id]
+        waiting = first.dispatch("the work that must not be lost",
+                                 timeout=30, linger=0)
+        self.assertEqual(waiting.state, "queued")
+        first.close(join_timeout=0.5)
+        safety.terminate(proc, reason="the daemon died")
+        # A second daemon, against the same jobs tree.
+        second = self.dispatcher()
+        summary = second.rehydrate()
+        self.assertEqual(summary["requeued"], [waiting.id])
+        self.assertEqual(summary["admitted"], [waiting.id])
+        resumed = second._jobs[waiting.id]
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and resumed.state == "running":
+            time.sleep(0.05)
+        self.assertEqual(resumed.state, "finished")
+        self.assertIn("must not be lost", resumed.read_output())
+        self.assertFalse((resumed.dir / "queued.json").exists(),
+                         "an admitted job must stop looking like it is waiting")
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -878,6 +878,30 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
                        'luna dispatch "run the test suite and report"')
     if task is None:
         return 2
+    # `--and` is a fan-out: several tasks under one plan id, cancellable as a
+    # group. It is spelled as a flag rather than inferred from anything,
+    # because splitting work across sessions is a decision somebody should
+    # have to make on purpose.
+    extra = [t.strip() for t in (args.also or []) if t.strip()]
+    if extra:
+        if args.wait:
+            sys.stderr.write("luna: --wait is for one job; a plan is several. "
+                             "Use `luna jobs` for the group's outcome\n")
+            return 2
+        with Client(timeout=60) as client:
+            resp = client.call("dispatch", tasks=[task, *extra], to=args.to,
+                               timeout=args.timeout)
+        if args.json:
+            print(json.dumps(resp, indent=2))
+            return 0 if resp.get("ok") else 1
+        if not resp.get("ok"):
+            return fail(resp)
+        print(resp["announce"])
+        for job in resp.get("jobs", []):
+            print(f"  {S.bold(job['id'])} {job.get('state'):<8} "
+                  + S.dim(render.fit(job["task"].splitlines()[0],
+                                     max(20, S.width - 24), S)))
+        return 0 if not resp.get("errors") else 1
     timeout = args.timeout + 60 if args.wait else 30
     with Client(timeout=timeout) as client:
         resp = client.call("dispatch", task=task, to=args.to,
@@ -901,10 +925,14 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
 
 
 #: How a job's state is spelled, in the four characters every row gives it.
-#: Fixed width so the column beside it stays a column; the two that mean
-#: something went wrong are the only ones that take colour.
+#: Fixed width so the column beside it stays a column; only the ones that mean
+#: something went wrong take colour.
+#: `interrupted` is the one that needs explaining: the daemon died while the
+#: job was running. Not a failure and not a success — nobody knows how far it
+#: got, and it was deliberately not re-run.
 _STATE_MARK = {"finished": "ok", "failed": "FAIL", "running": "run",
-               "queued": "wait", "cancelled": "cxl", "orphaned": "orph"}
+               "queued": "wait", "cancelled": "cxl", "orphaned": "orph",
+               "interrupted": "INTR"}
 
 
 def cmd_jobs(args: argparse.Namespace) -> int:
@@ -939,12 +967,23 @@ def _jobs_text(resp: dict, style: render.Style, with_output: bool = False) -> st
     rows = []
     for job in resp["jobs"]:
         mark = _STATE_MARK.get(job["state"], job["state"][:4])
-        if job["state"] in ("failed", "orphaned"):
+        if job["state"] in ("failed", "orphaned", "interrupted"):
             mark = style.alert(mark)
         code = "" if job.get("exit_code") is None else f"exit {job['exit_code']}"
+        # A fan-out reads as a group, and a resurrected job must never read as
+        # a fresh one: it is work the user asked for before something died,
+        # and they may well have forgotten it. Both ride on the timestamp
+        # column rather than adding a seventh, so the columns stay columns.
+        tag = ""
+        if job.get("plan"):
+            where = (f" {job['plan_index']}/{job['plan_size']}"
+                     if job.get("plan_index") and job.get("plan_size") else "")
+            tag += f"  [{job['plan']}{where}]"
+        if job.get("rehydrated"):
+            tag += "  [resumed]"
         rows.append([style.bold(job["id"]), mark, job["to"],
                      f"{job['elapsed_s']:.1f}s", code,
-                     style.dim(job["iso"].replace("T", " "))])
+                     style.dim(job["iso"].replace("T", " ") + tag)])
     laid = render.columns(rows, style, gap=2, align="lllrll")
     # The task is the reason the job exists, so it gets its own line at full
     # width rather than a truncated sixth column.
@@ -1575,6 +1614,12 @@ def build_parser() -> argparse.ArgumentParser:
     dp.add_argument("task", nargs="*")
     dp.add_argument("--to", default="worker", choices=["worker", "sol"],
                     help="sol is the specialist: own prompt, own memory")
+    dp.add_argument("--and", dest="also", action="append", metavar="TASK",
+                    help="another independent task, dispatched under the same "
+                         "plan id; repeat for each. `luna jobs` shows the "
+                         "group together and one --cancel stops it. Only "
+                         "worth it when the tasks share no files and each is "
+                         "substantial")
     dp.add_argument("--wait", action="store_true",
                     help="block until the job finishes and print its output")
     dp.add_argument("--timeout", type=float, default=3600.0)
@@ -1584,7 +1629,8 @@ def build_parser() -> argparse.ArgumentParser:
     jb.add_argument("-n", "--limit", type=int, default=20)
     jb.add_argument("--output", action="store_true",
                     help="include what each job wrote")
-    jb.add_argument("--cancel", default=None, metavar="JOB_ID")
+    jb.add_argument("--cancel", default=None, metavar="JOB_ID",
+                    help="a job id, or a plan id to stop the whole fan-out")
     jb.set_defaults(func=cmd_jobs)
 
     pk = add("peek", help="show or hide the luna workspace")

@@ -135,6 +135,22 @@ class Daemon:
         # through `luna confirm`, because the pending map it looks in would be
         # the other object's.
         self.dispatcher.confirm = self.confirm
+        # What the last daemon left behind, resolved before anything new is
+        # accepted. Queued work is picked back up (`[dispatch]
+        # requeue_on_start`); work that was *running* when the daemon died is
+        # recorded as interrupted and never re-run, because its side effects
+        # are on the user's machine and nothing on disk says how far it got.
+        # Here rather than in `Dispatcher.__init__` on purpose: a constructor
+        # that spawns terminals is a constructor no test can build safely.
+        try:
+            resumed = self.dispatcher.rehydrate()
+        except Exception:  # noqa: BLE001 - a bad jobs tree must not stop boot
+            log.exception("could not rehydrate the jobs tree")
+        else:
+            if any(resumed.get(k) for k in ("requeued", "interrupted",
+                                            "completed", "dropped")):
+                log.info("resumed the jobs tree",
+                         extra={k: len(v) for k, v in resumed.items()})
         # `[dispatch] job_retention_days`, on a timer in its own thread. Not on
         # the request path: it walks a directory tree, and nobody should wait
         # for it to answer a question about the weather.
@@ -850,7 +866,16 @@ class Daemon:
     # -- Phase 2: delegation, the workspace, and the record -------------
 
     def op_dispatch(self, req: dict[str, Any]) -> dict[str, Any]:
-        """Hand a task to a real agent session in the `luna` workspace."""
+        """Hand a task to a real agent session in the `luna` workspace.
+
+        A ``tasks`` list instead of a ``task`` is a fan-out: the jobs go out
+        under one plan id and come back as a group. Nothing here decides to
+        fan out — that is Luna's judgement, and `data/persona.md` says when it
+        is worth paying for — this only carries the decision once it is made.
+        """
+        tasks = req.get("tasks")
+        if isinstance(tasks, list) and tasks:
+            return self._op_dispatch_plan(req, tasks)
         task = req.get("task")
         if not isinstance(task, str) or not task.strip():
             raise protocol.ProtocolError("dispatch requires a non-empty 'task'")
@@ -871,6 +896,27 @@ class Daemon:
             payload = self._wait_for_job(job, float(req.get("wait_timeout") or
                                                     config.DISPATCH_TIMEOUT_S))
             payload["announce"] = self.dispatcher.announce(job)
+        return protocol.ok(req.get("id"), **payload)
+
+    def _op_dispatch_plan(self, req: dict[str, Any],
+                          tasks: list[Any]) -> dict[str, Any]:
+        """A fan-out. Never waits: a plan is several jobs, and blocking a
+        socket thread on all of them is a thread held for the length of the
+        slowest one."""
+        cleaned = [t for t in tasks if isinstance(t, str) and t.strip()]
+        if len(cleaned) != len(tasks):
+            raise protocol.ProtocolError(
+                "every entry in 'tasks' must be a non-empty string")
+        to = str(req.get("to") or "worker").lower()
+        block = self.sol_memory.block() if to == "sol" else ""
+        plan = self.dispatcher.dispatch_plan(
+            cleaned, to,
+            timeout=float(req.get("timeout") or config.DISPATCH_TIMEOUT_S),
+            sol_memory_block=block,
+            estimate_seconds=_number(req.get("estimate_seconds")),
+            estimate_usd=_number(req.get("estimate_usd")))
+        payload = plan.to_dict()
+        payload["announce"] = self.dispatcher.announce_plan(plan)
         return protocol.ok(req.get("id"), **payload)
 
     def _wait_for_job(self, job: dispatch.Job, timeout: float) -> dict[str, Any]:
@@ -896,12 +942,19 @@ class Daemon:
     def op_jobs(self, req: dict[str, Any]) -> dict[str, Any]:
         target = req.get("cancel")
         if target:
-            stopped = self.dispatcher.cancel(str(target))
+            target = str(target)
+            # A plan id cancels the whole group. Routed by looking the id up
+            # rather than by its shape, so nothing depends on how ids happen
+            # to be spelled today.
+            if target in self.dispatcher.plans():
+                return protocol.ok(req.get("id"), target=target,
+                                   **self.dispatcher.cancel_plan(target))
+            stopped = self.dispatcher.cancel(target)
             return protocol.ok(req.get("id"), cancelled=1 if stopped else 0,
-                               target=str(target),
+                               target=target,
                                note="" if stopped else
-                                    "no running or queued job with that id "
-                                    "in this daemon")
+                                    "no running or queued job, and no plan, "
+                                    "with that id in this daemon")
         jobs = self.dispatcher.jobs(limit=int(req.get("limit")
                                               or config.JOB_LIST_LIMIT),
                                     with_output=bool(req.get("output")))
