@@ -26,7 +26,8 @@ from pathlib import Path
 
 from ._support import (FORBIDDEN_AMBIENT_STATE, FORBIDDEN_APLAY,
                        FORBIDDEN_COREDUMP_DIR, FORBIDDEN_CRASH_TOGGLE_OFF,
-                       FORBIDDEN_CRASH_WATCH_UNIT, FORBIDDEN_GRIM,
+                       FORBIDDEN_CRASH_WATCH_UNIT, FORBIDDEN_GH,
+                       FORBIDDEN_GIT, FORBIDDEN_GRIM,
                        FORBIDDEN_HUD_MESSAGE, FORBIDDEN_HUD_SETTINGS,
                        FORBIDDEN_HYPRCTL, FORBIDDEN_JOBS_DIR,
                        FORBIDDEN_NOTIFIER,
@@ -36,7 +37,7 @@ from ._support import (FORBIDDEN_AMBIENT_STATE, FORBIDDEN_APLAY,
                        TempMemoryCase)
 
 from lunad import (ambient, config, confirm, context, dispatch, hud, presence,
-                   speech)
+                   speech, vcs)
 
 #: Every ``config`` name that reaches the outside world, and what it would do
 #: to the machine running the suite if it were the real thing.
@@ -47,6 +48,10 @@ DISARMED = {
     "HYPRCTL_BIN": (FORBIDDEN_HYPRCTL, "moves the user's workspaces"),
     "VENV_PYTHON": (FORBIDDEN_PYTHON, "forks a real 331 MB piper worker"),
     "GRIM_BIN": (FORBIDDEN_GRIM, "photographs the user's screen"),
+    "GIT_BIN": (FORBIDDEN_GIT, "pushes to a real remote"),
+    "GH_BIN": (FORBIDDEN_GH,
+               "opens, comments on and MERGES pull requests on the user's "
+               "own GitHub account"),
 }
 
 
@@ -84,6 +89,7 @@ class LateReadCase(unittest.TestCase):
         (dispatch.Hyprland.__init__, ("hyprctl",)),
         (confirm.ConfirmBroker.__init__, ("notify_bin",)),
         (speech.Speech.__init__, ("aplay", "python", "caption")),
+        (vcs.Repo.__init__, ("git_bin", "gh_bin", "notify_bin")),
     )
 
     def test_outward_parameters_default_to_none(self) -> None:
@@ -135,6 +141,28 @@ class ConstructionCase(TempMemoryCase):
         self.assertNotEqual(d.jobs_dir, config.STATE_DIR / "jobs")
         self.assertFalse(str(d.jobs_dir).startswith(str(Path.home())),
                          "a stray Dispatcher is collecting inside $HOME")
+
+    def test_a_repo_built_with_nothing_holds_both_vcs_sentinels(self) -> None:
+        repo = vcs.Repo(self.root)
+        self.assertEqual(repo.git_bin, FORBIDDEN_GIT)
+        self.assertEqual(repo.gh_bin, FORBIDDEN_GH)
+        self.assertEqual(repo.notify_bin, FORBIDDEN_NOTIFIER)
+
+    def test_a_repo_built_with_nothing_cannot_reach_git_or_gh(self) -> None:
+        """Nothing stubbed. The spawn is genuinely attempted and must fail.
+
+        `gh` is authenticated on the machine this suite runs on, so the
+        sentinel is the only thing between a case that forgets to inject a
+        runner and a pull request opened on the user's real account.
+        """
+        repo = vcs.Repo(self.root)
+        self.assertFalse(repo.is_repo())
+        ok, detail = repo.available()
+        self.assertFalse(ok)
+        self.assertIn(FORBIDDEN_GIT, detail)
+        with self.assertRaises(vcs.VcsUnavailable):
+            vcs.run_process([config.GH_BIN, "pr", "merge", "1"],
+                            self.root, 5.0)
 
     def test_an_explicit_value_still_wins(self) -> None:
         # The guard must not take the argument away from callers that need it:

@@ -216,6 +216,16 @@ SCHEMA: tuple[Section, ...] = (
             Key("network_send", "ask", "policy",
                 comment="posting data off the machine"),
             Key("git_push", "ask", "policy"),
+            # "never" — just do it — because the user chose branch, commit,
+            # PR, wait for CI, auto-merge on green. The *green* half of that
+            # is not a policy and cannot be turned off here: `lunad.vcs`
+            # refuses a merge whose checks have not all concluded
+            # successfully whatever this key says. Set it to "ask" to be
+            # consulted before each merge, or "deny" to have her open the
+            # pull request and stop.
+            Key("git_merge", "never", "policy",
+                comment="merging her own PR; the green-checks gate is in "
+                        "code, not here"),
             Key("long_job", "ask", "policy",
                 comment="anything estimated over `long_job_seconds`"),
             Key("long_job_seconds", 300, "int", minimum=1, maximum=86_400),
@@ -279,6 +289,38 @@ SCHEMA: tuple[Section, ...] = (
             Key("requeue_on_start", True, "bool",
                 comment="queued jobs are picked back up after a restart; "
                         "running ones are never re-run"),
+        ),
+    ),
+    Section(
+        "vcs",
+        align=20,
+        header=(
+            "How her work reaches GitHub. Every piece of it goes branch ->",
+            "commit -> push -> pull request; she never pushes to the default",
+            "branch, and she merges her own pull request only when CI is",
+            "green. What \"green\" means is in `lunad/vcs.py` and is not a",
+            "setting: all checks concluded successfully, none pending, none",
+            "missing, not a draft, mergeable. A repository with no CI",
+            "configured therefore never auto-merges.",
+        ),
+        keys=(
+            Key("branch_prefix", "luna", "str",
+                comment="branches are `<prefix>/<topic>-<yymmdd>`"),
+            Key("auto_merge", True, "bool",
+                comment="attempt the merge once the checks are green"),
+            Key("merge_method", "squash", "str",
+                choices=("squash", "merge", "rebase")),
+            Key("delete_branch", True, "bool",
+                comment="delete the head branch when the merge lands"),
+            Key("notify_on_refusal", True, "bool",
+                comment="toast when an auto-merge was refused"),
+            # 0 means do not wait: read the checks once and decide. It does
+            # not mean "wait forever", and it is not an off switch for the
+            # gate — a `ship` with 0 simply refuses anything CI has not
+            # finished reporting on yet, which is the safe direction.
+            Key("check_wait_seconds", 900, "int", minimum=0, maximum=21_600,
+                comment="how long `luna vcs ship` waits for CI; 0 = do not "
+                        "wait"),
         ),
     ),
     Section(

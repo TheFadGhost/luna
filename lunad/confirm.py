@@ -116,6 +116,21 @@ _CLASSIFIERS: tuple[tuple[str, re.Pattern[str], str], ...] = (
         r"|\bgit\s+\S+\s+--force\b|\bpush\b[^\n]{0,20}\b(?:to\s+)?(?:origin|remote|upstream)\b)",
         re.IGNORECASE),
      "pushes to a git remote"),
+    # Separate from `git_push` on purpose. Pushing a branch is reversible with
+    # one command and nobody else sees it; merging a pull request writes to the
+    # default branch, closes the review, and by default deletes the branch that
+    # held the evidence. They deserve different answers, so they are different
+    # settings — and this one defaults to `never` because the user chose
+    # auto-merge-on-green. The *green* half of that is not a setting: it is
+    # enforced in `lunad.vcs.Repo.merge`, whatever this says.
+    #
+    # `git merge` on its own is deliberately not matched: merging a branch into
+    # another locally is ordinary work and gating it would put a toast on the
+    # screen for every rebase-adjacent thing an agent does.
+    ("git_merge", re.compile(
+        r"(?:\bgh\s+pr\s+merge\b|\bgh\s+api\b[^\n]{0,80}/merges?\b)",
+        re.IGNORECASE),
+     "merges a pull request"),
 )
 
 # Classes that no amount of reading the task text can detect: they are decided

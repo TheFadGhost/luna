@@ -60,6 +60,7 @@ write_outside_home = "ask"
 system_config      = "ask"   # /etc, systemd units, hyprland config
 network_send       = "ask"   # posting data off the machine
 git_push           = "ask"
+git_merge          = "never" # merging her own PR; the green-checks gate is in code, not here
 long_job           = "ask"   # anything estimated over `long_job_seconds`
 long_job_seconds   = 300
 spend              = "ask"   # anything with a metered cost over `spend_threshold`
@@ -89,6 +90,20 @@ app_id             = "org.omarchy.luna"
 max_parallel       = 1       # jobs running at once; the rest queue
 job_retention_days = 14      # finished job directories older than this are collected; 0 = never
 requeue_on_start   = true    # queued jobs are picked back up after a restart; running ones are never re-run
+
+# How her work reaches GitHub. Every piece of it goes branch -> commit -> push
+# -> pull request; she never pushes to the default branch, and she merges her
+# own pull request only when CI is green. What "green" means is in
+# `lunad/vcs.py` and is not a setting: all checks concluded successfully, none
+# pending, none missing, not a draft, mergeable. A repository with no CI
+# configured therefore never auto-merges.
+[vcs]
+branch_prefix        = "luna"     # branches are `<prefix>/<topic>-<yymmdd>`
+auto_merge           = true       # attempt the merge once the checks are green
+merge_method         = "squash"   # squash | merge | rebase
+delete_branch        = true       # delete the head branch when the merge lands
+notify_on_refusal    = true       # toast when an auto-merge was refused
+check_wait_seconds   = 900        # how long `luna vcs ship` waits for CI; 0 = do not wait
 
 # The append-only record. Rotation moves bytes, it never drops them:
 # audit.jsonl -> audit.jsonl.1 -> ... -> audit.jsonl.N, oldest deleted last.
@@ -208,9 +223,33 @@ restarting voxtype — so that route creates drift the pane will then show.
 
 ### `[confirm]`, `[confirm.prompt]`
 
-Read by `confirm.ConfirmBroker` on every gate, live. Eight policy classes plus
+Read by `confirm.ConfirmBroker` on every gate, live. Nine policy classes plus
 the prompt's timeout, default and channel. The four hard denies are not in the
 file and the file cannot re-enable them.
+
+`git_merge` is the newest and the only one that defaults to `never`. It is
+separate from `git_push` because the two actions are not comparable: pushing a
+branch is reversible with one command and nobody else sees it, while merging
+writes to the default branch, closes the review and — by default — deletes the
+branch that held the evidence. `never` is what the user chose (auto-merge on
+green); `ask` puts a toast up before each merge; `deny` makes her open the pull
+request and stop. **None of the three can make her merge a pull request that is
+not green** — that gate is in `lunad/vcs.py`, in code, and this file cannot
+reach it.
+
+### `[vcs]`
+
+Read by `vcs.Repo`, live, per operation — a `Repo` is built for each request
+rather than held, so nothing here is ever captured.
+
+| key | read by | effect |
+|---|---|---|
+| `branch_prefix` | `vcs.branch_name`, `vcs.Repo.branch` | Live. Branches are `<prefix>/<topic>-<yymmdd>`. The date is not a random suffix on purpose: a job re-run on the same day lands on the branch it was already using, which is the resume case, instead of leaving a repository full of near-identical abandoned branches. |
+| `auto_merge` | `vcs.Repo.ship` | Live. Off, she branches, commits, pushes and opens the pull request and then stops, and the report says she stopped on purpose. On, she reads the checks and merges **only** if they are green. It is not a way to merge without checks; there is no such way. |
+| `merge_method` | `vcs.Repo.merge` | Live, per merge. Passed to `gh pr merge` as `--squash`, `--merge` or `--rebase`. Anything else is refused before `gh` is reached. |
+| `delete_branch` | `vcs.Repo.merge` | Live. `--delete-branch` on a successful merge. Never on a refused one — a refused merge changes nothing at all. |
+| `notify_on_refusal` | `vcs.Repo.notify_refusal` | Live. A refused auto-merge is the one outcome here that needs a person: a green merge needs nobody, and a pull request that quietly stayed open is one the user finds out about days later. `critical` urgency, carrying the refusal reasons. A missing `omarchy-notification-send` is logged and swallowed — a desktop that cannot toast is not a merge that should have happened. |
+| `check_wait_seconds` | `vcs.Repo.ship` | Live. How long `ship` waits for CI to finish before deciding. Waiting stops early as soon as the verdict can no longer change. **`0` means do not wait, not wait forever**, and it is not an off switch for the gate: a `ship` with `0` refuses anything CI has not finished reporting, which is the safe direction. A pull request whose checks never start costs the full wait and is then refused, deliberately — an unattended merge that gave up waiting and merged anyway is the failure the whole module exists to prevent. |
 
 ### `[memory]`
 

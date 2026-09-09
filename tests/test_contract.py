@@ -875,6 +875,12 @@ class DriftCase(unittest.TestCase):
         ("hud.idle_visible", "HUD_IDLE_VISIBLE"),
         ("hud.caption", "HUD_CAPTION"),
         ("hud.sprite", "HUD_SPRITE"),
+        ("vcs.branch_prefix", "VCS_BRANCH_PREFIX"),
+        ("vcs.auto_merge", "VCS_AUTO_MERGE"),
+        ("vcs.merge_method", "VCS_MERGE_METHOD"),
+        ("vcs.delete_branch", "VCS_DELETE_BRANCH"),
+        ("vcs.notify_on_refusal", "VCS_NOTIFY_ON_REFUSAL"),
+        ("vcs.check_wait_seconds", "VCS_CHECK_WAIT_S"),
     )
 
     #: Sections where *every* key must appear in PAIRS above. A section can

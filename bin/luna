@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import sys
 import uuid
@@ -1473,6 +1474,157 @@ def _ambient_text(amb: dict, style: render.Style) -> str:
 
 
 # =========================================================================
+def cmd_vcs(args: argparse.Namespace) -> int:
+    """The GitHub workflow: branch, commit, push, PR, checks, merge.
+
+    Every call carries this shell's working directory, because `git` is
+    relative to a checkout and the daemon's own cwd is meaningless. The work
+    still happens in the daemon: that is where the confirmation broker with the
+    pending questions lives, and a push approved in a toast has to be
+    answerable with `luna confirm yes`, which talks to the daemon and not to
+    this process.
+
+    Exit codes carry the verdict, so a script can act on it: 0 for done, 3 for
+    "the workflow refused" — a merge that was not green, a `ship` whose pull
+    request is open and unmerged. A refusal is not a crash and must not exit 1
+    alongside the ones that are.
+    """
+    action = args.vcs_cmd
+    payload: dict[str, object] = {"action": action, "cwd": os.getcwd(),
+                                  "actor": "user"}
+    wait = getattr(args, "wait", None)
+    for name in ("topic", "message", "body", "title", "base", "head", "branch",
+                 "number", "method", "on", "labels", "paths", "draft",
+                 "exact"):
+        if hasattr(args, name) and getattr(args, name) not in (None, [], ""):
+            payload[name] = getattr(args, name)
+    if wait is not None:
+        payload["wait"] = float(wait)
+    if getattr(args, "no_merge", False):
+        payload["merge"] = False
+
+    # A merge that waits for CI holds the connection for as long as it waits,
+    # so the client's patience has to exceed the daemon's. Without the margin
+    # the CLI times out mid-merge and reports a failure that did not happen.
+    timeout = 60.0
+    if action in ("checks", "merge"):
+        timeout = float(wait or 0.0) + 120.0
+    elif action == "ship":
+        timeout = (float(wait) + 180.0) if wait is not None else 1200.0
+
+    with Client(timeout=timeout) as client:
+        resp = client.call("vcs", **payload)
+    if args.json:
+        print(json.dumps(resp, indent=2))
+        return 0 if resp.get("ok") else 1
+    if not resp.get("ok"):
+        for line in resp.get("refusals") or []:
+            sys.stderr.write(f"  {S.dim('·')} {line}\n")
+        return fail(resp)
+    print(_vcs_text(action, resp, S))
+    if action in ("checks", "merge"):
+        return 0 if (resp.get("green") or resp.get("merged")) else 3
+    if action == "ship":
+        return 0 if resp.get("merged") else 3
+    return 0
+
+
+def _vcs_text(action: str, resp: dict, style: render.Style) -> str:
+    if action == "status":
+        if not resp.get("available"):
+            return (style.alert("unavailable") + "  "
+                    + style.dim(resp.get("detail", "")))
+        pr = resp.get("pull_request")
+        dirty = resp.get("dirty") or []
+        rows = [
+            ["branch", (style.alert(resp["branch"] + "  (the default branch "
+                                    "— branch before you work)")
+                        if resp["on_default"]
+                        else style.bold(resp["branch"] or "(detached)"))],
+            ["default", resp["default_branch"]],
+            ["head", style.dim(resp["head"])],
+            ["dirty", f"{len(dirty)} path(s)"
+                      + (style.dim("  " + render.join(style, dirty[:6]))
+                         if dirty else "")],
+            ["pull request",
+             (f"{style.bold('#' + str(pr['number']))} {style.dim(pr['url'])}"
+              if pr else style.dim("none open"))],
+        ]
+        out = [style.bold(resp["slug"] or resp["root"])]
+        out.extend("  " + line for line in render.columns(rows, style))
+        return "\n".join(out)
+
+    if action == "branch":
+        return (f"{'created' if resp['created'] else 'switched to'} "
+                + style.bold(resp["branch"]))
+    if action == "commit":
+        out = [f"{style.bold(resp['sha'])} {resp['subject']}",
+               style.dim(f"  {len(resp['files'])} file(s) on "
+                         f"{resp['branch']}")]
+        if resp.get("left_alone"):
+            # The point of naming these is that she did not touch them. A
+            # commit that silently swept them in would print nothing here.
+            out.append(style.dim("  left alone: "
+                                 + ", ".join(resp["left_alone"][:8])))
+        return "\n".join(out)
+    if action == "push":
+        return "pushed " + style.bold(resp["branch"])
+    if action == "pr":
+        return (f"{'opened' if resp['created'] else 'already open'} "
+                f"{style.bold('#' + str(resp['number']))} "
+                + style.dim(resp["url"]))
+    if action == "checks":
+        return _checks_text(resp, style)
+    if action == "merge":
+        return "\n".join([
+            _checks_text(resp.get("checks") or {}, style),
+            f"{style.bold('merged')} #{resp['number']} by {resp['method']}"
+            + (style.dim(" and deleted the branch")
+               if resp["branch_deleted"] else "")])
+    if action == "issue":
+        return (f"opened {style.bold('#' + str(resp['number']))} "
+                + style.dim(resp["url"]))
+    if action == "comment":
+        return resp.get("url") or "commented"
+    if action == "ship":
+        pr = resp["pull_request"]
+        out = [f"{style.bold(resp['commit']['sha'])} "
+               f"{resp['commit']['subject']}",
+               style.dim(f"  branch {resp['branch']['branch']}"),
+               f"  pull request {style.bold('#' + str(pr['number']))} "
+               + style.dim(pr["url"])]
+        if resp.get("checks"):
+            out.append(_checks_text(resp["checks"], style))
+        if resp["merged"]:
+            out.append("  " + style.bold("merged"))
+        else:
+            out.append("  " + style.alert("not merged") + " — "
+                       + resp.get("note", ""))
+        return "\n".join(out)
+    return json.dumps(resp, indent=2)
+
+
+def _checks_text(status: dict, style: render.Style) -> str:
+    """The verdict and every reason for it.
+
+    The reasons are the whole point: "not green" alone tells nobody whether to
+    wait, to look at a failure, or to go and configure CI.
+    """
+    if not status:
+        return ""
+    counts = status.get("counts") or {}
+    green = bool(status.get("green"))
+    head = style.plain("green") if green else style.alert("not green")
+    out = ["  checks " + head + "  "
+           + style.dim(render.join(style, [
+               f"{counts.get('passing', 0)} passing",
+               f"{counts.get('failing', 0)} failing",
+               f"{counts.get('pending', 0)} pending",
+               f"{counts.get('tolerated', 0)} skipped"]))]
+    for line in status.get("refusals") or []:
+        out.extend(render.wrapped(line, style, 6,
+                                  first="    " + style.dim("·") + " "))
+    return "\n".join(out)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1693,6 +1845,85 @@ def build_parser() -> argparse.ArgumentParser:
     amdiag.add_argument("--exe", default="", help="the crashed command's name")
     amdiag.add_argument("--when", default="", help="when it happened")
     am.set_defaults(func=cmd_ambient)
+
+    vc = add(
+        "vcs", help="the GitHub workflow: branch, commit, push, PR, merge",
+        description="Branch, commit with a real message, push, open a pull "
+                    "request, and merge only when CI is green. Never straight "
+                    "to the default branch.")
+    vcsub = vc.add_subparsers(dest="vcs_cmd", required=False)
+
+    def vcsadd(name: str, **kw: object) -> argparse.ArgumentParser:
+        return vcsub.add_parser(name, parents=[common], **kw)  # type: ignore[arg-type]
+
+    vcsadd("status", help="branch, default branch, dirty paths, "
+                          "and any open pull request")
+    vbr = vcsadd("branch", help="create or switch to a branch of her own")
+    vbr.add_argument("topic", help="what the work is about; becomes "
+                                   "luna/<topic>-<yymmdd>")
+    vbr.add_argument("--base", default=None, help="cut it from here instead "
+                                                  "of the current HEAD")
+    vbr.add_argument("--exact", action="store_true",
+                     help="use TOPIC verbatim as the branch name")
+    vcm = vcsadd(
+        "commit", help="stage the named paths and commit them",
+        description="The paths are required. There is no 'commit everything "
+                    "dirty' mode: she may be standing in somebody else's "
+                    "working tree. Pass `.` if all of it really is hers.")
+    vcm.add_argument("paths", nargs="+")
+    vcm.add_argument("-m", "--message", required=True)
+    vcm.add_argument("--body", default="", help="the rest of the message")
+    vps = vcsadd("push", help="push the branch (never the default)")
+    vps.add_argument("--branch", default=None)
+    vpr = vcsadd("pr", help="open a pull request, or show the one "
+                                      "already open for this branch")
+    vpr.add_argument("--title", required=True)
+    vpr.add_argument("--body", required=True,
+                     help="what changed and why — not a restatement of the diff")
+    vpr.add_argument("--base", default=None)
+    vpr.add_argument("--head", default=None)
+    vpr.add_argument("--draft", action="store_true")
+    vck = vcsadd("checks", help="the check status, and every reason "
+                                          "it is not mergeable")
+    vck.add_argument("number", nargs="?", type=int, default=None)
+    vck.add_argument("--wait", type=float, default=None,
+                     help="seconds to wait for CI to finish; 0 = look once")
+    vmg = vcsadd(
+        "merge", help="merge — only if the checks are green",
+        description="Refused, loudly, unless every check has concluded "
+                    "successfully. No checks at all is a refusal too.")
+    vmg.add_argument("number", nargs="?", type=int, default=None)
+    vmg.add_argument("--wait", type=float, default=None)
+    vmg.add_argument("--method", default=None,
+                     choices=("squash", "merge", "rebase"))
+    vis = vcsadd("issue", help="open an issue")
+    vis.add_argument("title")
+    vis.add_argument("--body", default="")
+    vis.add_argument("--label", dest="labels", action="append", default=[])
+    vcc = vcsadd("comment", help="comment on an issue or a PR")
+    vcc.add_argument("number", type=int)
+    vcc.add_argument("body")
+    vcc.add_argument("--on", default="issue", choices=("issue", "pr"))
+    vsh = vcsadd(
+        "ship", help="branch, commit, push, PR, and merge if it is green",
+        description="The whole workflow in one call. A refused merge is not a "
+                    "failure of the rest: the pull request stays open and the "
+                    "reasons are printed.")
+    vsh.add_argument("paths", nargs="+")
+    vsh.add_argument("--topic", required=True)
+    vsh.add_argument("-m", "--message", required=True)
+    vsh.add_argument("--title", default=None)
+    vsh.add_argument("--body", default="",
+                     help="the pull request description; one is generated if "
+                          "you give none, and a generated one is worse")
+    vsh.add_argument("--base", default=None)
+    vsh.add_argument("--draft", action="store_true")
+    vsh.add_argument("--wait", type=float, default=None,
+                     help="seconds to wait for CI; default [vcs] "
+                          "check_wait_seconds")
+    vsh.add_argument("--no-merge", action="store_true",
+                     help="open the pull request and stop")
+    vc.set_defaults(func=cmd_vcs, vcs_cmd="status")
 
     cn = add("cancel", help="cancel an in-flight request")
     cn.add_argument("target", nargs="?", default=None)
