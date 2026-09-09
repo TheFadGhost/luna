@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import Any
 
 from . import config, safety, settings as settings_mod
+from . import hud as hud_mod
 
 log = logging.getLogger("lunad.speech")
 
@@ -483,6 +484,7 @@ class Speech:
         settings: Any = None,
         synth: Any = None,
         on_activity: Any = None,
+        caption: Any = None,
     ) -> None:
         # Kept as *overrides*, not as resolved values: with neither given,
         # `model` and `voice_config` are derived from `[voice] piper_voice`
@@ -504,6 +506,19 @@ class Speech:
         # Best-effort by contract: a raising callback must never break speech,
         # and a slow one would stall playback, so it must return promptly.
         self._on_activity = on_activity
+        # What she says, put on the HUD beside the orb. Constructed here and
+        # not taken as a resolved default, for the same reason `aplay` and
+        # `python` are not: `hud.Caption` reaches
+        # `config.HUD_MESSAGE_FILE`, which `tests/_support.py` redirects
+        # process-wide, and a value bound at import would write a test's
+        # fixture text onto the user's live desktop.
+        #
+        # It cannot fail a reply. Every method on it swallows everything and
+        # complains once per process -- see `hud.Caption` -- so the call sites
+        # below are deliberately bare, with no try/except of their own to
+        # suggest that a caption is a thing that can go wrong here.
+        self._caption = caption if caption is not None else hud_mod.Caption(
+            settings=settings)
 
         self._proc: subprocess.Popen | None = None
         self._stdout: Any = None
@@ -628,7 +643,9 @@ class Speech:
             return {"spoken": "", "sentences": 0, "id": None,
                     "note": "nothing speakable in that text"}
 
-        self.cancel()                       # barge-in: previous utterance stops
+        # barge-in: the previous utterance stops. The caption stays -- the one
+        # written below replaces it in a single `os.replace`.
+        self.cancel(retract=False)
         job = _Job(sentences, spoken, cfg=voice_cfg)
         with self._lock:
             if self._closed:
@@ -636,6 +653,16 @@ class Speech:
             self._job = job
         threading.Thread(target=self._run_job, args=(job,), daemon=True,
                          name=f"luna-speak-{job.id}").start()
+        # One caption per utterance, carrying the *spoken* form -- already
+        # capped by `[voice] max_spoken_chars` and cut at a sentence boundary.
+        # Not one per sentence: the HUD is a glance surface, and a pane that
+        # re-rendered every 260 characters would be a teleprompter.
+        #
+        # After the thread has started, so the file write is never in front of
+        # the first audio frame; before `_notify()`, so the caption and the
+        # `speaking` state the pane reads land in that order rather than the
+        # pane briefly showing her speaking with nothing to show.
+        self._caption.said(spoken)
         self._notify()
         if wait:
             job.done.wait(timeout)
@@ -679,8 +706,17 @@ class Speech:
         except Exception:  # noqa: BLE001 - a watcher must not break speech
             log.exception("speech activity callback failed")
 
-    def cancel(self) -> bool:
+    def cancel(self, *, retract: bool = True) -> bool:
         """Stop speaking now. Safe to call when nothing is speaking.
+
+        ``retract`` is about the HUD caption, not about the audio. Every
+        :meth:`say` opens with a barge-in cancel, and a barge-in that removed
+        the caption would delete the message file microseconds before writing
+        a new one -- which the pane reads as "dismiss", then "show", i.e. a
+        flicker on every single reply. So ``say`` passes ``retract=False`` and
+        lets the next write replace the old message atomically, while every
+        other caller -- ``luna hush``, shutdown -- keeps the default and takes
+        the words off the screen along with the voice.
 
         Barge-in is the most latency-sensitive kill in the daemon, so this
         must never wait behind a piper cold-load: ``self._lock`` is only ever
@@ -709,6 +745,17 @@ class Speech:
             self._kill(loading)
         if speaking:
             self.counters["cancelled"] += 1
+        # `luna hush` is `speak.cancel`, which is this method, so retracting
+        # the caption here is what makes a hush clear the words on screen as
+        # well as the words in the air. Unconditional rather than gated on
+        # `speaking`: an utterance whose audio has finished can still have its
+        # caption up, and that is exactly the one a hush is aimed at.
+        #
+        # It removes only a caption *this* path wrote (`hud.Caption.clear`
+        # passes an owner tag), so hushing her mid-sentence does not also wipe
+        # a crash notice she had nothing to do with.
+        if retract:
+            self._caption.clear()
         self._notify()
         return speaking
 

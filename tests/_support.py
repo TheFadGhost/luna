@@ -168,6 +168,14 @@ FORBIDDEN_OMARCHY_UPDATE_LOG = _AMBIENT_DIR / "omarchy-update.log"
 FORBIDDEN_AMBIENT_STATE = _AMBIENT_DIR / "ambient.json"
 FORBIDDEN_HUD_MESSAGE = _STATE_DIR / "message"
 
+#: The third file in that runtime directory, and the third thing the desktop
+#: reads. `lunad/hud.py` publishes the six `[hud]` keys here for the orb
+#: overlay; against the real path a test would rewrite the running desktop's
+#: overlay settings -- moving the orb into another corner, resizing it, or
+#: switching it off entirely -- with nothing on screen to say a suite did it,
+#: and it would stay that way until the next real settings change.
+FORBIDDEN_HUD_SETTINGS = _STATE_DIR / "hud.json"
+
 FORBIDDEN_COREDUMP_DIR.mkdir(parents=True, exist_ok=True)
 FORBIDDEN_POWER_SUPPLY_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -188,6 +196,7 @@ config.OMARCHY_VERSION_FILE = FORBIDDEN_OMARCHY_VERSION
 config.OMARCHY_UPDATE_LOG = FORBIDDEN_OMARCHY_UPDATE_LOG
 config.AMBIENT_STATE_PATH = FORBIDDEN_AMBIENT_STATE
 config.HUD_MESSAGE_FILE = FORBIDDEN_HUD_MESSAGE
+config.HUD_SETTINGS_FILE = FORBIDDEN_HUD_SETTINGS
 
 
 class FakeHyprland:

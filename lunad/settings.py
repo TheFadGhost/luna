@@ -341,6 +341,49 @@ SCHEMA: tuple[Section, ...] = (
         ),
     ),
     Section(
+        "hud",
+        align=14,
+        header=(
+            "The orb overlay -- the sprite the desktop draws for her, and the "
+            "caption",
+            "beside it. Read by the Quickshell plugin, NOT by lunad: the "
+            "daemon's only",
+            "job here is to project these six keys into "
+            "$XDG_RUNTIME_DIR/luna/hud.json,",
+            "which is a file QML can actually read. See docs/CONFIG-SCHEMA.md "
+            "[hud].",
+        ),
+        keys=(
+            Key("enabled", config.HUD_ENABLED, "bool",
+                comment="false draws nothing and unmasks nothing"),
+            Key("corner", config.HUD_CORNER, "str",
+                choices=config.HUD_CORNERS,
+                comment="top-left | top-right | bottom-left | bottom-right"),
+            Key("scale", config.HUD_SCALE, "float",
+                minimum=config.HUD_SCALE_MIN, maximum=config.HUD_SCALE_MAX,
+                comment="multiplier on the sprite's base size"),
+            # False, so the overlay is a thing that appears when she is doing
+            # something rather than a thing that is always on the screen. The
+            # bar icon is the always-on surface and it already exists; a second
+            # permanent one is clutter until somebody asks for it.
+            Key("idle_visible", config.HUD_IDLE_VISIBLE, "bool",
+                comment="true keeps the sprite on screen while she is idle"),
+            Key("caption", config.HUD_CAPTION, "bool",
+                comment="draw what she says beside the sprite"),
+            Key("sprite", config.HUD_SPRITE, "str",
+                choices=config.HUD_SPRITES,
+                comment="only \"orb\" exists; anything else falls back to it"),
+        ),
+        footer=(
+            "There is no ttl key. How long a caption stays up is the pane's "
+            "own contract",
+            "(HANDOFF-hud.md): the countdown does not even start while she is "
+            "still",
+            "speaking, so a number here would not mean what it looked like it "
+            "meant.",
+        ),
+    ),
+    Section(
         "ui",
         keys=(
             Key("theme_follows_omarchy", True, "bool"),

@@ -27,14 +27,16 @@ from pathlib import Path
 from ._support import (FORBIDDEN_AMBIENT_STATE, FORBIDDEN_APLAY,
                        FORBIDDEN_COREDUMP_DIR, FORBIDDEN_CRASH_TOGGLE_OFF,
                        FORBIDDEN_CRASH_WATCH_UNIT, FORBIDDEN_GRIM,
-                       FORBIDDEN_HUD_MESSAGE, FORBIDDEN_HYPRCTL,
-                       FORBIDDEN_JOBS_DIR, FORBIDDEN_NOTIFIER,
+                       FORBIDDEN_HUD_MESSAGE, FORBIDDEN_HUD_SETTINGS,
+                       FORBIDDEN_HYPRCTL, FORBIDDEN_JOBS_DIR,
+                       FORBIDDEN_NOTIFIER,
                        FORBIDDEN_OMARCHY_UPDATE_LOG, FORBIDDEN_OMARCHY_VERSION,
                        FORBIDDEN_POWER_SUPPLY_DIR, FORBIDDEN_PYTHON,
                        FORBIDDEN_STATE_FILE, FORBIDDEN_TERMINAL, FakeHyprland,
                        TempMemoryCase)
 
-from lunad import ambient, config, confirm, context, dispatch, presence, speech
+from lunad import (ambient, config, confirm, context, dispatch, hud, presence,
+                   speech)
 
 #: Every ``config`` name that reaches the outside world, and what it would do
 #: to the machine running the suite if it were the real thing.
@@ -81,7 +83,7 @@ class LateReadCase(unittest.TestCase):
         (dispatch.Dispatcher.__init__, ("terminal", "notify_bin", "jobs_dir")),
         (dispatch.Hyprland.__init__, ("hyprctl",)),
         (confirm.ConfirmBroker.__init__, ("notify_bin",)),
-        (speech.Speech.__init__, ("aplay", "python")),
+        (speech.Speech.__init__, ("aplay", "python", "caption")),
     )
 
     def test_outward_parameters_default_to_none(self) -> None:
@@ -285,6 +287,45 @@ class AmbientPathCase(TempMemoryCase):
         self.addCleanup(amb.close)
         self.assertEqual(amb.tick(now=0.0), 0)
         self.assertEqual(amb.tick(now=10_000.0), 0)
+
+
+class HudSettingsFileCase(TempMemoryCase):
+    """The overlay's settings file is not the user's either.
+
+    `$XDG_RUNTIME_DIR/luna/hud.json` is the third file in that directory and
+    the newest, and it is the one with the most visible failure mode: it is
+    not a state a widget displays, it is the *configuration* the orb overlay
+    draws itself from. A test that wrote the real one would move the orb into
+    a different corner of the live desktop, resize it, or switch it off -- and
+    unlike a stale `state` word, nothing would correct it until the user next
+    changed a setting.
+
+    Same shape as `PresenceFileCase`, one file along, and the same fix: the
+    path is redirected process-wide and read late in the constructor body.
+    """
+
+    def test_the_settings_file_is_redirected(self) -> None:
+        self.assertEqual(config.HUD_SETTINGS_FILE, FORBIDDEN_HUD_SETTINGS)
+        self.assertNotIn("/run/user", str(config.HUD_SETTINGS_FILE))
+        self.assertFalse(str(config.HUD_SETTINGS_FILE).startswith(
+            str(Path.home())))
+
+    def test_the_publisher_reads_the_path_late(self) -> None:
+        params = inspect.signature(hud.HudSettings.__init__).parameters
+        self.assertIsNone(params["path"].default)
+        self.assertEqual(hud.HudSettings().path, FORBIDDEN_HUD_SETTINGS)
+
+    def test_the_caption_writes_through_the_redirected_message_file(self) -> None:
+        # `hud.Caption` holds no path of its own -- it borrows the shared
+        # `ambient.HudWriter`, which is already covered above. This asserts
+        # the borrowing, so a later edit that gives Caption its own writer
+        # cannot quietly acquire an un-redirected path with it.
+        self.assertEqual(hud.Caption().writer.path, FORBIDDEN_HUD_MESSAGE)
+
+    def test_a_default_speech_captions_nowhere_near_the_real_pane(self) -> None:
+        s = speech.Speech(settings=self.settings)
+        self.addCleanup(s.close)
+        self.assertEqual(s._caption.writer.path, FORBIDDEN_HUD_MESSAGE)
 
 
 class LiveFireCase(TempMemoryCase):

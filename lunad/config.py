@@ -67,6 +67,19 @@ STATE_FILE = RUNTIME_DIR / "state"
 # nothing polls and an absent file simply means there is nothing to show.
 HUD_MESSAGE_FILE = RUNTIME_DIR / "message"
 
+# The HUD overlay's *settings*, the third and last file in that directory. One
+# JSON object, written atomically by `lunad/hud.py` on start and on every
+# config reload, removed on shutdown. The orb plugin reads it through the same
+# inotify-backed FileView it uses for the other two.
+#
+# It exists because the overlay is drawn by QML that cannot read
+# ~/.config/jarvis/config.toml: Quickshell has no TOML parser, the file is 0600
+# in a 0700 directory, and a second reader of the user's config would be a
+# second thing to keep in step with the schema. So lunad projects the six
+# `[hud]` keys -- and nothing else -- into a file shaped for the overlay, and
+# the overlay never learns that a config file exists.
+HUD_SETTINGS_FILE = RUNTIME_DIR / "hud.json"
+
 OMARCHY_DEFAULT_AGENT = HOME / ".config" / "omarchy" / "defaults" / "agent"
 
 # --- Jarvis: the app's own configuration home ------------------------------
@@ -424,6 +437,59 @@ AMBIENT_CRASH_BURST = 3               # more than this in one tick coalesces
 AMBIENT_RECENT_DUMPS = 64             # dump names remembered for de-duplication
 AMBIENT_HUD_TTL_S = 12.0              # seconds an ambient caption stays up
 AMBIENT_DIAGNOSE_TIMEOUT_S = 900.0    # ceiling on a dispatched crash diagnosis
+
+# --- The HUD overlay ------------------------------------------------------
+#
+# Fallback defaults for the six `[hud]` keys, and the two tuples that say what
+# a string key is allowed to be. Every one of these is paired with its schema
+# default in `tests/test_contract.py::DriftCase`, which is the test that exists
+# because a default and its constant have silently disagreed twice.
+#
+# These are what the *publisher* falls back to, not what the overlay does. The
+# overlay has its own copy of the same six defaults and uses them when the file
+# is absent, which is the normal state on a machine whose daemon is not
+# running -- an absent hud.json must never be an error state on screen.
+
+HUD_ENABLED = True
+HUD_CORNER = "bottom-right"
+HUD_CORNERS = ("top-left", "top-right", "bottom-left", "bottom-right")
+#: Clamped, not merely validated: the schema already refuses a value outside
+#: this range, but the publisher is the last thing between a hand-edited
+#: config file and a sprite drawn ten screens wide.
+HUD_SCALE = 1.0
+HUD_SCALE_MIN = 0.5
+HUD_SCALE_MAX = 3.0
+HUD_IDLE_VISIBLE = False
+HUD_CAPTION = True
+#: Only "orb" exists. The key is here so a second sprite does not need a
+#: schema change to be selectable; anything unrecognised reads as "orb".
+HUD_SPRITE = "orb"
+HUD_SPRITES = ("orb",)
+
+#: How long a spoken caption stays up once she has stopped talking. NOT a
+#: setting: the pane's own contract (HANDOFF-hud.md) says the ttl countdown
+#: does not start while `state` reads `speaking`, so this is reading time
+#: after the last sentence and not a cap on the utterance. Shorter than
+#: AMBIENT_HUD_TTL_S because a caption of something she just said aloud has
+#: already been delivered once, by voice.
+SPEECH_HUD_TTL_S = 8.0
+
+#: Who put the message currently on `HUD_MESSAGE_FILE` there. Two paths write
+#: that one file -- an ambient event, and a spoken reply -- and each may
+#: retract only its own: a `luna hush` mid-answer must not wipe a crash
+#: notice, and lunad shutting down must not wipe a caption the speech path had
+#: just put up. `ambient.HudWriter` carries the tag; it never reaches the file
+#: and the pane has never heard of it.
+#:
+#: They live *here*, rather than beside the writer that uses them, for a
+#: reason that looks pedantic and is not:
+#: `tests/test_ambient.py::NeverSpeaksCase` reads the shipped source of
+#: `lunad/ambient.py` and fails if the word `speech` appears in its code at
+#: all. That guard is the whole of "an ambient event never speaks", it is
+#: worth more than the convenience of a constant in the obvious place, and
+#: naming the tag in `config` keeps both.
+HUD_OWNER_AMBIENT = "ambient"
+HUD_OWNER_SPEECH = "speech"
 
 
 def ensure_dirs() -> None:

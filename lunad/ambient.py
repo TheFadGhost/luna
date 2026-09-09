@@ -169,6 +169,13 @@ SOURCES = (CRASH, BATTERY, UPDATE)
 #: Urgency levels `omarchy-notification-send` understands.
 LOW, NORMAL, CRITICAL = "low", "normal", "critical"
 
+#: Which path put the message currently on the HUD there. Defined in `config`
+#: and not here, because `tests/test_ambient.py::NeverSpeaksCase` reads this
+#: file's source and fails if the *other* tag's name appears in it -- which is
+#: the guard that makes "an ambient event never speaks" a fact about the file
+#: rather than a promise in a docstring. See `config.HUD_OWNER_AMBIENT`.
+AMBIENT_OWNER = config.HUD_OWNER_AMBIENT
+
 
 class AmbientChannelError(RuntimeError):
     """An ambient event was pointed at a channel it is not allowed to use.
@@ -230,10 +237,12 @@ class HudWriter:
     ``id`` that is what makes a message *new* to the reader.
 
     The counter is process-wide on purpose, and this class is deliberately not
-    ambient-specific: when the speech path grows captions it must share this
-    writer rather than start a second ``id`` sequence, or two writers will hand
-    the pane the same id for different sentences and one of them will never be
-    shown. :func:`hud` is the shared instance.
+    ambient-specific: the speech path shares this writer rather than starting a
+    second ``id`` sequence, since two writers would hand the pane the same id
+    for different sentences and one of them would never be shown.
+    :func:`hud` is the shared instance and ``lunad/hud.py::Caption`` is the
+    other user of it; ``owner`` on :meth:`write` and :meth:`clear` is what
+    keeps the two from retracting each other's messages.
 
     Best-effort throughout. The pane may not be running, the runtime directory
     may be gone, and neither is a reason for an event not to reach the toast.
@@ -247,12 +256,21 @@ class HudWriter:
         self._tmp = self.path.with_name(self.path.name + ".tmp")
         self._lock = threading.Lock()
         self._id = 0
-        self._mine = False
+        #: Which path wrote what is on disk now, or None for "nothing of ours
+        #: is up". See AMBIENT_OWNER.
+        self._owner: str | None = None
         self._complained = False
 
     def write(self, text: str, *, kind: str = "say",
-              ttl: float | None = None) -> bool:
-        """Publish one message. Returns whether it reached disk."""
+              ttl: float | None = None,
+              owner: str = AMBIENT_OWNER) -> bool:
+        """Publish one message. Returns whether it reached disk.
+
+        ``owner`` records which path put it there so that :meth:`clear` can
+        retract one path's message without wiping the other's -- it never
+        reaches the file, and the pane has never heard of it. The tags are
+        `config.HUD_OWNER_*`.
+        """
         text = (text or "").strip()
         if not text:
             return False
@@ -270,20 +288,30 @@ class HudWriter:
             except OSError as exc:
                 self._complain("could not write the HUD message", exc)
                 return False
-            self._mine = True
+            self._owner = owner
             return True
 
-    def clear(self, *, only_mine: bool = False) -> bool:
+    def clear(self, *, only: str | None = None) -> bool:
         """Remove the file, which dismisses whatever the pane is showing.
 
-        ``only_mine`` exists for shutdown: ambient must not wipe a caption the
-        speech path put there, so it retracts a message only when the last
-        write to the file was its own.
+        ``only`` is an owner tag (``config.HUD_OWNER_*``) and is how the two
+        writers stay out of each other's way: given one, the message is
+        retracted **only** if that path is what put it there.
+
+        It was a bare ``only_mine`` boolean while ambient was the only writer,
+        and the docstring already promised what a boolean could not deliver --
+        "ambient must not wipe a caption the speech path put there". With a
+        second writer sharing the file, ``_mine`` was true for both of them and
+        every clear was a clear of whatever happened to be up. The tag is that
+        promise, kept.
+
+        ``None`` still means "remove it whoever wrote it", which is what a
+        caller that owns the whole surface wants.
         """
         with self._lock:
-            if only_mine and not self._mine:
+            if only is not None and self._owner != only:
                 return False
-            self._mine = False
+            self._owner = None
             try:
                 self.path.unlink()
             except FileNotFoundError:
@@ -408,10 +436,11 @@ class Notifier:
         """
         text = f"{event.headline} — {event.body}" if event.body else event.headline
         return self.hud_writer.write(text, kind="alert",
-                                     ttl=config.AMBIENT_HUD_TTL_S)
+                                     ttl=config.AMBIENT_HUD_TTL_S,
+                                     owner=AMBIENT_OWNER)
 
     def clear_pane(self) -> bool:
-        return self.hud_writer.clear(only_mine=True)
+        return self.hud_writer.clear(only=AMBIENT_OWNER)
 
 
 # =========================================================================

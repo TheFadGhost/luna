@@ -719,9 +719,32 @@ class DeliveryCase(AmbientCase):
 
     def test_removing_the_message_dismisses_it_but_only_if_it_was_ours(self) -> None:
         writer = ambient.HudWriter(self.root / "message")
-        self.assertFalse(writer.clear(only_mine=True))
+        self.assertFalse(writer.clear(only=config.HUD_OWNER_AMBIENT))
         writer.write("mine")
-        self.assertTrue(writer.clear(only_mine=True))
+        self.assertTrue(writer.clear(only=config.HUD_OWNER_AMBIENT))
+        self.assertFalse((self.root / "message").exists())
+
+    def test_one_writer_never_retracts_the_other_paths_message(self) -> None:
+        """The reason the ownership tag is a string and not a boolean.
+
+        Two paths share this file: an ambient event and a spoken caption. Each
+        may retract only what it put there -- a `luna hush` must not wipe a
+        crash notice, and lunad's shutdown must not wipe a caption the speech
+        path had just put up. While ownership was a bare `_mine` boolean both
+        were true for the shared writer and either clear took whatever was on
+        screen.
+        """
+        writer = ambient.HudWriter(self.root / "message")
+        writer.write("a crash", owner=config.HUD_OWNER_AMBIENT)
+        self.assertFalse(writer.clear(only=config.HUD_OWNER_SPEECH))
+        self.assertTrue((self.root / "message").exists())
+
+        writer.write("something she said", owner=config.HUD_OWNER_SPEECH)
+        self.assertFalse(writer.clear(only=config.HUD_OWNER_AMBIENT))
+        self.assertTrue((self.root / "message").exists())
+
+        # No tag at all still means "remove it, whoever wrote it".
+        self.assertTrue(writer.clear())
         self.assertFalse((self.root / "message").exists())
 
     def test_an_unwritable_hud_path_costs_a_caption_not_the_event(self) -> None:

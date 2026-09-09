@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import (__version__, agent, ambient as ambient_mod, audit as audit_mod,
+               hud as hud_mod,
                config, confirm, consolidate, context as context_mod, dispatch,
                log as luna_log, persona, presence as presence_mod, protocol,
                safety, session as sessions, settings as settings_mod, speech)
@@ -157,6 +158,11 @@ class Daemon:
         # it: it publishes `idle`/`thinking`/`speaking` to the file the bar
         # widget watches.
         self.presence = presence_mod.Presence()
+        # The overlay's settings, published beside `state` in the same tmpfs
+        # directory. Built before Speech because Speech captions into the
+        # third file there, and the surface should know how it is meant to be
+        # drawn before anything is drawn on it.
+        self.hud = hud_mod.HudSettings(settings=self.settings)
         self.speech = speech.Speech(settings=self.settings,
                                     on_activity=self._publish_state)
         # The consolidation pass. `adapter` is a callable and not the adapter
@@ -185,6 +191,11 @@ class Daemon:
             extra={"agent": self.agent_name, "version": __version__},
         )
         self._publish_state()
+        # The overlay reads an absent hud.json as "every default", so this is
+        # not required for it to work -- it is required for it to be *right*,
+        # and a user who set `corner = "top-left"` should not have to change a
+        # setting again to make the daemon notice.
+        self.hud.publish()
         self.audit.append("daemon.started", ok=True, agent=self.agent_name,
                           version=__version__,
                           why="lunad came up",
@@ -227,6 +238,13 @@ class Daemon:
         work sits there until something else moves and the setting looks inert.
         """
         keys = {c["key"] for c in changes}
+        # Unconditional, and deliberately not gated on a `hud.` prefix.
+        # `publish()` compares against what it last wrote and does nothing when
+        # nothing moved, so the gate would buy no syscalls and would be one
+        # more place to forget a key -- which is how a settings app comes to
+        # lie. The cheap correct thing is to offer every reload and let the
+        # publisher decide.
+        self.hud.publish()
         self.audit.append("settings.reloaded", ok=True,
                           why="config.toml changed on disk",
                           changed=[f"{c['key']}: {c['from']!r} -> {c['to']!r}"
@@ -1175,10 +1193,17 @@ class Daemon:
         # First, so the bar stops claiming she is here while the rest of the
         # shutdown (cancelling runs, draining speech) takes its time.
         self.presence.clear()
-        # Early, next to presence and for the same reason: the two files the
+        # Early, next to presence and for the same reason: the three files the
         # desktop reads should stop claiming things before the slow half of the
         # shutdown starts. `close()` also retracts an ambient caption from the
         # HUD, but only one ambient put there.
+        #
+        # `hud.json` goes too. `lunad.service.d/20-presence.conf` removes all
+        # three in `ExecStopPost` for the crash case; this is the clean one,
+        # and both have to exist -- systemd cannot clean up after a daemon
+        # that is still running, and a daemon that was SIGKILLed cannot clean
+        # up after itself.
+        self.hud.clear()
         self.ambient.close()
         self.settings.stop_watching()
         # Before the memory it writes into is closed, and bounded so a wedged

@@ -31,6 +31,7 @@ PANES = (
     ("listen", "Listening"),
     ("confirm", "Confirmations"),
     ("ambient", "Ambient"),
+    ("hud", "Overlay"),
     ("memory", "Memory"),
     ("jobs", "Jobs"),
     ("about", "About"),
@@ -289,6 +290,8 @@ class JarvisApp(Gtk.Application):
             return panes.confirm_pane(b)
         if key == "ambient":
             return panes.ambient_pane(b)
+        if key == "hud":
+            return panes.hud_pane(b)
         if key == "memory":
             return panes.memory_pane(b, self.win)
         if key == "jobs":

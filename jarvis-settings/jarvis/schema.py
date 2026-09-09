@@ -319,6 +319,45 @@ SPEC: tuple[Section, ...] = (
         ),
     ),
     Section(
+        key="hud", title="Overlay", pane="hud",
+        doc="The orb the desktop draws for her, and the caption beside it. "
+            "Drawn by a Quickshell plugin, not by lunad — these six keys "
+            "are published to a file it reads.",
+        fields=(
+            Toggle("enabled", "Draw the overlay",
+                   "Off, nothing is drawn and nothing is clickable — the "
+                   "overlay is a click-through layer, so off means it is not "
+                   "there rather than there and invisible.",
+                   default=True),
+            Choice("corner", "Corner",
+                   "Which corner of the screen the sprite sits in.",
+                   default="bottom-right",
+                   options=("top-left", "top-right", "bottom-left",
+                            "bottom-right")),
+            # A Real, and a spin button, exactly like [voice] speed — the
+            # other multiplier in this app. There is no slider widget in
+            # jarvis/widgets.py and inventing one for a single row would be a
+            # second control kind to keep themed for no gain.
+            #
+            # 0.5–3.0 matches the daemon's clamp, so the GUI refuses out of
+            # range rather than writing a value that is silently pulled back.
+            Real("scale", "Size", "A multiplier on the sprite's base size.",
+                 default=1.0, min=0.5, max=3.0, step=0.1, digits=2, unit="x"),
+            Toggle("idle_visible", "Keep it on screen while she is idle",
+                   "Off, it appears when she starts listening, thinking or "
+                   "speaking, and fades out after. The bar icon is the "
+                   "always-on surface.",
+                   default=False),
+            Toggle("caption", "Show what she says beside it",
+                   "The spoken form of a reply, one message per answer. A "
+                   "`luna hush` takes it off the screen.",
+                   default=True),
+            Choice("sprite", "Sprite",
+                   "Reserved. Only the orb exists so far.",
+                   default="orb", options=("orb",)),
+        ),
+    ),
+    Section(
         key="ui", title="Interface", pane="about",
         fields=(
             Toggle("theme_follows_omarchy", "Follow the Omarchy theme",
