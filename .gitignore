@@ -20,3 +20,8 @@ secrets*
 *.onnx
 models/
 vocab.txt
+
+# Agent tooling state, not source. Claude Code (and similar agent CLIs) drop
+# a per-checkout worktree/settings directory here; it holds local session
+# state, not anything the repo should ship or review.
+.claude/
