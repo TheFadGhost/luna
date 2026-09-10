@@ -1807,6 +1807,138 @@ class Memory:
             )
         return "### Possibly relevant past exchanges\n" + "\n".join(lines)
 
+    def bridge_block(self, limit: int | None = None,
+                     exclude: Iterable[int] = ()) -> str:
+        """The last few exchanges verbatim, for the first turn of a new thread.
+
+        Not a search and deliberately not scored: this is the one place in the
+        recall path where *recency alone* is the relevance criterion. It exists
+        for a single moment — the turn after a live conversation's session was
+        retired (a tier-1 write, the turn cap, the token budget, a refused
+        resume) and the replacement thread has never heard of anything.
+
+        Tier 1 and tier 2 both survive that rollover, because both are rebuilt
+        into every prompt. What does not survive is the part of a conversation
+        that lives in no store at all: "the second one", "do that again",
+        "why?". :meth:`recall_block` cannot recover it, because a pronoun
+        matches nothing — the antecedent is in the turn before, not in the
+        query. So this block is keyed on when, not on what.
+
+        ``exclude`` drops episodes already rendered by :meth:`recall_block`
+        for the same turn, so a rollover costs a handful of lines rather than
+        printing the same exchange twice under two different headings.
+
+        Returns "" when there is nothing to bridge to, and never raises for a
+        reason the caller has to care about — a rollover with no bridge is the
+        behaviour that exists today, and it is not worth failing an ask over.
+        """
+        limit = config.SESSION_BRIDGE_EPISODES if limit is None else limit
+        if limit <= 0:
+            return ""
+        seen = {int(i) for i in exclude}
+        try:
+            episodes = self.episodes.recent(limit=limit + len(seen))
+        except (MemoryError, sqlite3.Error):
+            return ""
+        kept = [ep for ep in episodes if ep.id not in seen][:limit]
+        if not kept:
+            return ""
+        lines = []
+        # Oldest first: read as a narrative, the way `since()` is, so that a
+        # question and the answer that followed it arrive in that order.
+        for ep in reversed(kept):
+            user = _clip(ep.user_text.strip().replace("\n", " "), 240)
+            luna = _clip(ep.luna_text.strip().replace("\n", " "), 240)
+            lines.append(f"- user: {user}\n  luna: {luna}")
+        return ("### The last few exchanges, immediately before this one\n"
+                + "\n".join(lines))
+
+    def fit_tier1(self, handle: Tier1File, entries: Sequence[str],
+                  protect: int = 0) -> dict[str, Any]:
+        """Write *entries* into *handle*, evicting the oldest to make room.
+
+        The plain :meth:`Tier1File.replace` refuses an oversized write outright
+        and that is correct for a human or an RPC caller: somebody asked for
+        something that does not fit and deserves to be told so.
+
+        It is *not* correct for the consolidation pass, which is the only
+        writer nobody is watching. A full LUNA.md means every pass proposes
+        four entries, every pass is refused, and Luna silently stops learning
+        anything new for the rest of the machine's life — with the only
+        evidence a log line and an `over_cap` counter. That failure is quiet,
+        permanent and indistinguishable from having nothing to learn.
+
+        So: tier 1 is a *bounded window over* curated memory rather than a
+        bucket that fills up once. The oldest entries are evicted, in order,
+        until the write fits. Nothing is destroyed — each evicted entry is
+        written into tier 2 first, at full salience, so it stays searchable
+        and recallable; it stops being *always* in the prompt, which is the
+        only thing the cap ever bought.
+
+        ``protect`` guards that many entries at the **end** of *entries* from
+        eviction: they are what this write is trying to add, and evicting them
+        to fit them would be a loop with a straight face. If the protected
+        tail alone still will not fit, :class:`MemoryCapExceeded` is raised
+        exactly as :meth:`Tier1File.replace` would — an entry longer than the
+        whole cap is a genuine refusal, not a lack of room.
+
+        Returns ``{"usage": ..., "evicted": [...], "lost": [...]}``.
+        ``lost`` is the subset of ``evicted`` whose write into tier 2 failed —
+        text that really is gone. It is returned rather than logged because
+        this module keeps no logger of its own, and because "a fact was
+        destroyed" is a fact about the *pass*, which its caller audits.
+        """
+        remaining = list(entries)
+        protect = max(0, min(int(protect), len(remaining)))
+        evicted: list[str] = []
+        lost: list[str] = []
+        while True:
+            try:
+                usage = handle.replace(remaining)
+            except MemoryCapExceeded:
+                if len(remaining) <= protect:
+                    # Nothing left that may be evicted. Put back what was
+                    # taken? No: the evictions already landed in tier 2 and
+                    # the file was never written, so the store is consistent
+                    # and the entries are recoverable. Raising is the honest
+                    # answer to "this does not fit at any size".
+                    raise
+                oldest = remaining.pop(0)
+                if not self._spill(handle, oldest):
+                    lost.append(oldest)
+                evicted.append(oldest)
+                continue
+            return {"usage": usage, "evicted": evicted, "lost": lost}
+
+    def _spill(self, handle: Tier1File, entry: str) -> bool:
+        """Move one retired tier-1 entry down into tier 2. False if it failed.
+
+        At salience 1.0 and not at whatever ``score_salience`` would make of
+        it: this text was promoted into curated memory by a consolidation
+        pass that judged it worth keeping forever, and re-scoring it as if it
+        were an overheard remark would throw that judgement away at the exact
+        moment it is being relied on. Decay still applies on read, so an
+        evicted entry fades like anything else — just from the top.
+
+        The framing goes in ``user_text`` and the fact in ``luna_text`` so
+        that a later search matches on the fact's own words; both columns are
+        in the FTS index.
+
+        A failure returns False rather than raising: the alternative is that a
+        full tier 1 becomes an *unwritable* tier 1, which is the failure this
+        whole method exists to prevent. The caller is told, and says so.
+        """
+        try:
+            self.episodes.record(
+                f"Retired note from {handle.name}",
+                entry,
+                surface="tier1-eviction",
+                salience=1.0,
+            )
+        except Exception:  # noqa: BLE001 - see the docstring
+            return False
+        return True
+
     def usage(self) -> dict[str, Any]:
         return {
             "tier1": {"LUNA.md": self.luna.usage(), "USER.md": self.user.usage()},

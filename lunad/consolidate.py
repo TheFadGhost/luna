@@ -378,6 +378,12 @@ class Consolidator:
         self.added = 0
         self.removed = 0
         self.over_cap = 0
+        # Entries pushed out of tier 1 to make room for newer ones. Counted
+        # separately from `removed`, which is the model deciding a note is
+        # wrong or spent; an eviction is the *cap* deciding, the entry is
+        # still true, and it is still in tier 2. Conflating the two would
+        # make an honest "she is at capacity" look like curation.
+        self.evicted = 0
         self.cost_usd = 0.0
         self.last_run = 0.0
         self.last_note = ""
@@ -700,12 +706,14 @@ class Consolidator:
         adds = sum(len(v["added"]) for v in applied.values())
         drops = sum(len(v["removed"]) for v in applied.values())
         over = [name for name, v in applied.items() if v.get("over_cap")]
+        evicted = sum(len(v.get("evicted") or ()) for v in applied.values())
         usage = reply.usage or {}
         with self._lock:
             self.passes += 1
             self.added += adds
             self.removed += drops
             self.over_cap += len(over)
+            self.evicted += evicted
             if reply.cost_usd:
                 self.cost_usd += reply.cost_usd
             if note:
@@ -720,7 +728,7 @@ class Consolidator:
                         "episodes": len(episodes), "through_id": through_id,
                         "parsed": parsed, "retried": retried,
                         "gave_up": gave_up, "added": adds, "removed": drops,
-                        "over_cap": over,
+                        "over_cap": over, "evicted": evicted,
                         "input_tokens": usage.get("input_tokens"),
                         "output_tokens": usage.get("output_tokens"),
                         "note": note})
@@ -736,13 +744,14 @@ class Consolidator:
         self._audit(parsed,
                     why=why_note,
                     manual=manual, episodes=len(episodes), added=adds,
-                    removed=drops, over_cap=over, cost_usd=reply.cost_usd,
+                    removed=drops, over_cap=over, evicted=evicted,
+                    cost_usd=reply.cost_usd,
                     through_id=through_id, files=applied)
         return {"ran": True, "parsed": parsed, "retried": retried,
                 "gave_up": gave_up, "retry_count": retry_count,
                 "episodes": len(episodes),
                 "through_id": through_id, "added": adds, "removed": drops,
-                "over_cap": over, "cost_usd": reply.cost_usd,
+                "over_cap": over, "evicted": evicted, "cost_usd": reply.cost_usd,
                 "wall_ms": wall_ms, "note": note, "files": applied}
 
     def preview(self, why: str = "luna memory consolidate --dry-run"
@@ -880,15 +889,46 @@ class Consolidator:
             try:
                 record["usage"] = handle.replace(proposed)
             except MemoryCapExceeded as exc:
-                # A normal outcome, not a fault. The file is untouched, the
-                # overflow is recorded with everything needed to act on it,
-                # and the next pass sees the same episodes plus whatever has
-                # happened since.
-                record["over_cap"] = exc.to_dict()
-                record["added"], record["removed"] = [], []
-                log.info("consolidation proposal did not fit",
-                         extra={"file": handle.name, "overflow": exc.overflow,
-                                "cap": exc.cap, "proposed": exc.proposed_chars})
+                # Not a fault, but not a place to stop either. This is the
+                # only writer nobody is watching: refusing here means that
+                # once tier 1 is full, every pass proposes, every pass is
+                # refused, and Luna silently stops learning — permanently,
+                # with a log line for evidence. So the file is re-fitted
+                # instead: the oldest entries are evicted into tier 2, where
+                # they stay searchable, until this pass's additions fit.
+                # `protect=len(adds)` keeps the pass from evicting the very
+                # entries it is trying to write. See `Memory.fit_tier1`.
+                try:
+                    fitted = self.memory.fit_tier1(handle, proposed,
+                                                   protect=len(adds))
+                except MemoryCapExceeded as hard:
+                    # Even the additions alone will not fit — an entry longer
+                    # than the whole cap. That is a genuine refusal and the
+                    # old behaviour is the right one.
+                    record["over_cap"] = hard.to_dict()
+                    record["added"], record["removed"] = [], []
+                    log.info("consolidation proposal did not fit at any size",
+                             extra={"file": handle.name,
+                                    "overflow": hard.overflow, "cap": hard.cap,
+                                    "proposed": hard.proposed_chars})
+                else:
+                    record["usage"] = fitted["usage"]
+                    record["evicted"] = fitted["evicted"]
+                    log.info("consolidation made room in tier 1",
+                             extra={"file": handle.name,
+                                    "evicted": len(fitted["evicted"]),
+                                    "was_over_by": exc.overflow})
+                    if fitted["lost"]:
+                        # An eviction whose tier-2 write failed is the one
+                        # outcome here that really does destroy text. It is
+                        # rare (a broken episode store) and it is the reason
+                        # the evicted text is carried into the record: as with
+                        # `removed` above, the audit log is then the only copy.
+                        record["lost"] = fitted["lost"]
+                        log.warning("a tier-1 entry was evicted and could not "
+                                    "be saved into tier 2",
+                                    extra={"file": handle.name,
+                                           "lost": len(fitted["lost"])})
             except LunaMemoryError as exc:
                 record["error"] = str(exc)
                 record["added"], record["removed"] = [], []
@@ -926,6 +966,7 @@ class Consolidator:
                 "added": self.added,
                 "removed": self.removed,
                 "over_cap": self.over_cap,
+                "evicted": self.evicted,
                 "cost_usd": round(self.cost_usd, 6),
                 "note": self.last_note,
                 "through_id": _as_int(

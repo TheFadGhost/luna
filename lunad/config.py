@@ -501,6 +501,29 @@ SESSION_IDLE_S = 1800.0                            # 30 min without a turn
 SESSION_MAX_TURNS = 60                             # then start clean
 DEFAULT_CONVERSATION = "default"
 
+# The history ceiling, in input tokens as the agent reports them on
+# `turn.completed`. Deliberately not a `[memory]` setting: like the two
+# constants above it is a property of the *agent's* limits rather than a
+# preference, and a wrong value here is a broken conversation rather than a
+# taste someone disagrees with.
+#
+# Measured on this machine against `gpt-5.6-luna` (docs/_context-notes.md):
+# the model advertises a 272,000-token context window, and a resumed thread
+# driven to 283,135 input tokens still answered normally — so the advertised
+# figure is a soft one and 240,000 sits comfortably below both. `codex exec`
+# exposes none of the `notes`/`new_context` tools that let the model checkpoint
+# itself when a window fills, so past the real wall there is nothing but a
+# failed turn. 0 disables the check.
+SESSION_TOKEN_BUDGET = 240_000
+
+# How many recent exchanges are replayed into the first turn of a session that
+# replaced a live one. Four is two or three questions' worth of "the second
+# one" / "do that again" — enough to keep the pronouns pointing at something.
+# Each side is clipped to 240 characters, so the block is at most ~2,000
+# characters and lands on one turn in sixty; `_latency-notes.md` §3 measured
+# prompt size as not a latency lever at all, so it is not worth trimming.
+SESSION_BRIDGE_EPISODES = 4
+
 # --- Logging --------------------------------------------------------------
 
 LOG_MAX_BYTES = 1_048_576

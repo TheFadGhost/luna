@@ -368,14 +368,46 @@ def build_dispatch_system_prompt(to: str = "worker", spec: str | None = None,
     return "\n\n".join(p.strip() for p in parts if p.strip()) + "\n"
 
 
+def bridge_section(bridge_block: str) -> str:
+    """The rendered "what we were just saying" section, or "".
+
+    Its own function because it is composed in two places: normally by
+    :func:`build_user_message` at the top of an ask, and again by the
+    resume-refused retry in ``server.py``, which has to add it to a message
+    that was already built before anyone knew the thread was gone.
+    """
+    body = bridge_block.strip()
+    if not body:
+        return ""
+    return (
+        "## Where this conversation had got to\n\n" + body
+        + "\n\nThis is your own conversation, continued. Treat it as "
+          "something you remember rather than something you were just "
+          "handed: answer as if it had never been interrupted, and do not "
+          "mention this block, a reset, or anything about your memory "
+          "unless the user asks."
+    )
+
+
 def build_user_message(prompt: str, recall_block: str = "",
-                       surface: str = "cli", context_line: str = "") -> str:
+                       surface: str = "cli", context_line: str = "",
+                       bridge_block: str = "") -> str:
     """Wrap the user's message with anything retrieved for *this* turn.
 
     Recall goes first and the question last, so the model reads the context
     before the request rather than having to hold the request in mind while it
     reads. The surface is named because a spoken answer has to be shorter than
     a typed one and Luna has no other way to know which she is giving.
+
+    ``bridge_block`` is the last few exchanges verbatim, and it appears on
+    exactly one turn: the first turn of a conversation whose session was
+    retired out from under it. It sits *after* recall and immediately before
+    the question, because it is the most local context there is — recall is
+    "something like this came up once", the bridge is "this is what we were
+    saying ten seconds ago". It carries an instruction not to remark on it:
+    a rollover the user has to notice is a failed rollover, and "as I was
+    saying before my context reset" is exactly the seam this exists to hide.
+    See :meth:`lunad.memory.Memory.bridge_block`.
 
     ``context_line`` is what the desktop looks like at this instant — see
     :mod:`lunad.context`. It belongs *here* and nowhere else. It changes every
@@ -388,6 +420,8 @@ def build_user_message(prompt: str, recall_block: str = "",
     if recall_block.strip():
         parts.append("## Recalled context (tier 2, retrieved for this message)\n\n"
                      + recall_block.strip())
+    if bridge_block.strip():
+        parts.append(bridge_section(bridge_block))
     if context_line.strip():
         parts.append("## The desktop right now\n\n" + context_line.strip())
     if surface == "voice":

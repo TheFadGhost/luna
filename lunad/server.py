@@ -393,6 +393,7 @@ class Daemon:
                 "counters": dict(self.sessions.counters),
                 "idle_s": self.sessions.idle_s,
                 "max_turns": self.sessions.max_turns,
+                "token_budget": self.sessions.token_budget,
             },
         )
 
@@ -460,17 +461,23 @@ class Daemon:
         # second ceiling, and any failure at all means the ask goes out without
         # it. A context line is worth twenty tokens; it is not worth a question
         # that does not get answered.
-        message = persona.build_user_message(
-            prompt, recall, surface, context_line=context_mod.context_line())
         # Her name is in the prefix, so it is in the fingerprint: renaming her
         # must retire the warm sessions rather than resume one whose cached
         # prefix still introduces her by the old name.
         prefix = sessions.fingerprint(self.persona_spec, tier1, who)
 
+        # Before the message, not after: acquiring the session is what reveals
+        # whether this turn opens a thread that replaced a live one, and if it
+        # does the message has to carry the bridge back to it.
         explicit = req.get("session_id") or req.get("resume")
         sess = None if explicit else self.sessions.acquire(conversation, prefix)
         args = ({"session_id": req.get("session_id"), "resume": req.get("resume")}
                 if explicit else self.sessions.args_for(sess))
+        bridge = self._bridge(sess, request_id)
+
+        message = persona.build_user_message(
+            prompt, recall, surface, context_line=context_mod.context_line(),
+            bridge_block=bridge)
 
         run = self.runs.new(prompt, surface, request_id)
         self._publish_state()
@@ -478,6 +485,7 @@ class Daemon:
                                "prompt_chars": len(prompt),
                                "system_chars": len(system_prompt),
                                "recalled": bool(recall),
+                               "bridged": bool(bridge),
                                "conversation": conversation,
                                "resuming": bool(args.get("resume"))})
         # Speech is dispatched from inside the agent call, the moment the
@@ -506,17 +514,20 @@ class Daemon:
                     reply = self._ask_agent(req, message, system_prompt, args,
                                             run, sess, conversation, prefix,
                                             request_id, images=(str(shot),),
-                                            on_reply=speaker)
+                                            on_reply=speaker,
+                                            bridged=bool(bridge))
             else:
                 reply = self._ask_agent(req, message, system_prompt, args, run,
                                         sess, conversation, prefix, request_id,
-                                        on_reply=speaker)
+                                        on_reply=speaker,
+                                        bridged=bool(bridge))
         finally:
             self.runs.done(run)
             self._publish_state()
 
         if sess is not None:
-            self.sessions.succeeded(sess, reply.cost_usd, reply.session_id)
+            self.sessions.succeeded(sess, reply.cost_usd, reply.session_id,
+                                    usage=reply.usage)
 
         episode = None
         if remember:
@@ -548,6 +559,7 @@ class Daemon:
                                  "spoke": bool(spoken)})
         payload = reply.to_dict()
         payload["recalled"] = bool(recall)
+        payload["bridged"] = bool(bridge)
         payload["conversation"] = conversation
         payload["resumed"] = bool(args.get("resume"))
         if spoken is not None:
@@ -606,12 +618,41 @@ class Daemon:
         with self._lock:
             self.cost_usd += cost_usd
 
+    def _bridge(self, sess: "sessions.Session | None",
+                request_id: str) -> str:
+        """The last few exchanges, but only on the turn that needs them.
+
+        A session carries a reason only when it replaced one that was still
+        live — the turn cap, a tier-1 write, the token budget, a refused
+        resume. On every other turn this returns "" and costs a dict lookup.
+
+        Nothing here may fail an ask. A rollover with no bridge is exactly
+        what the daemon did before this existed, and it answers the question;
+        an exception on the way to answering it does not.
+        """
+        if sess is None or not sess.carry:
+            return ""
+        try:
+            block = self.memory.bridge_block()
+        except Exception:  # noqa: BLE001 - see the docstring
+            log.exception("could not build the conversation bridge",
+                          extra={"req_id": request_id})
+            return ""
+        # Logged at info because this is the one event the user is deliberately
+        # not told about. If a rollover ever *does* go wrong, this line is the
+        # only place it will have been written down.
+        log.info("bridging a retired session",
+                 extra={"req_id": request_id, "conversation": sess.key,
+                        "why": sess.carry, "bridge_chars": len(block)})
+        return block
+
     def _ask_agent(self, req: dict[str, Any], message: str, system_prompt: str,
                    args: dict[str, Any], run: agent.AgentRun,
                    sess: sessions.Session | None, conversation: str,
                    prefix: str, request_id: str,
                    images: tuple[str, ...] = (),
                    on_reply: "_EarlySpeaker | None" = None,
+                   bridged: bool = False,
                    ) -> agent.AgentReply:
         """One agent call, with a single retry if a resume is refused.
 
@@ -640,9 +681,22 @@ class Daemon:
                         extra={"req_id": request_id,
                                "conversation": conversation,
                                "detail": str(exc)[:300]})
-            self.sessions.drop(conversation)
+            # A refused resume is the one rollover that arrives with no
+            # warning — the agent's own session store was cleaned up under us,
+            # or its context finally gave out — and the retry is the turn most
+            # in need of a bridge back to what was being said. `bridged`
+            # guards against writing a second one onto a message that already
+            # opened with one, which is what happens when a turn that was
+            # itself a rollover then fails.
+            self.sessions.drop(conversation,
+                               carry="the agent refused to resume the thread")
             fresh = self.sessions.acquire(conversation, prefix)
-            return self.adapter.ask(message, system_prompt,
+            retry = message
+            if not bridged:
+                section = persona.bridge_section(self._bridge(fresh, request_id))
+                if section:
+                    retry = section + "\n\n" + message
+            return self.adapter.ask(retry, system_prompt,
                                     model=model,
                                     session_id=fresh.session_id, resume=None,
                                     timeout=timeout, run=run, images=images,
