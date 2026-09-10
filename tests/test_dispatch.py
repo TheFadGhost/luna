@@ -38,6 +38,14 @@ class DispatcherCase(TempMemoryCase):
             "# Stands in for `claude -p`: echoes the prompt it was given on\n"
             "# stdin, then exits with whatever LUNA_TEST_RC says.\n"
             "cat\n"
+            "# LUNA_TEST_GATE, when set, holds the agent open until that file\n"
+            "# appears. A case that needs a job to hold its slot until a\n"
+            "# precise moment -- and then to end of its own accord, exit code\n"
+            "# and all -- waits on this rather than on a `linger` it hopes is\n"
+            "# long enough. `run.sh` bounds the wait with its own `timeout`.\n"
+            "if [ -n \"${LUNA_TEST_GATE:-}\" ]; then\n"
+            "  while [ ! -e \"$LUNA_TEST_GATE\" ]; do sleep 0.02; done\n"
+            "fi\n"
             "exit ${LUNA_TEST_RC:-0}\n", encoding="utf-8")
         self.fake_agent.chmod(0o755)
 
@@ -67,7 +75,23 @@ class DispatcherCase(TempMemoryCase):
         while time.monotonic() < deadline and job.state == "running":
             time.sleep(0.05)
         self.assertNotEqual(job.state, "running", "the job never finished")
+        # `_watch` publishes the new state *before* it writes the finish
+        # record, so "not running any more" is not "done". A caller that read
+        # the audit log the moment the state flipped could find the spawn
+        # entry and not the finish one -- which is how
+        # `AuditTrailTests.test_a_dispatch_writes_spawn_and_finish_entries`
+        # failed once in 36 contended full-suite runs. Wait for the entry
+        # itself, the last thing this job's watcher writes, rather than for
+        # the state, which is only the first.
+        while time.monotonic() < deadline and not self._finish_entry(job):
+            time.sleep(0.02)
+        self.assertTrue(self._finish_entry(job),
+                        "the job's watcher never wrote its finish record")
         return job
+
+    def _finish_entry(self, job: dispatch.Job) -> list[dict]:
+        return [e for e in self.audit.read(action="dispatch.finish")
+                if e["job_id"] == job.id]
 
 
 class HappyPathTests(DispatcherCase):
@@ -256,10 +280,50 @@ class QueueTests(DispatcherCase):
         for job in jobs:
             self.addCleanup(_stop_quietly, d, job)
         self.assertEqual(len(jobs), 4)
-        running = [j for j in jobs if j.state == "running"]
-        self.assertEqual(len(running), 2,
-                         "the gate let more than max_parallel through")
-        self.assertEqual(len([j for j in jobs if j.state == "queued"]), 2)
+        states = [j.state for j in jobs]
+        # Both halves, and the states in the message: too few running is a
+        # real failure too, and it is the one that is hard to read from
+        # `1 != 2`. `_taken()` used to add the lengths of `_procs` and
+        # `_admitting` rather than count their union, so the job in the
+        # window between the two -- which is where `_start` writes job.json,
+        # the audit entry and starts the watcher -- counted as two, and three
+        # of these four queued behind a slot that was free.
+        self.assertEqual(states.count("running"), 2,
+                         f"the gate must admit exactly max_parallel: {states}")
+        self.assertEqual(states.count("queued"), 2, f"{states}")
+
+    def test_a_job_handed_from_admitting_to_running_occupies_one_slot(self):
+        """`_taken()` counts job ids, not entries in two structures.
+
+        The deterministic half of the case above. A job is in `_admitting`
+        from the admission decision until the `finally` at the end of
+        `_start`, and in `_procs` from the moment it holds a `Popen` -- and
+        clearing the queue marker, writing `job.json`, the audit entry and
+        starting the watcher thread all happen inside that overlap. `_taken()`
+        used to add the two lengths, so for the whole of that window one job
+        occupied two slots and a dispatch arriving there queued behind a slot
+        that was free.
+
+        `_write_job` is called inside the window, so what `_taken()` answers
+        there is exactly what that other dispatch would have seen.
+        """
+        d = self.dispatcher()
+        self.settings.set("dispatch.max_parallel", 2)
+        seen: list[int] = []
+        real_write = d._write_job
+
+        def spy(job: dispatch.Job) -> None:
+            if job.state == "running":
+                with d._lock:
+                    seen.append(d._taken())
+            return real_write(job)
+
+        d._write_job = spy
+        job = d.dispatch("the only job there is", timeout=30, linger=20)
+        self.addCleanup(_stop_quietly, d, job)
+        self.assertEqual(seen, [1],
+                         "one admitted job is one slot, even while it is in "
+                         "both `_admitting` and `_procs`")
 
     def test_a_queued_job_is_a_first_class_job_in_the_listing(self):
         d = self.dispatcher()
@@ -494,13 +558,30 @@ class AdmissionLeakTests(DispatcherCase):
         d = self.dispatcher()
         self.settings.set("dispatch.max_parallel", 1)
 
-        job_a = d.dispatch("first, finishes on its own", timeout=30, linger=0.3)
+        # Job A holds the only slot until this file appears, and not one
+        # instant less. It used to be held by `linger=0.3` instead -- but
+        # `_runner_script` writes `sleep {int(linger)}`, so 0.3 became
+        # `sleep 0` and job A held the slot only for the ~15ms its own
+        # process took to start and exit. Any dispatch of job B slower than
+        # that found the slot already free and started it, which is
+        # `'running' != 'queued'` on whichever runner happened to be busy.
+        gate = self.root / "job-a-may-exit"
+        os.environ["LUNA_TEST_GATE"] = str(gate)
+        self.addCleanup(os.environ.pop, "LUNA_TEST_GATE", None)
+
+        # Each job is registered for cleanup the moment it exists, before the
+        # assertion about it: a job held open by the gate and then abandoned
+        # by a failing assertion would sit in the agent's wait loop until
+        # `run.sh`'s own `timeout` fired, writing into a temporary tree
+        # teardown had already deleted. That is the stray `/tmp/luna-test-*`
+        # CI has a check for.
+        job_a = d.dispatch("first, finishes on its own", timeout=30, linger=0)
+        self.addCleanup(_stop_quietly, d, job_a)
         self.assertEqual(job_a.state, "running")
         job_b = d.dispatch("second, queued behind the only slot",
                            timeout=30, linger=0)
-        self.assertEqual(job_b.state, "queued")
-        self.addCleanup(_stop_quietly, d, job_a)
         self.addCleanup(_stop_quietly, d, job_b)
+        self.assertEqual(job_b.state, "queued")
 
         real_spawn = d.spawn
 
@@ -519,10 +600,11 @@ class AdmissionLeakTests(DispatcherCase):
 
         d.notify_finished = spy_notify
 
-        # Job A finishes on its own (its own spawn already happened before
-        # the sabotage above was installed); its `_watch` thread then tries
-        # to admit job B, hits the injected error, and must still finish its
-        # own bookkeeping regardless.
+        # Job A now finishes on its own, exit code and all, with the sabotage
+        # in place (its own spawn happened before that was installed); its
+        # `_watch` thread then tries to admit job B, hits the injected error,
+        # and must still finish its own bookkeeping regardless.
+        gate.write_text("job A may exit now\n", encoding="utf-8")
         self.wait_for(job_a, "finished", "failed")
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline and job_a.id not in notified:
@@ -906,7 +988,13 @@ class PlanTests(DispatcherCase):
     def test_the_plan_id_reaches_disk_so_the_group_survives_a_restart(self):
         self.settings.set("dispatch.max_parallel", 1)
         d = self.dispatcher()
-        plan = d.dispatch_plan(["alpha", "bravo"], linger=0)
+        # `linger=20`, as in the fan-out case below, for the same reason: the
+        # fake agent exits at once, so with `linger=0` alpha's slot could come
+        # free while bravo was still being composed and bravo would start
+        # rather than queue. Then there is no queued job to read off disk and
+        # the case fails as "one of the two must have been held back" -- which
+        # it did, once in 13 contended runs of this module.
+        plan = d.dispatch_plan(["alpha", "bravo"], timeout=30, linger=20)
         self.addCleanup(d.cancel_plan, plan.id)
         queued = [j for j in plan.jobs if j.state == "queued"]
         self.assertTrue(queued, "one of the two must have been held back")

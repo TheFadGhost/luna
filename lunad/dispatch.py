@@ -919,8 +919,23 @@ class Dispatcher:
                         f"{len(refused)} job(s) could not be signalled"}
 
     def _taken(self) -> int:
-        """Slots in use. Call with the lock held."""
-        return len(self._procs) + len(self._admitting)
+        """Slots in use — job ids, counted once each. Call with the lock held.
+
+        The union, not the sum. A job is in ``_admitting`` from the admission
+        decision until ``_start``'s ``finally``, and in ``_procs`` from the
+        moment it holds a ``Popen``; those two overlap, and everything
+        ``_start`` does after the spawn — clearing the queue marker, writing
+        ``job.json``, the audit entry, starting the watcher thread — happens
+        inside the overlap. Adding the two lengths counted that one job twice
+        for the whole of it, so a dispatch arriving in that window saw the
+        limit as already reached and queued itself behind a slot that was
+        free. Conservative, never an over-admission — but under
+        ``max_parallel = 2`` it left a real slot idle until something else
+        finished and ``_admit_next`` ran, and with four simultaneous
+        dispatches it admitted one where it should have admitted two (seen
+        once in 30 contended runs).
+        """
+        return len(self._procs.keys() | self._admitting)
 
     def _start(self, pending: _Pending) -> Job:
         """Spawn an accepted job. Called at dispatch time, or when a slot frees.
