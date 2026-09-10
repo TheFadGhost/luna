@@ -42,9 +42,18 @@ bin/luna audit --since 30m                 # what she did, and why
 bin/luna spawned --check 12345             # ask the firewall about a pid
 bin/luna settings                          # the live config, and where it lives
 bin/luna settings set voice.voice flux-donovan-en
+bin/luna settings set assistant.name 42 --string   # keep a value literal
+bin/luna embed status                      # semantic recall: on? model here?
 bin/luna confirm                           # the policy, and anything waiting
 bin/luna confirm yes <token>               # release a pending confirmation
 ```
+
+`--json` is accepted before or after the subcommand and prints the daemon's
+reply unchanged. Everything else is laid out for a terminal: aligned columns,
+weight for hierarchy, and one colour, red, which only ever means something is
+wrong. It is width-aware, it obeys [`NO_COLOR`](https://no-color.org), and it
+emits no escape sequence at all when stdout is not a terminal — so piping any
+of it, `--json` or not, gets bytes.
 
 ## Delegation
 
@@ -139,8 +148,9 @@ that *reject* rather than truncate, and the frozen system-prompt block that keep
 the KV-cache prefix valid.
 
 **Tier 1** is the curated identity, always in the prompt. **Tier 2** is every
-exchange in SQLite, searched with FTS5 and ranked by a salience score that
-decays. **Tier 3** is a derived profile: measurements taken from tier 2 —
+exchange in SQLite, searched two ways at once — FTS5 for keywords and a local
+384-dimension embedding index for paraphrase — and ranked by a salience score
+that decays. **Tier 3** is a derived profile: measurements taken from tier 2 —
 stable facts on one side, how the user likes to be talked to on the other —
 rebuilt from scratch rather than appended to, so deleting it costs nothing.
 That split is borrowed from [VoiceMem](https://github.com/xzf-thu/VoiceMem),
@@ -158,10 +168,34 @@ write without writing any of it.
 
 Two deliberate departures from Hermes. It outsources semantic retrieval to a
 paid cloud service (Postgres + pgvector + a second LLM), which is not viable on
-this hardware — and **nor is the local embedding index this file used to claim
-was already here**. Tier 2 is keyword search today; semantic recall is still
-Phase 3. And Hermes has no decay, so memories only get tidied at the cap; Luna
-scores salience and lets trivia age out.
+this hardware; Luna's runs locally instead, on
+[all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)
+(Apache-2.0, 86 MB of ONNX) under `onnxruntime` alone — no
+sentence-transformers, no `tokenizers`, no vector extension. The WordPiece
+tokenizer is a hundred lines of standard library over the model's own
+`vocab.txt` and the vectors are BLOBs in the same SQLite file. And Hermes has
+no decay, so memories only get tidied at the cap; Luna scores salience and
+lets trivia age out.
+
+The model is **not** in this repository and is never downloaded behind a
+question. A fresh clone answers on keywords alone until you run
+
+```
+bin/luna embed fetch              # ~86 MB into ~/.local/share/luna/models/
+```
+
+after which paraphrase works too: measured on the real database, *"how much
+charge is left"* went from retrieving nothing to retrieving both episodes
+about the battery, while *"so anyway do you think I should do something about
+this"* still retrieves nothing at all. `luna embed status` says whether the
+model is present, whether the setting is on, and what to type about either;
+`luna embed backfill` indexes old episodes by hand — though it happens on its
+own, in the background, on mains power.
+
+`[memory] semantic_recall = false` turns it off without deleting anything.
+Off is not a degraded mode, and neither is a model that was never fetched:
+recall falls back to the keyword index it has always had, with no error and no
+other change in behaviour.
 
 ## Contributing
 
@@ -178,4 +212,7 @@ how to report a vulnerability privately.
 ## Licence
 
 [MIT](LICENSE). Piper (GPL-3.0) is invoked as a separate binary over a pipe and
-does not affect this licence.
+does not affect this licence. The embedding model
+([all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2),
+Apache-2.0, © its authors) is downloaded at the user's request rather than
+vendored, and is compatible with MIT.

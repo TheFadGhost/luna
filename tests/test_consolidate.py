@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from lunad import agent, config, consolidate
+from lunad import agent, config, consolidate, render
 from lunad.memory import (CONSOLIDATED_THROUGH, EpisodeStore,
                           MemoryCapExceeded, Tier1File)
 
@@ -97,7 +97,12 @@ def _cli() -> Any:
         spec = importlib.util.spec_from_loader("luna_cli", loader)
         module = importlib.util.module_from_spec(spec)
         loader.exec_module(module)
-        module.BOLD = module.DIM = module.RESET = ""
+        # The style object is chosen at import from the real stdout, so a
+        # suite run in a terminal would otherwise assert against escape
+        # codes and a suite run in a pipe would not. Pinned to no colour and
+        # a fixed width, which is also the only way the column assertions
+        # below mean anything.
+        module.S = render.Style(color=False, width=100)
         _CLI = module
     return _CLI
 
@@ -357,18 +362,58 @@ class WatermarkTests(ConsolidatorCase):
         self.assertEqual(con.snapshot()["failures"], 1)
         self.assertEqual(self.memory_obj.luna.entries(), [])
 
-    def test_an_unusable_reply_still_moves_it(self) -> None:
-        # The call is paid for either way, and a reply that will not parse
-        # will not parse the second time either. Paying twice for the same
-        # unusable answer is the runaway this avoids.
-        con = self.build("I had a look and there's nothing worth keeping!")
+    def test_an_unusable_reply_retries_before_giving_up_the_batch(self) -> None:
+        # The old contract moved the watermark on the very first unparseable
+        # reply, unconditionally, in a `finally` -- defended as runaway-cost
+        # control against per-token billing. That defence is gone: the brain
+        # runs on Codex against a flat ChatGPT subscription, so a retry costs
+        # nothing, and a batch of the user's episodes should not be erased
+        # forever by one malformed reply. It now gets
+        # `max_unparseable_retries` tries against the *same* batch (same
+        # watermark, even as new episodes may extend it) before the pass
+        # gives up, moves the watermark anyway, and says so loudly.
+        con = self.build("I had a look and there's nothing worth keeping!",
+                         max_unparseable_retries=3)
         self.seed(2)
-        result = con.run_once()
-        self.assertTrue(result["ran"])           # it ran, and it was paid for
-        self.assertFalse(result["parsed"])
-        self.assertEqual(self.through(), "2")
-        self.assertEqual(con.snapshot()["failures"], 1)
+
+        first = con.run_once()
+        self.assertTrue(first["ran"])            # it ran, and it was paid for
+        self.assertFalse(first["parsed"])
+        self.assertTrue(first["retried"])
+        self.assertFalse(first["gave_up"])
+        self.assertEqual(first["retry_count"], 1)
+        self.assertEqual(self.through(), "")     # watermark did NOT move
+
+        second = con.run_once()
+        self.assertTrue(second["retried"])
+        self.assertEqual(second["retry_count"], 2)
+        self.assertEqual(self.through(), "")
+
+        third = con.run_once()
+        self.assertFalse(third["retried"])
+        self.assertTrue(third["gave_up"])
+        self.assertEqual(third["retry_count"], 3)
+        self.assertEqual(self.through(), "2")    # now it moves
+
+        self.assertEqual(con.snapshot()["failures"], 3)
         self.assertEqual(self.memory_obj.luna.entries(), [])
+
+        # Giving up resets the retry count, so the next batch starts clean.
+        self.memory_obj.episodes.record("something new", "ok", ts=3000.0)
+        fourth = con.run_once()
+        self.assertEqual(fourth["retry_count"], 1)
+
+    def test_a_reply_that_parses_on_a_retry_saves_the_whole_batch(self) -> None:
+        con = self.build("not json", "not json either", proposal(),
+                         max_unparseable_retries=3)
+        self.seed(2)
+        self.assertFalse(con.run_once()["parsed"])
+        self.assertFalse(con.run_once()["parsed"])
+        third = con.run_once()
+        self.assertTrue(third["parsed"])
+        self.assertFalse(third["retried"])
+        self.assertFalse(third["gave_up"])
+        self.assertEqual(self.through(), "2")
 
 
 # =========================================================================
@@ -930,7 +975,7 @@ class ReportTests(TempMemoryCase):
         code, text = self.printed(self.report(dry_run=True))
         self.assertEqual(code, 0)
         self.assertTrue(text.startswith("dry run — nothing was written."))
-        self.assertIn("would consolidate 3 episode(s)", text)
+        self.assertIn("would consolidate 3 episodes", text)
         self.assertIn("+ The bar is omarchy-shell.", text)
         self.assertIn("- [2] Uses waybar.", text)
         self.assertIn("the watermark did not move", text)
@@ -939,7 +984,7 @@ class ReportTests(TempMemoryCase):
     def test_an_applied_pass_prints_what_went_in_and_what_came_out(self) -> None:
         code, text = self.printed(self.report())
         self.assertEqual(code, 0)
-        self.assertIn("consolidated 3 episode(s)", text)
+        self.assertIn("consolidated 3 episodes", text)
         self.assertNotIn("would consolidate", text)
         self.assertIn("+ The bar is omarchy-shell.", text)
         self.assertIn("$0.0004", text)

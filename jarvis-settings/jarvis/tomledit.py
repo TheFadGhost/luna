@@ -24,12 +24,11 @@ import tomllib
 
 _TABLE_RE = re.compile(r"^\s*\[\s*([^\]]+?)\s*\]\s*(?:#.*)?$")
 _ARRAY_TABLE_RE = re.compile(r"^\s*\[\[")
-# key = value  [# comment]
-_PAIR_RE = re.compile(
-    r"^(?P<pre>\s*(?P<key>[A-Za-z0-9_-]+)\s*=\s*)"
-    r"(?P<val>.*?)"
-    r"(?P<gap>\s*)(?P<comment>#.*)?$"
-)
+# The `key = ` prefix of a `key = value  [# comment]` line. Only this part
+# is a fixed shape; everything after it needs quote- and bracket-aware
+# scanning (see _scan_value) because the value can itself contain `#`, or
+# can be the first line of a value that spans several lines.
+_KEY_RE = re.compile(r"^(?P<pre>\s*(?P<key>[A-Za-z0-9_-]+)\s*=\s*)")
 
 
 class TomlEditError(Exception):
@@ -70,6 +69,113 @@ def _scalar(tok: str) -> bool:
     return True
 
 
+def _find_triple_close(text: str, delim: str, start: int) -> int:
+    """Index in `text` of the closing `delim` ('\"\"\"' or "'''"), from
+    `start`, or -1. Backslash-escaping only applies inside \"\"\" — a
+    literal '''...''' string has no escapes at all."""
+    i, n = start, len(text)
+    while i < n:
+        if delim == '"""' and text[i] == "\\":
+            i += 2
+            continue
+        if text[i:i + 3] == delim:
+            return i
+        i += 1
+    return -1
+
+
+def _find_single_close(text: str, quote: str, start: int) -> int:
+    """Index of the closing quote for a one-line "..." or '...' string,
+    from `start`, or -1 if it never closes on this line."""
+    i, n = start, len(text)
+    while i < n:
+        if quote == '"' and text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == quote:
+            return i
+        i += 1
+    return -1
+
+
+def _scan_value(text: str, state=None) -> tuple[int, object]:
+    """Scan one physical line of a TOML value, continuing from `state`.
+
+    `state` is `None` to start a fresh value, or whatever a previous call
+    to this function returned as `end_state` for the line before this one.
+
+    Returns `(comment_index, end_state)`:
+
+      comment_index -- where an unquoted, unbracketed `#` starts on this
+                        line, or -1 if there is none (either because the
+                        line has no comment, or because the value is not
+                        finished by the end of the line, in which case
+                        nothing after the opening token can be a comment)
+      end_state      -- `None` if the value is complete by the end of this
+                        line, else what continues onto the next line:
+                        '\"\"\"' or "'''" mid-triple-quoted-string, or a
+                        positive int (unmatched `[` depth) mid-array —
+                        the only two TOML constructs that span lines.
+
+    A `#`, `[`, `]`, `"`, or `'` inside a one-line "..." or '...' string is
+    just a character of that string and never changes what this returns —
+    which is exactly the bug this function exists to fix: splitting a line
+    into value/comment on the first literal `#` treats `model = "gpt#4"`
+    as truncated at the `#`, and treats a decoy `key = value`-shaped line
+    inside someone else's multi-line string as a real assignment.
+    """
+    i, n = 0, len(text)
+    depth = state if isinstance(state, int) else 0
+    if isinstance(state, str):
+        close = _find_triple_close(text, state, 0)
+        if close < 0:
+            return -1, state
+        i = close + 3
+    while i < n:
+        head = text[i:i + 3]
+        if head in ('"""', "'''"):
+            close = _find_triple_close(text, head, i + 3)
+            if close < 0:
+                return -1, head
+            i = close + 3
+            continue
+        c = text[i]
+        if c in ('"', "'"):
+            close = _find_single_close(text, c, i + 1)
+            i = close + 1 if close >= 0 else n
+            continue
+        if c == "[":
+            depth += 1
+        elif c == "]":
+            depth = max(0, depth - 1)
+        elif c == "#" and depth == 0:
+            return i, None
+        i += 1
+    return -1, (depth or None)
+
+
+def _match_pair(line: str) -> dict | None:
+    """`{pre, key, val, gap, comment, end_state}` for one `key = ...`
+    line, or `None` if `line` is not one at all. Comment-splitting and
+    continuation detection both go through `_scan_value`."""
+    km = _KEY_RE.match(line)
+    if km is None:
+        return None
+    pre, key = km.group("pre"), km.group("key")
+    body = line[km.end():]
+    if body.endswith("\n"):
+        body = body[:-1]
+    ci, end_state = _scan_value(body, None)
+    if ci < 0:
+        val_part, comment = body, ""
+    else:
+        val_part, comment = body[:ci], body[ci:]
+    stripped = val_part.rstrip()
+    gap = val_part[len(stripped):]
+    return {"pre": pre, "key": key, "val": stripped, "gap": gap,
+            "comment": comment, "end_state": end_state}
+
+
 def _split(dotted: str) -> tuple[str, str]:
     table, _, key = dotted.rpartition(".")
     if not table or not key:
@@ -94,8 +200,20 @@ def set_values(text: str, changes: dict) -> str:
     # table name -> index just past its last content line
     tail_of: dict[str, int] = {}
     current = ""
+    # None, or what a value opened on an earlier line still needs to close
+    # ('\"\"\"', "'''", or an unmatched-`[` depth) — see _scan_value. While
+    # this is set, every line belongs to that value, whatever it looks
+    # like: a line inside someone else's multi-line string that happens to
+    # read as `key = value` is not a fresh assignment.
+    continuation = None
 
     for i, line in enumerate(lines):
+        if continuation is not None:
+            body = line[:-1] if line.endswith("\n") else line
+            if line.strip():
+                tail_of[current] = i + 1
+            _ci, continuation = _scan_value(body, continuation)
+            continue
         if _ARRAY_TABLE_RE.match(line):
             current = "\x00array"           # never a target; skip its keys
             continue
@@ -106,27 +224,32 @@ def set_values(text: str, changes: dict) -> str:
             continue
         if line.strip():
             tail_of[current] = i + 1
-        pm = _PAIR_RE.match(line)
-        if not pm:
+        pm = _match_pair(line)
+        if pm is None:
             continue
-        dotted = f"{current}.{pm.group('key')}" if current else pm.group("key")
+        if pm["end_state"] is not None:
+            # This value continues past this line, whether or not it is
+            # one we are writing — later lines must not be scanned as
+            # fresh table headers or assignments until it closes.
+            continuation = pm["end_state"]
+        dotted = f"{current}.{pm['key']}" if current else pm["key"]
         if dotted not in pending:
             continue
-        if not _scalar(pm.group("val")):
+        if not _scalar(pm["val"]):
             # A multi-line or unrecognised value. Leave it alone rather than
             # guess; the key stays at its old value and the caller is told.
             raise TomlEditError(
                 f"{dotted} has a value this editor will not rewrite in place")
         new = format_value(pending.pop(dotted))
-        comment = pm.group("comment") or ""
-        gap = pm.group("gap") or ""
+        comment = pm["comment"]
+        gap = pm["gap"]
         if comment:
             # Keep the comment column if the new value still fits under it.
-            column = len(pm.group("pre")) + len(pm.group("val")) + len(gap)
-            pad = column - (len(pm.group("pre")) + len(new))
+            column = len(pm["pre"]) + len(pm["val"]) + len(gap)
+            pad = column - (len(pm["pre"]) + len(new))
             gap = " " * pad if pad >= 1 else " "
         eol = "\n" if line.endswith("\n") else ""
-        lines[i] = f"{pm.group('pre')}{new}{gap}{comment}{eol}"
+        lines[i] = f"{pm['pre']}{new}{gap}{comment}{eol}"
 
     # Whatever is left needs inserting. Group by table so a new table is
     # written once, and insert from the bottom up so earlier indices stay valid.

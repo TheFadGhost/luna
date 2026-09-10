@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import sqlite3
 import statistics
@@ -33,6 +34,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from . import config
+from . import embed as embed_mod
 from . import settings as settings_mod
 
 # =========================================================================
@@ -105,20 +107,59 @@ _DELIM = config.ENTRY_DELIMITER
 _ENTRY_RE = re.compile(rf"^{re.escape(_DELIM)}[ \t]?", re.MULTILINE)
 
 
+def _fsync_best_effort(fd: int) -> None:
+    """fsync, but never let a filesystem/platform that refuses it raise here.
+
+    Durability is an upgrade over plain atomicity, not a replacement for it:
+    the rename in :func:`atomic_write` is what every reader's correctness
+    depends on, and that already works without this. A `tmpfs` scratch dir,
+    a sandboxed test tree, or a platform where `fsync` is refused on a
+    directory descriptor must not turn a memory write into an unhandled
+    exception on the answer path -- so this is best-effort and silent.
+    """
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+
+
 def atomic_write(path: Path, text: str) -> None:
     """Write ``text`` so that no reader ever sees a half-written file.
 
-    Temp file beside the target, then ``Path.replace``, which is ``os.replace``
-    and is atomic within one filesystem. Every file memory owns goes through
-    here — the tier-1 files and the tier-3 profile alike — because the failure
-    being prevented is identical for both: a daemon killed mid-write leaving a
+    Temp file beside the target, ``fsync``ed, then ``Path.replace`` (which is
+    ``os.replace``, atomic within one filesystem), then the containing
+    directory is ``fsync``ed too. Every file memory owns goes through here —
+    the tier-1 files and the tier-3 profile alike — because the failure being
+    prevented is identical for both: a daemon killed mid-write leaving a
     truncated ``LUNA.md``, which is worse than no file at all because it still
     parses. One mechanism that is known to work beats two that look similar.
+
+    The rename alone is atomic against a killed process: a reader sees either
+    the old file or the new one, never a mix. It is not durable against power
+    loss, because a rename can sit in the page cache and vanish with it --
+    the old file, the new file, or (transiently, mid-rename, on some
+    filesystems) neither may be what is on disk after the machine comes back.
+    The two ``fsync`` calls close that gap: one flushes the new content to
+    disk before the rename is attempted, the other flushes the directory
+    entry the rename changed. Both are best-effort (see
+    :func:`_fsync_best_effort`) — they harden this against a lost write, they
+    do not gate it.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        _fsync_best_effort(f.fileno())
     tmp.replace(path)
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        _fsync_best_effort(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def parse_entries(text: str) -> list[str]:
@@ -181,27 +222,39 @@ class Tier1File:
     # -- reading ---------------------------------------------------------
 
     def text(self) -> str:
-        try:
-            return self.path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return ""
+        # Guarded by the same lock every write goes through. Safe today only
+        # by accident of `atomic_write`'s `os.replace` being atomic at the
+        # filesystem level -- a reader here was never able to observe a
+        # half-written file even without this -- but "the lock guards every
+        # access to this file" is the invariant the rest of the class is
+        # written against (`_check_cap` reads `entries()` from inside a held
+        # lock, which only works because RLock is reentrant), and a reader
+        # that quietly opted out of it was one refactor away from being
+        # wrong for a reason nobody would see in a diff.
+        with self._lock:
+            try:
+                return self.path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                return ""
 
     def entries(self) -> list[str]:
-        return parse_entries(self.text())
+        with self._lock:
+            return parse_entries(self.text())
 
     def usage(self) -> dict[str, Any]:
         """Current occupancy. ``pct`` is the number to show a human."""
-        entries = self.entries()
-        chars = len(render_entries(entries))
-        return {
-            "file": self.name,
-            "path": str(self.path),
-            "chars": chars,
-            "cap": self.cap,
-            "pct": round(100.0 * chars / self.cap, 1) if self.cap else 0.0,
-            "remaining": self.cap - chars,
-            "entries": len(entries),
-        }
+        with self._lock:
+            entries = self.entries()
+            chars = len(render_entries(entries))
+            return {
+                "file": self.name,
+                "path": str(self.path),
+                "chars": chars,
+                "cap": self.cap,
+                "pct": round(100.0 * chars / self.cap, 1) if self.cap else 0.0,
+                "remaining": self.cap - chars,
+                "entries": len(entries),
+            }
 
     # -- writing ---------------------------------------------------------
 
@@ -263,17 +316,42 @@ class Tier1File:
 # Salience — ARCHITECTURE.md section 4, "Salience and decay"
 # =========================================================================
 
+# A second-person reference ("you", "your", "you're"/"youre"), used below to
+# require that "actually" and "wrong"/"incorrect" be aimed *at Luna* rather
+# than merely present in the message.
+_YOU = r"(?:you'?re|your|you)"
+# A bare "not" reads as a correction's contrastive shape ("it's X, not Y") --
+# the other cue that pairs with "actually" below, alongside second person, to
+# keep "actually it's foot, not alacritty" a correction without a "you" in it
+# anywhere.
+_YOU_OR_CONTRAST = rf"(?:{_YOU}|not)"
+# Same clause, not a later one: no sentence terminator or newline between the
+# two words. "Actually I like this. You should check the logs." must not
+# match just because both words appear somewhere in a longer message.
+_SAME_CLAUSE = r"[^.!?\n]*"
+
 # An explicit correction from the user. Kept tight on purpose: a false
 # positive here pins a memory at 1.0 forever, which is expensive to undo.
+#
+# "actually" and "wrong"/"incorrect" used to be bare word-boundary patterns,
+# so "actually I like this" and "my code is wrong" -- containing neither a
+# correction nor any reference to Luna at all -- pinned an unrelated memory
+# permanently. Both are now anchored to a second-person reference (or, for
+# "actually", the contrastive "X, not Y" shape a correction often takes even
+# without addressing Luna directly) in the same clause: a correction is
+# something aimed at what Luna said or did, not any sentence that happens to
+# contain the word.
 _CORRECTION_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
         r"^\s*no[,.\s]",
         r"\bthat'?s (wrong|not right|incorrect|not what)\b",
-        r"\bactually\b",
+        rf"\bactually\b{_SAME_CLAUSE}\b{_YOU_OR_CONTRAST}\b",
+        rf"\b{_YOU_OR_CONTRAST}\b{_SAME_CLAUSE}\bactually\b",
         r"\bi (said|meant|told you)\b",
         r"\bnot what i\b",
-        r"\b(wrong|incorrect)\b",
+        rf"\b{_YOU}\b{_SAME_CLAUSE}\b(wrong|incorrect)\b",
+        rf"\b(wrong|incorrect)\b{_SAME_CLAUSE}\b{_YOU}\b",
         r"\bcorrection\b",
         r"\binstead of\b",
         r"\bstop (doing|saying|calling)\b",
@@ -433,6 +511,28 @@ CREATE TRIGGER IF NOT EXISTS episodes_au AFTER UPDATE ON episodes BEGIN
     VALUES (new.id, new.user_text, new.luna_text);
 END;
 
+-- The semantic half of tier-2 recall: one vector per episode, as a BLOB.
+--
+-- Not `sqlite-vec`. With episodes in the hundreds-to-thousands a brute-force
+-- cosine over one float32 matrix is microseconds, so a native extension would
+-- be a build dependency, a packaging problem and an `omarchy update` hazard
+-- bought for nothing measurable. `model` and `dim` are stored per row rather
+-- than assumed, because vectors written by one model are meaningless to
+-- another and that has to be *detectable* rather than a slow rot in recall
+-- quality: change the model and the old rows can be found and re-embedded.
+--
+-- Separate table, not a column on `episodes`, for two reasons. It keeps the
+-- FTS triggers above untouched, and it makes "which episodes still need
+-- embedding" a plain anti-join rather than a scan for NULLs — which is the
+-- query the resumable backfill is built on.
+CREATE TABLE IF NOT EXISTS episode_vectors (
+    episode_id INTEGER PRIMARY KEY,
+    model      TEXT    NOT NULL,
+    dim        INTEGER NOT NULL,
+    vec        BLOB    NOT NULL,
+    ts         REAL    NOT NULL
+);
+
 -- A tiny key/value side table, and the only mutable state the store carries
 -- that is not an episode. The consolidation pass keeps its watermark here --
 -- how far through the episodes it has read -- rather than in a file of its
@@ -455,11 +555,84 @@ CREATE TABLE IF NOT EXISTS meta (
 #: system that loses things quietly is the failure worth designing against.
 CONSOLIDATED_THROUGH = "consolidated_through_id"
 
+#: Longest prefix of a message ``count_similar`` will build its FTS query
+#: from. The query is an OR (or AND, then OR) over every surviving token, so
+#: its cost tracks the message length; a long dictated transcript recorded on
+#: every turn would make that expensive on every write for no benefit --
+#: whatever makes a message "look like" a prior episode is set well before
+#: two thousand characters in.
+SIMILARITY_QUERY_CHARS = 2000
+
+#: Longest text ``EpisodeStore.record`` stores per side of an exchange.
+#: Generous on purpose -- this is not one of tier 1's tight curated caps, it
+#: exists only to put a ceiling under a single pathological write (a
+#: dictation session that never found a pause). Tier 2 is meant to hold real
+#: exchanges verbatim; this only bites the tail nobody would read back anyway.
+EPISODE_TEXT_CHARS = 20_000
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit]
+
+
 _FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
-_STOPWORDS = frozenset(
-    "a an the and or of to in on for with what when did we i you is are was "
-    "were be been it that this about how why".split()
-)
+
+# Deliberately large. The old ~30-word list let filler survive: "so anyway do
+# you think I should do something about this" kept "do", "so", "think" and
+# "something", which OR-joined into a query that matched 10 of 15 episodes in
+# the real database on pure noise. Every word below is either closed-class
+# (article, preposition, conjunction, pronoun, auxiliary/modal verb) or a
+# generic verb/quantifier so common it carries no discriminating power on its
+# own ("think", "get", "something"). Domain words never belong here — the
+# risk of dropping something meaningful is in the rare-token gate below, not
+# in this list, so this list can be generous.
+_STOPWORDS = frozenset("""
+    a an the and or of to in on for with what when did we i you is are was
+    were be been it that this about how why who which whom whose where
+    do does did doing done am have has had having will would shall should
+    can could may might must
+    i you we he she it they me him her us them my your his its our their
+    mine yours ours theirs myself yourself himself herself itself ourselves
+    yourselves themselves
+    think thinks thought thinking know knows knew knowing knowledge
+    want wants wanted wanting need needs needed needing
+    like likes liked liking get gets got getting gotten
+    go goes going went gone make makes made making
+    say says said saying tell tells told telling ask asks asked asking
+    come comes came coming look looks looked looking see sees saw seeing
+    let lets letting
+    so anyway anyways well just really very quite actually basically
+    literally honestly probably maybe perhaps kind sort okay ok um uh
+    yeah yep nope hey hi hello
+    something anything nothing everything someone anyone everyone nobody
+    some any all much many more most less least few several little lot lots
+    bit thing things stuff way ways
+    also too still even ever never always right one please thanks thank
+    now then today tomorrow yesterday here there
+""".split())
+
+#: Minimum length for a survivor token to count as "reasonably rare" and
+#: therefore worth building a query around at all. Below this, a query is
+#: treated as content-free even if a handful of short non-stopword tokens
+#: happen to survive — three or four two-and-three-letter leftovers are not a
+#: signal.
+_RARE_TOKEN_MIN_LEN = 4
+
+#: :meth:`Memory.recall_block` refuses to inject an episode whose
+#: ``coverage`` (fraction of the search query's content tokens actually
+#: present — see ``EpisodeStore.search``) is below this. Deliberately not a
+#: threshold on the raw BM25 score: BM25's IDF term collapses toward zero on
+#: a tiny corpus (a single-episode test database scores a perfect one-word
+#: match at bm25 ≈ 0, indistinguishable from noise), so it does not compare
+#: across corpus sizes. Coverage does — it is a token-count ratio, the same
+#: meaning whether the store holds 2 episodes or 20,000. Inclusive: an
+#: OR-widened hit needs at least half the query's content tokens present, so
+#: a two-token query sharing its one specific, already rarity-gated word
+#: ("what voice did we choose" against an episode about choosing a voice)
+#: still surfaces, while a three-token query sharing only one incidental
+#: word out of three does not. Every AND-pass hit is coverage 1.0 by
+#: construction and always clears it.
+RECALL_COVERAGE_FLOOR = 0.5
 
 
 def assert_fts5(conn: sqlite3.Connection | None = None) -> None:
@@ -486,19 +659,60 @@ def assert_fts5(conn: sqlite3.Connection | None = None) -> None:
             conn.close()
 
 
-def build_fts_query(raw: str) -> str | None:
+def _content_tokens(raw: str) -> list[str]:
+    """The lexical half of recall: tokenize, drop stopwords, gate on rarity.
+
+    Returns ``[]`` — not the stopword-only tokens — when nothing survives
+    that is worth searching on. The old behaviour fell back to the *raw*
+    tokens (stopwords included) whenever filtering emptied the list, which
+    is backwards: a query that is entirely filler ("what is it") is exactly
+    the case that should retrieve nothing, not the case that should retrieve
+    on the filler words verbatim. A query also has to clear
+    :data:`_RARE_TOKEN_MIN_LEN` on at least one surviving token — a handful
+    of short leftovers ("do", "so", "get" would already be gone, but e.g.
+    "bit", "way") is still not a signal worth building a query around.
+
+    This is the lexical (FTS5/BM25) half of recall. The paraphrase half —
+    "how much charge is left" never matching an episode that says "battery"
+    — is the embedding index in :mod:`lunad.embed`, wired in exactly where
+    the previous pass said it should be: :meth:`EpisodeStore.search` runs
+    this function's FTS candidates and the vector lookup side by side, unions
+    the episode ids, and feeds each source's relevance score (BM25 here,
+    cosine there) into the same coverage/floor gate ``recall_block`` already
+    enforces.
+
+    Note what that means for *this* function: it still gates both halves.
+    A query that is entirely filler returns ``[]`` here and
+    :meth:`EpisodeStore.search` gives up before any embedding happens, so
+    the semantic path cannot reintroduce the noise this list was widened to
+    remove — "so anyway do you think I should do something about this" is
+    refused for the same reason it was before, one step earlier than the
+    coverage floor, and no model is ever asked about it.
+    """
+    tokens = [t for t in _FTS_TOKEN_RE.findall(raw.lower()) if t not in _STOPWORDS]
+    if not any(len(t) >= _RARE_TOKEN_MIN_LEN or t.isdigit() for t in tokens):
+        return []
+    return tokens
+
+
+def build_fts_query(raw: str, mode: str = "or") -> str | None:
     """Turn free text into a safe FTS5 MATCH expression.
 
     User queries contain apostrophes, hyphens and question marks, all of which
-    are FTS5 syntax. Every token is quoted and stopwords are dropped; returns
-    ``None`` when nothing usable is left.
+    are FTS5 syntax. Every token is quoted; returns ``None`` when
+    :func:`_content_tokens` finds nothing usable.
+
+    ``mode="or"`` (the default, and what every existing caller gets) joins
+    permissively. ``mode="and"`` requires every surviving token to appear in
+    the same row — :meth:`EpisodeStore.search` tries that first and only
+    widens to ``"or"`` when it comes back empty, so a multi-word query cannot
+    match on a single incidental word the way a pure-OR query can.
     """
-    tokens = [t for t in _FTS_TOKEN_RE.findall(raw.lower()) if t not in _STOPWORDS]
-    if not tokens:
-        tokens = _FTS_TOKEN_RE.findall(raw.lower())
+    tokens = _content_tokens(raw)
     if not tokens:
         return None
-    return " OR ".join(f'"{t}"' for t in tokens)
+    joiner = " AND " if mode == "and" else " OR "
+    return joiner.join(f'"{t}"' for t in tokens)
 
 
 @dataclass
@@ -511,6 +725,23 @@ class Episode:
     salience: float
     effective_salience: float = 0.0
     rank: float = 0.0
+    #: Fraction of the search query's content tokens actually found in this
+    #: episode's text. 1.0 for every hit from the AND pass (all tokens
+    #: present, by construction) and for anything not fetched via
+    #: :meth:`EpisodeStore.search` at all (``recent``/``since``, where
+    #: coverage does not apply). Only the OR-widen fallback produces values
+    #: below 1.0 — see ``search`` and ``Memory.recall_block``'s relevance
+    #: floor. Since semantic recall exists, a hit's coverage is the *better*
+    #: of its lexical and semantic readings: two independent measures of
+    #: "is this episode about what was asked" agreeing is evidence, and
+    #: taking the max is what lets a paraphrase clear the floor without the
+    #: floor being lowered for anybody.
+    coverage: float = 1.0
+    #: Cosine similarity between the query and this episode's stored vector,
+    #: or 0.0 when the semantic index had no opinion (model absent, not yet
+    #: warm, timed out, or this episode not among its nearest neighbours).
+    #: Reported so ``mem search`` can show *why* something surfaced.
+    similarity: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -522,6 +753,8 @@ class Episode:
             "luna_text": self.luna_text,
             "salience": self.salience,
             "effective_salience": self.effective_salience,
+            "coverage": self.coverage,
+            "similarity": self.similarity,
         }
 
 
@@ -533,7 +766,8 @@ class EpisodeStore:
     and removes a whole class of cross-thread sqlite bugs.
     """
 
-    def __init__(self, path: Path = config.EPISODES_DB) -> None:
+    def __init__(self, path: Path = config.EPISODES_DB,
+                 embedder: "embed_mod.Embedder | None" = None) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -545,16 +779,38 @@ class EpisodeStore:
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
+        # The embedding worker is process-wide, not per-store: Luna and Sol
+        # have separate databases but there is only one model, and holding
+        # two copies of it against 3-4 GB of headroom would be absurd. The
+        # worker keeps their vectors in separate *spaces*, keyed by database
+        # path, which is what `self._space` names.
+        self._embedder_override = embedder
+        self._space = str(path)
+        self._index_lock = threading.Lock()
+        self._index_thread: threading.Thread | None = None
+        self._index_stop = threading.Event()
 
     def close(self) -> None:
+        # Stop the indexer *before* the connection goes. A background thread
+        # still writing into a store whose tree has been deleted is exactly
+        # the leak `tests/_support._cleanup_tree` exists to catch, and it
+        # would be this thread that caused it.
+        self._index_stop.set()
+        thread = self._index_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=10.0)
         with self._lock:
             self._conn.close()
 
     # -- writing ---------------------------------------------------------
 
     def count_similar(self, user_text: str) -> int:
-        """How many prior episodes look like this one (for the repetition term)."""
-        query = build_fts_query(user_text)
+        """How many prior episodes look like this one (for the repetition term).
+
+        Queried from at most :data:`SIMILARITY_QUERY_CHARS` of ``user_text``,
+        not the whole thing -- see that constant.
+        """
+        query = build_fts_query(_clip(user_text, SIMILARITY_QUERY_CHARS))
         if not query:
             return 0
         try:
@@ -576,6 +832,12 @@ class EpisodeStore:
         ts: float | None = None,
         salience: float | None = None,
     ) -> Episode:
+        # See EPISODE_TEXT_CHARS: a ceiling under one pathological write, not
+        # a curated-tier cap. Clipped before scoring too, so a long
+        # transcript's salience is computed from the same text that gets
+        # stored and searched, not from an uncapped string that never lands.
+        user_text = _clip(user_text, EPISODE_TEXT_CHARS)
+        luna_text = _clip(luna_text, EPISODE_TEXT_CHARS)
         ts = time.time() if ts is None else ts
         if salience is None:
             salience = score_salience(
@@ -659,19 +921,10 @@ class EpisodeStore:
             row = self._conn.execute("SELECT max(id) AS m FROM episodes").fetchone()
         return int(row["m"] or 0)
 
-    def search(self, query: str, limit: int = 10) -> list[Episode]:
-        """Keyword recall, ranked by BM25 lifted by decayed salience.
-
-        Decay is applied here, at read time. A stale trivial episode sinks;
-        a correction from six months ago still surfaces.
-        """
-        match = build_fts_query(query)
-        if not match:
-            return []
-        now = time.time()
+    def _run_match(self, match: str, limit: int) -> list[sqlite3.Row]:
         try:
             with self._lock:
-                rows = self._conn.execute(
+                return self._conn.execute(
                     "SELECT e.*, bm25(episodes_fts) AS bm "
                     "FROM episodes_fts JOIN episodes e ON e.id = episodes_fts.rowid "
                     "WHERE episodes_fts MATCH ? "
@@ -679,14 +932,351 @@ class EpisodeStore:
                     (match, limit * 4),
                 ).fetchall()
         except sqlite3.Error as exc:
-            raise MemoryError(f"episode search failed for {query!r}: {exc}") from exc
+            raise MemoryError(f"episode search failed for {match!r}: {exc}") from exc
 
-        episodes = [self._hydrate(r, now, rank=float(r["bm"])) for r in rows]
-        # bm25 is negative and lower is better; salience in [0,1] lifts a hit.
-        episodes.sort(key=lambda e: e.rank - 2.0 * e.effective_salience)
+    def _token_hit_ids(self, token: str) -> set[int]:
+        """Every episode id the FTS index itself says contains ``token``.
+
+        Used to score coverage on the OR-widen fallback. Deliberately routed
+        back through the index rather than a plain-text ``token in text``
+        check: the index applies the porter stemmer, and a naive substring
+        check disagrees with it on irregular forms ("chose" is the matched
+        stem for a query token "choose" — MATCH finds it, `"choose" in text`
+        does not) and would under-count coverage for hits the index itself
+        considers legitimate.
+        """
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT rowid FROM episodes_fts WHERE episodes_fts MATCH ?",
+                    (f'"{token}"',),
+                ).fetchall()
+            return {int(r["rowid"]) for r in rows}
+        except sqlite3.Error:
+            return set()
+
+    def search(self, query: str, limit: int = 10) -> list[Episode]:
+        """Keyword recall and semantic recall, unioned, ranked by coverage.
+
+        Two candidate sources into one funnel.
+
+        **Lexical (FTS5/BM25), AND-then-widen.** Tries every surviving
+        content token required in the same row first, and only falls back to
+        OR (any token) when that comes back empty. A pure-OR query is what
+        let "so anyway do you think I should do something about this" match
+        10 of 15 episodes in the real database — six of the ten shared
+        exactly one incidental word with the query and nothing else.
+        Requiring AND first means a multi-word query only matches loosely
+        when nothing matches it fully, and the fallback hits carry their true
+        ``coverage`` (fraction of query tokens actually present).
+
+        **Semantic (cosine over stored vectors).** What FTS5 structurally
+        cannot do: "how much charge is left" retrieved 0 of 19 episodes on
+        the real database while two of them were about the battery, because
+        "charge" and "battery" share no token and no stemmer relates them.
+        The vector index scores those two at 0.42 and 0.32, which
+        :func:`lunad.embed.coverage_from_cosine` reads as coverage 0.66 and
+        0.54 — over the floor on their own merits, with the floor left
+        exactly where it was.
+
+        The two are unioned and each episode keeps the **better** of its two
+        coverage readings, then everything sorts by coverage first and by the
+        old ``bm25 lifted by decayed salience`` within a coverage tier. So
+        the existing lexical ordering is preserved wherever the semantic
+        index has no opinion, which is every case that worked before.
+
+        Three properties worth stating because they are load-bearing:
+
+        * The filler gate comes first. No content tokens means no search of
+          *either* kind — the semantic path cannot reintroduce the noise the
+          precision pass removed, and a content-free query never reaches a
+          model at all.
+        * Semantic recall is strictly additive. If the model is absent, cold,
+          slow or broken, :meth:`_semantic_scores` returns ``{}`` in bounded
+          time and this method behaves exactly as it did before it existed.
+        * Decay is still applied here, at read time, to every hit from either
+          source. A correction still scores 1.0 and still never decays; the
+          semantic path hydrates through the same :meth:`_hydrate` and gets
+          the same salience lift, so nothing routes around it.
+        """
+        tokens = _content_tokens(query)
+        if not tokens:
+            return []
+        now = time.time()
+
+        # Kicked before the FTS queries rather than after, so the (bounded)
+        # wait for the worker overlaps SQLite's work instead of following it.
+        semantic = self._semantic_scores(query)
+
+        and_match = " AND ".join(f'"{t}"' for t in tokens)
+        rows = self._run_match(and_match, limit)
+        full_coverage = True
+        token_hits: dict[str, set[int]] | None = None
+        if not rows and len(tokens) > 1:
+            or_match = " OR ".join(f'"{t}"' for t in tokens)
+            rows = self._run_match(or_match, limit)
+            full_coverage = False
+            token_hits = {t: self._token_hit_ids(t) for t in tokens}
+
+        found: dict[int, Episode] = {}
+        for row in rows:
+            ep = self._hydrate(row, now, rank=float(row["bm"]))
+            if full_coverage:
+                ep.coverage = 1.0
+            else:
+                assert token_hits is not None
+                hit = sum(1 for t in tokens if ep.id in token_hits[t])
+                ep.coverage = hit / len(tokens)
+            found[ep.id] = ep
+
+        # Episodes only the vector index knows about. These are the whole
+        # point: they share no token with the query, so no BM25 exists for
+        # them and their rank is the negated cosine instead — the same
+        # lower-is-better axis, ordering the paraphrases among themselves.
+        lexical = set(found)
+        for row in self._rows_by_id([i for i in semantic if i not in found]):
+            ep = self._hydrate(row, now, rank=-float(semantic[int(row["id"])]))
+            ep.coverage = 0.0
+            found[ep.id] = ep
+
+        for ep in found.values():
+            cos = semantic.get(ep.id)
+            if cos is None:
+                continue
+            ep.similarity = cos
+            ep.coverage = max(ep.coverage, embed_mod.coverage_from_cosine(cos))
+
+        # Coverage first; then a hit that actually contains the words ahead
+        # of one that merely means the same; then the old key, bm25 lifted by
+        # decayed salience (bm25 is negative and lower is better, salience in
+        # [0,1] lifts a hit).
+        #
+        # That middle term is not a nicety. BM25's IDF collapses toward zero
+        # on a small corpus — a one-word match in a three-episode database
+        # scores about -1e-7 — so comparing it against a negated cosine would
+        # let a 0.9 paraphrase outrank a literal keyword hit purely because
+        # the two numbers are on incomparable scales. Splitting them into
+        # separate sort tiers means neither scale is ever compared with the
+        # other, and the ordering that existed before the vector index is
+        # reproduced exactly whenever the vector index has nothing to add.
+        episodes = sorted(found.values(),
+                          key=lambda e: (-e.coverage,
+                                         0 if e.id in lexical else 1,
+                                         e.rank - 2.0 * e.effective_salience))
         return episodes[:limit]
 
+    def _rows_by_id(self, ids: Sequence[int]) -> list[sqlite3.Row]:
+        if not ids:
+            return []
+        marks = ",".join("?" * len(ids))
+        with self._lock:
+            return self._conn.execute(
+                f"SELECT *, 0.0 AS bm FROM episodes WHERE id IN ({marks})",
+                [int(i) for i in ids],
+            ).fetchall()
+
+    # -- the semantic half -----------------------------------------------
+
+    def _embedder(self) -> "embed_mod.Embedder":
+        return (self._embedder_override if self._embedder_override is not None
+                else embed_mod.get_embedder())
+
+    def _semantic_scores(self, query: str) -> dict[int, float]:
+        """Cosines for the query's nearest neighbours. ``{}`` means no opinion.
+
+        Everything here is best-effort by construction. This runs on the ask
+        path, so the rules are the ones ``lunad/presence.py`` follows: it may
+        not block on a cold model (``Embedder.search`` kicks an asynchronous
+        warm-up and returns ``None`` instead), it may not exceed its own hard
+        timeout, and it may not raise. A bare ``except`` is right here — the
+        alternative to "no semantic opinion" is a failed answer, and
+        :mod:`lunad.embed` has already logged whatever went wrong.
+        """
+        try:
+            emb = self._embedder()
+            if not emb.enabled():
+                return {}
+            # Warming and backfilling both happen on a background thread,
+            # never here. This call only decides whether that thread has
+            # anything to do.
+            self._start_indexer(emb)
+            hits = emb.search(self._space, query, embed_mod.SEARCH_CANDIDATES)
+            if not hits:
+                return {}
+            return {int(i): float(c) for i, c in hits.items()
+                    if c > embed_mod.SEMANTIC_FLOOR}
+        except Exception:  # noqa: BLE001 - the answer path ends here
+            return {}
+
+    def vector_stats(self) -> dict[str, int]:
+        """How much of tier 2 is embedded. Cheap enough to call per search."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT (SELECT count(*) FROM episodes) AS episodes, "
+                "(SELECT count(*) FROM episode_vectors) AS vectors, "
+                "(SELECT coalesce(max(episode_id), 0) FROM episode_vectors) "
+                "  AS max_vector_id, "
+                "(SELECT count(*) FROM episodes WHERE id NOT IN "
+                "  (SELECT episode_id FROM episode_vectors)) AS pending"
+            ).fetchone()
+        return {"episodes": int(row["episodes"]), "vectors": int(row["vectors"]),
+                "max_vector_id": int(row["max_vector_id"]),
+                "pending": int(row["pending"])}
+
+    def pending_vector_rows(self, limit: int) -> list[sqlite3.Row]:
+        """Episodes with no vector yet, oldest first.
+
+        An anti-join and nothing else, which is the whole of the backfill's
+        resumability: progress is the rows that are already in
+        ``episode_vectors``, each batch is committed before the next starts,
+        and a kill at any point costs at most one batch. There is no cursor
+        to keep consistent and nothing to reset.
+        """
+        with self._lock:
+            return self._conn.execute(
+                "SELECT id, user_text, luna_text FROM episodes "
+                "WHERE id NOT IN (SELECT episode_id FROM episode_vectors) "
+                "ORDER BY id LIMIT ?", (int(limit),)).fetchall()
+
+    def store_vectors(self, rows: Sequence[tuple[int, bytes]],
+                      model: str = embed_mod.MODEL_NAME,
+                      dim: int = embed_mod.EMBED_DIM) -> int:
+        if not rows:
+            return 0
+        now = time.time()
+        with self._lock:
+            self._conn.executemany(
+                "INSERT INTO episode_vectors (episode_id, model, dim, vec, ts) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(episode_id) DO UPDATE SET "
+                "model=excluded.model, dim=excluded.dim, vec=excluded.vec, "
+                "ts=excluded.ts",
+                [(int(i), model, int(dim), blob, now) for i, blob in rows])
+            self._conn.commit()
+        return len(rows)
+
+    def _sync_worker(self, emb: "embed_mod.Embedder") -> int:
+        """Hand the worker the vectors it does not have yet.
+
+        The worker holds its matrix in memory and loses it when it is
+        unloaded, so this is a delta against *its* watermark rather than
+        against anything persistent. A cold worker reports watermark 0 and
+        gets the lot, which for thousands of episodes is a few megabytes down
+        a pipe, once per load, on a background thread.
+        """
+        mark = emb.watermark(self._space)
+        if mark is None:
+            return 0
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT episode_id, vec FROM episode_vectors "
+                "WHERE episode_id > ? AND model = ? AND dim = ? "
+                "ORDER BY episode_id", (int(mark), embed_mod.MODEL_NAME,
+                                        embed_mod.EMBED_DIM)).fetchall()
+        if not rows:
+            return 0
+        return emb.sync(self._space,
+                        [(int(r["episode_id"]), bytes(r["vec"])) for r in rows])
+
+    def backfill_vectors(self, force: bool = False,
+                         budget: int | None = None,
+                         embedder: "embed_mod.Embedder | None" = None
+                         ) -> tuple[int, int]:
+        """Embed episodes that have no vector. Returns ``(done, remaining)``.
+
+        Never called from the answer path — only from the background indexer
+        thread and from ``python3 -m lunad.embed backfill``.
+
+        **Power policy.** Measured on this machine at ~35 ms of one core per
+        episode. Catching up the handful recorded since the last session is a
+        second or two and runs anywhere. A first-ever index over thousands is
+        minutes of sustained full-core work for a result nobody is waiting
+        on, so above :data:`lunad.embed.BACKFILL_BATTERY_LIMIT` outstanding
+        episodes it waits for mains power. ``force`` overrides that, and a
+        machine that reports no battery at all counts as mains.
+        """
+        emb = embedder if embedder is not None else self._embedder()
+        state = self.vector_stats()
+        if not emb.enabled() or state["pending"] == 0:
+            return 0, state["pending"]
+        if (not force and state["pending"] > embed_mod.BACKFILL_BATTERY_LIMIT
+                and embed_mod.on_mains_power() is False):
+            return 0, state["pending"]
+
+        done = 0
+        while not self._index_stop.is_set():
+            take = embed_mod.BACKFILL_BATCH
+            if budget is not None:
+                take = min(take, budget - done)
+            if take <= 0:
+                break
+            batch = self.pending_vector_rows(take)
+            if not batch:
+                break
+            texts = [embed_mod.compose_episode_text(r["user_text"],
+                                                    r["luna_text"])
+                     for r in batch]
+            vectors = emb.embed(texts)
+            if vectors is None or len(vectors) != len(batch):
+                break
+            self.store_vectors([(int(r["id"]), v)
+                                for r, v in zip(batch, vectors)])
+            done += len(batch)
+            # Published to the worker as it lands, not at the end, so a long
+            # backfill improves recall while it runs instead of after it.
+            self._sync_worker(emb)
+            if self._index_stop.wait(embed_mod.BACKFILL_PAUSE_S):
+                break
+        return done, self.vector_stats()["pending"]
+
+    def _start_indexer(self, emb: "embed_mod.Embedder") -> None:
+        """Start the background warm-and-backfill thread, if it has work.
+
+        One thread at a time, and it exits when it is done rather than
+        looping forever — a resident loop would keep touching the worker and
+        defeat the idle unload it is supposed to respect.
+        """
+        if self._index_stop.is_set():
+            return
+        with self._index_lock:
+            thread = self._index_thread
+            if thread is not None and thread.is_alive():
+                return
+            try:
+                if not self._index_work_pending(emb):
+                    return
+            except sqlite3.Error:
+                return
+            self._index_thread = threading.Thread(
+                target=self._index_once, args=(emb,),
+                name="luna-embed-index", daemon=True)
+            self._index_thread.start()
+
+    def _index_work_pending(self, emb: "embed_mod.Embedder") -> bool:
+        state = self.vector_stats()
+        if state["pending"] > 0:
+            return True
+        mark = emb.watermark(self._space)
+        if mark is None:
+            # Not warm. Warming it *is* the work — and it is why the first
+            # question after a restart is answered on FTS5 alone.
+            return state["vectors"] > 0
+        return mark < state["max_vector_id"]
+
+    def _index_once(self, emb: "embed_mod.Embedder") -> None:
+        try:
+            if not emb.wait_ready():
+                return
+            if self._index_stop.is_set():
+                return
+            self._sync_worker(emb)
+            self.backfill_vectors(embedder=emb)
+        except Exception:  # noqa: BLE001 - a background thread that raises
+            # takes nothing with it but its own progress, and the next search
+            # starts it again.
+            return
+
     def stats(self) -> dict[str, Any]:
+        vectors = self.vector_stats()
         with self._lock:
             row = self._conn.execute(
                 "SELECT count(*) AS n, min(ts) AS first, max(ts) AS last, "
@@ -699,6 +1289,8 @@ class EpisodeStore:
             "last_ts": row["last"],
             "mean_salience": round(float(row["avg_sal"]), 4) if row["avg_sal"] else 0.0,
             "size_bytes": self.path.stat().st_size if self.path.exists() else 0,
+            "vectors": vectors["vectors"],
+            "vectors_pending": vectors["pending"],
         }
 
 
@@ -1141,12 +1733,13 @@ class Memory:
         user_md: Path = config.USER_MD,
         episodes_db: Path = config.EPISODES_DB,
         profile_json: Path | None = None,
+        embedder: "embed_mod.Embedder | None" = None,
     ) -> None:
         self.luna = Tier1File(luna_md, config.LUNA_MD_CAP, "LUNA.md",
                               cap_key="memory.luna_cap_chars")
         self.user = Tier1File(user_md, config.USER_MD_CAP, "USER.md",
                               cap_key="memory.user_cap_chars")
-        self.episodes = EpisodeStore(episodes_db)
+        self.episodes = EpisodeStore(episodes_db, embedder=embedder)
         # The profile defaults to sitting *beside the episode store it is
         # derived from*, not to a fixed path. That is the honest relationship
         # — tier 3 is a function of tier 2 and belongs with its input — and it
@@ -1184,8 +1777,19 @@ class Memory:
         return "\n\n".join(chunks)
 
     def recall_block(self, query: str, limit: int = config.RECALL_LIMIT) -> str:
-        """Relevant tier-2 episodes, rendered for the prompt. May be empty."""
-        hits = self.episodes.search(query, limit=limit)
+        """Relevant tier-2 episodes, rendered for the prompt. May be empty.
+
+        Filters out anything below :data:`RECALL_COVERAGE_FLOOR` first.
+        Injecting a weak match into the prompt is worse than injecting
+        nothing — it reads as confirmed context and actively misleads,
+        rather than just failing to help — so this is the one place in the
+        recall path that would rather come back empty than come back wrong.
+        ``EpisodeStore.search`` itself stays permissive, because other
+        callers (e.g. the raw ``mem search`` surface) want to see weak hits
+        to judge for themselves.
+        """
+        hits = [ep for ep in self.episodes.search(query, limit=limit)
+                if ep.coverage >= RECALL_COVERAGE_FLOOR]
         if not hits:
             return ""
         lines = []

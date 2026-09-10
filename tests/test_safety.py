@@ -184,6 +184,89 @@ class OwnedPidTests(TempMemoryCase):
         self.assertFalse(safety.may_signal(proc.pid))
         self.assertIn("exited", self.ledger.why_not(proc.pid))
 
+    def test_terminate_confirms_death_even_when_it_has_to_escalate(self):
+        """`terminate()` returning True must mean *reaped*, not just signalled.
+
+        A process that ignores SIGTERM forces the SIGKILL escalation; the
+        return value has to reflect that the second, post-SIGKILL wait
+        actually saw it die (and, since `Popen.poll()` is what confirms that,
+        actually reaped it), not merely that both signals were sent.
+        """
+        proc = safety.spawn(
+            ["/bin/bash", "-c", "trap '' TERM; sleep 30"], kind="test",
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(_hard_stop, proc)
+        time.sleep(0.2)                # let bash actually install the trap
+
+        self.assertTrue(safety.terminate(proc, grace=2.0, reason="unit test"))
+        self.assertIsNotNone(
+            proc.poll(), "terminate() returning True must mean it already "
+                        "reaped the child, not merely signalled it")
+
+    def test_terminate_gives_up_cleanly_on_a_process_that_will_not_die(self):
+        """A bounded wait must not become an unbounded one.
+
+        Nothing on this machine can out-survive SIGKILL, so this stands a
+        process up that ignores *both* signals by holding the group hostage
+        with `may_signal` still saying yes — the honest way to prove the
+        bound is real is a grace period too short for even a normal SIGTERM
+        exit to land.
+        """
+        proc = safety.spawn(["sleep", "30"], kind="test",
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(_hard_stop, proc)
+        time.sleep(0.1)
+        confirmed = safety.terminate(proc, grace=0.0, reason="unit test")
+        # `grace=0.0` means neither bounded wait ever gets a chance to see it
+        # die, even though SIGKILL was sent and it dies moments later.
+        self.assertFalse(confirmed)
+        # But it must still be reaped shortly after, via reap_after below —
+        # not left running because terminate() gave up on confirming it.
+
+
+class ReapAfterTests(TempMemoryCase):
+    """`reap_after`: the actual fix for item 2.
+
+    ``reap()`` alone only edits the ledger; it was being used as if it also
+    waited. These prove the replacement actually reaps — and, when its own
+    bound is too short, keeps trying rather than leaking a zombie forever.
+    """
+
+    def test_reap_after_reaps_immediately_when_death_is_already_confirmed(self):
+        proc = safety.spawn(["/bin/true"], kind="test",
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(_hard_stop, proc)
+        proc.wait(timeout=5)
+        self.assertTrue(safety.reap_after(proc, timeout=5))
+        self.assertIsNone(self.ledger.get(proc.pid))
+
+    def test_reap_after_keeps_trying_once_its_own_bound_expires(self):
+        proc = safety.spawn(["sleep", "0.4"], kind="test",
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(_hard_stop, proc)
+
+        confirmed = safety.reap_after(proc, timeout=0.05)
+        self.assertFalse(confirmed, "a 0.4s process must outlive a 0.05s bound")
+        # Not forgotten yet: nothing has actually reaped it at this point, and
+        # a caller that treated `reap()` as if it always did this — the exact
+        # bug — would already have dropped the pid off the allowlist here.
+        self.assertIsNotNone(self.ledger.get(proc.pid))
+
+        deadline = time.monotonic() + 3.0
+        while (time.monotonic() < deadline
+              and self.ledger.get(proc.pid) is not None):
+            time.sleep(0.02)
+        self.assertIsNone(
+            self.ledger.get(proc.pid),
+            "the background wait must eventually reap the child and forget "
+            "it, rather than giving up once its own bound ran out")
+        self.assertIsNotNone(proc.poll(),
+                             "it must have actually been reaped, not just "
+                             "forgotten by the ledger")
+
+    def test_reap_after_on_an_already_dead_proc_is_a_no_op(self):
+        self.assertTrue(safety.reap_after(None))
+
 
 class PidReuseTests(TempMemoryCase):
     """The half of the rule that is not obvious.

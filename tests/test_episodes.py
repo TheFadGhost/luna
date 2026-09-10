@@ -8,6 +8,8 @@ import unittest
 
 from lunad import config
 from lunad.memory import (
+    EPISODE_TEXT_CHARS,
+    SIMILARITY_QUERY_CHARS,
     FTS5Unavailable,
     MemoryError as LunaMemoryError,
     assert_fts5,
@@ -49,8 +51,23 @@ class QueryBuildingTests(unittest.TestCase):
         self.assertEqual(build_fts_query("what did we decide about the widget"),
                          '"decide" OR "widget"')
 
-    def test_all_stopwords_falls_back_to_the_raw_tokens(self):
-        self.assertEqual(build_fts_query("what is it"), '"what" OR "is" OR "it"')
+    def test_all_stopwords_returns_none_rather_than_matching_on_filler(self):
+        # The old behaviour fell back to querying on the raw stopword tokens
+        # themselves when filtering emptied the list -- which is backwards:
+        # a query that is entirely filler is exactly the case that should
+        # retrieve nothing. Confirmed against the real database: this is the
+        # shape of query that matched 10 of 15 unrelated episodes.
+        self.assertIsNone(build_fts_query("what is it"))
+
+    def test_short_non_stopword_leftovers_do_not_clear_the_rarity_gate(self):
+        # "bit" and "way" are real, non-stopword words, but three-letter
+        # leftovers with nothing longer are still not a signal worth
+        # building a query around.
+        self.assertIsNone(build_fts_query("get a bit of a way on"))
+
+    def test_and_mode_requires_every_token_in_the_same_row(self):
+        self.assertEqual(build_fts_query("decide about the widget", mode="and"),
+                         '"decide" AND "widget"')
 
     def test_no_usable_tokens_returns_none(self):
         self.assertIsNone(build_fts_query("!!! ??? ***"))
@@ -122,6 +139,36 @@ class EpisodeStoreTests(TempMemoryCase):
         last = store.record("please fix the flickering bar", "fixed")
         self.assertGreater(last.salience, first.salience)
 
+    def test_count_similar_caps_the_query_to_a_prefix_of_a_long_message(self):
+        # count_similar used to build_fts_query() the entire, uncapped
+        # message on every write -- a long dictated transcript made that
+        # OR-query (proportional to token count) expensive every turn. The
+        # same word, same message, is seen when it falls inside the cap and
+        # invisible past it: that difference is the cap, and nothing else
+        # ("xylophone" never appears in the stored episode at all).
+        store = self.episodes()
+        store.record("please remember the special unicorn codeword", "ok")
+        padding = "xylophone " * ((SIMILARITY_QUERY_CHARS // 10) + 5)
+        self.assertGreater(len(padding), SIMILARITY_QUERY_CHARS)
+        self.assertEqual(store.count_similar(padding + "unicorn"), 0)
+        self.assertEqual(store.count_similar("unicorn " + padding), 1)
+
+    def test_record_clips_pathologically_long_text(self):
+        store = self.episodes()
+        ep = store.record("a" * (EPISODE_TEXT_CHARS + 5000),
+                          "b" * (EPISODE_TEXT_CHARS + 5000))
+        self.assertEqual(len(ep.user_text), EPISODE_TEXT_CHARS)
+        self.assertEqual(len(ep.luna_text), EPISODE_TEXT_CHARS)
+        [stored] = store.recent()
+        self.assertEqual(len(stored.user_text), EPISODE_TEXT_CHARS)
+        self.assertEqual(len(stored.luna_text), EPISODE_TEXT_CHARS)
+
+    def test_ordinary_length_text_is_unaffected_by_the_cap(self):
+        store = self.episodes()
+        ep = store.record("a normal message", "a normal reply")
+        self.assertEqual(ep.user_text, "a normal message")
+        self.assertEqual(ep.luna_text, "a normal reply")
+
     def test_decay_is_applied_at_read_time_and_rows_are_untouched(self):
         store = self.episodes()
         # The setting, not the constant: decay reads `[memory]
@@ -146,6 +193,45 @@ class EpisodeStoreTests(TempMemoryCase):
         self.assertEqual(len(hits), 2)
         self.assertIn("foot", hits[0].user_text)
 
+    def test_filler_query_retrieves_nothing(self):
+        # Reproduces the audit finding against a stand-in for the real
+        # database: a battery question, a bar-widget rewrite, a Quickshell
+        # version check, a greeting. None of it is about the filler query,
+        # and the old OR-only build_fts_query matched most of it anyway.
+        store = self.episodes()
+        store.record("Hello, what is the battery level right now?",
+                     "About 62 percent.")
+        store.record("What's eating my battery?", "Mostly the browser.")
+        store.record("I want to rewrite my whole bar widget in React.",
+                     "That is a lot of scope for tonight.")
+        store.record("look up the current Quickshell version",
+                     "You are on the latest.")
+        store.record("hello", "hi")
+        self.assertEqual(
+            store.search("so anyway do you think I should do something "
+                         "about this"),
+            [])
+
+    def test_and_then_widens_to_or_with_partial_coverage(self):
+        store = self.episodes()
+        store.record("the bar widget needs a rewrite", "noted")
+        store.record("the kettle finally boiled", "good")
+        # No episode has both "widget" and "kettle" -- the AND pass finds
+        # nothing -- so this must widen to OR and report partial coverage
+        # rather than come back empty.
+        hits = store.search("widget kettle")
+        self.assertEqual({h.user_text for h in hits},
+                         {"the bar widget needs a rewrite",
+                          "the kettle finally boiled"})
+        for h in hits:
+            self.assertAlmostEqual(h.coverage, 0.5)
+
+    def test_and_pass_hits_have_full_coverage(self):
+        store = self.episodes()
+        store.record("we decided the bar widget should be monochrome", "ok")
+        [hit] = store.search("bar widget")
+        self.assertEqual(hit.coverage, 1.0)
+
     def test_stats(self):
         store = self.episodes()
         store.record("a", "b")
@@ -162,6 +248,41 @@ class EpisodeStoreTests(TempMemoryCase):
 
     def test_recall_block_is_empty_when_nothing_matches(self):
         self.assertEqual(self.memory().recall_block("nothing here"), "")
+
+    def test_recall_block_refuses_weak_partial_matches(self):
+        # "widget kettle printer" shares only one of its three content
+        # tokens with either episode (coverage 1/3). raw search() still
+        # returns both -- it stays permissive for callers who want to judge
+        # weak hits themselves -- but recall_block must inject neither: a
+        # one-in-three match presented as "possibly relevant" reads as
+        # confirmed context to whatever reads the prompt, and that is worse
+        # than nothing. (A two-of-two-tokens-down-to-one case, e.g. "what
+        # voice did we choose" against an episode about choosing a voice, is
+        # coverage 0.5 and clears the floor -- see
+        # test_recall_block_keeps_a_strong_single_token_partial_match.)
+        mem = self.memory()
+        mem.episodes.record("the bar widget needs a rewrite", "noted")
+        mem.episodes.record("the kettle finally boiled", "good")
+        self.assertTrue(mem.episodes.search("widget kettle printer"))
+        self.assertEqual(mem.recall_block("widget kettle printer"), "")
+
+    def test_recall_block_keeps_a_strong_single_token_partial_match(self):
+        # An irregular verb defeats the porter stemmer ("choose" vs.
+        # "chose"), so the AND pass fails and this widens to OR on "voice"
+        # alone -- coverage 0.5 on a two-token query. That still clears the
+        # floor: one already rarity-gated, specific shared word is a real
+        # signal, not noise.
+        mem = self.memory()
+        mem.episodes.record("we chose jenny_dioco for the voice", "agreed")
+        block = mem.recall_block("what voice did we choose")
+        self.assertIn("jenny_dioco", block)
+
+    def test_recall_block_keeps_full_coverage_hits(self):
+        mem = self.memory()
+        mem.episodes.record("we decided the bar widget should be monochrome",
+                            "noted")
+        block = mem.recall_block("bar widget")
+        self.assertIn("monochrome", block)
 
 
 if __name__ == "__main__":

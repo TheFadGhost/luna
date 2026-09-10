@@ -10,10 +10,15 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
-from lunad import config, speech
+from lunad import config, safety, speech
+
+from ._support import TempMemoryCase
 
 PH = config.SPEECH_PLACEHOLDER
 
@@ -154,6 +159,94 @@ class SentenceSplitTests(unittest.TestCase):
         self.assertTrue(all(u.strip() for u in units), units)
 
 
+class LeadSplitTests(unittest.TestCase):
+    """`split_lead_sentence`: the cut that starts the audio a clause early.
+
+    The rule is measured, not aesthetic — docs/_latency-notes.md §4 — so these
+    assert the arithmetic that decides it as well as where the knife lands.
+    """
+
+    def test_a_short_opening_sentence_is_left_whole(self) -> None:
+        """Already near the ~1 s floor: a seam here would buy nothing."""
+        self.assertIsNone(speech.split_lead_sentence("Right, it is running."))
+
+    def test_a_long_sentence_is_cut_at_the_first_usable_comma(self) -> None:
+        pair = speech.split_lead_sentence(
+            "I checked the logs, and the service came back up ten minutes ago.")
+        assert pair is not None
+        head, tail = pair
+        self.assertEqual(head, "I checked the logs,")
+        self.assertEqual(tail, "and the service came back up ten minutes ago.")
+
+    def test_a_sentence_with_no_clause_boundary_is_left_whole(self) -> None:
+        """No good seam exists, so none is invented. 1.7 s is the price."""
+        self.assertIsNone(speech.split_lead_sentence(
+            "That is a well known problem with no easy answer in this code."))
+
+    def test_a_boundary_too_early_to_cover_the_tail_is_passed_over(self) -> None:
+        """A head whose audio ends before the tail arrives would leave a gap.
+
+        The first comma here is 19 characters in with 74 to follow, which the
+        head cannot cover; the second is 39 in, which it can. Passing over
+        rather than giving up is the difference between splitting this
+        sentence and not.
+        """
+        pair = speech.split_lead_sentence(
+            "The build is green, the tests all pass, and the branch is ready "
+            "to merge whenever you want it.")
+        assert pair is not None
+        self.assertEqual(pair[0], "The build is green, the tests all pass,")
+
+    def test_a_semicolon_a_colon_and_a_spaced_dash_all_count(self) -> None:
+        for text in (
+            "It finished about an hour ago; nothing has touched it since then.",
+            "Here is the shape of it: three services and one shared database.",
+            "It finished an hour ago - nothing has touched it since then, ok.",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNotNone(speech.split_lead_sentence(text))
+
+    def test_a_trailing_dash_is_dropped_but_a_comma_is_kept(self) -> None:
+        """Spoken, a trailing dash is a hesitation; a comma is a pause."""
+        pair = speech.split_lead_sentence(
+            "It finished an hour ago - nothing has touched it since then, ok.")
+        assert pair is not None
+        self.assertEqual(pair[0], "It finished an hour ago")
+        pair = speech.split_lead_sentence(
+            "I checked the logs, and the service came back up ten minutes ago.")
+        assert pair is not None
+        self.assertTrue(pair[0].endswith(","))
+
+    def test_a_number_and_a_clock_time_are_not_clause_boundaries(self) -> None:
+        """"1,234" and "3:15" have no space after the mark, so neither cuts."""
+        pair = speech.split_lead_sentence(
+            "It cost 1,234 pounds and change at 3:15 which is more than "
+            "I had expected.")
+        self.assertIsNone(pair)
+
+    def test_a_hyphenated_word_is_not_a_clause_boundary(self) -> None:
+        self.assertIsNone(speech.split_lead_sentence(
+            "That is a well-known problem with no easy answer in this code."))
+
+    def test_a_tail_too_short_to_be_worth_a_seam_is_declined(self) -> None:
+        """Under ~24 characters the tail saves less than the seam costs."""
+        self.assertIsNone(speech.split_lead_sentence(
+            "The deployment finished about an hour ago and nothing, since."))
+
+    def test_the_two_halves_are_the_whole_sentence(self) -> None:
+        """No words may be lost at the seam — only the dash, deliberately."""
+        text = ("I checked the logs, and the service came back up about ten "
+                "minutes ago.")
+        pair = speech.split_lead_sentence(text)
+        assert pair is not None
+        self.assertEqual(f"{pair[0]} {pair[1]}", text)
+
+    def test_the_cover_rule_is_the_measured_one(self) -> None:
+        """54 ms/char of audio against 17 ms/char of synthesis, plus margin."""
+        self.assertTrue(speech._lead_split_covers("x" * 40, "y" * 40))
+        self.assertFalse(speech._lead_split_covers("x" * 10, "y" * 100))
+
+
 class SampleRateTests(unittest.TestCase):
     """The rate comes from the voice, never from a constant in the source."""
 
@@ -224,6 +317,118 @@ class WorkerGuardTests(unittest.TestCase):
         self.assertFalse(st["loaded"])
         self.assertFalse(st["speaking"])
         self.assertEqual(st["counters"]["said"], 0)
+
+
+class BargeInDuringLoadTests(TempMemoryCase):
+    """Barge-in must not wait behind piper's cold load.
+
+    ``_ensure_worker`` used to hold ``self._lock`` for the whole cold load —
+    spawn plus up to ``SPEECH_START_TIMEOUT_S`` waiting for READY — and
+    ``cancel()``/``status()`` took the same lock. A real piper worker is not
+    used here (that is the hand-verified part, per the module docstring): a
+    genuine, harmless, long-lived process (``sleep 30``) stands in for it, so
+    the ledger/firewall behave normally, while its stdout never produces a
+    READY line — simulating a worker that is still loading.
+    """
+
+    def _speech(self) -> speech.Speech:
+        obj = speech.Speech(settings=self.settings, idle_unload_s=3600)
+        self.addCleanup(obj.close)
+        # Bypass the file-existence gate: the fake spawn below never touches
+        # `self.model`/`self.voice_config`, so their real presence on this
+        # machine must not decide whether the test can run.
+        obj.available = lambda: (True, "faked for this test")
+        return obj
+
+    def _spawn_stub_worker(self):
+        """Patch `speech.safety.spawn` to hand back a real `sleep 30`.
+
+        The daemon's own `argv` (python + PIPER_WORKER + model + config) is
+        discarded; what the caller gets back is a real, ledger-registered
+        process that will never write a READY line on its own — exactly a
+        cold load stuck mid-flight.
+        """
+        real_spawn = safety.spawn
+        spawned: list = []
+
+        def fake_spawn(argv, **kw):
+            proc = real_spawn(["sleep", "30"], **kw)
+            spawned.append(proc)
+            return proc
+
+        patcher = unittest.mock.patch.object(speech.safety, "spawn", fake_spawn)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        def cleanup():
+            for proc in spawned:
+                if proc.poll() is None:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:  # noqa: BLE001 - best-effort test cleanup
+                        pass
+                for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                    if pipe is not None:
+                        pipe.close()
+        self.addCleanup(cleanup)
+        return spawned
+
+    def _start_load(self, obj: speech.Speech):
+        started = threading.Event()
+        finished = threading.Event()
+        outcome: list[BaseException | None] = []
+
+        def load():
+            started.set()
+            try:
+                obj._ensure_worker()
+            except BaseException as exc:  # noqa: BLE001 - captured, not raised
+                outcome.append(exc)
+            else:
+                outcome.append(None)
+            finished.set()
+
+        thread = threading.Thread(target=load, daemon=True)
+        thread.start()
+        self.assertTrue(started.wait(2.0), "the load thread never started")
+        # A brief, generous grace period for the load to actually reach the
+        # point of blocking on READY (spawn a real process, register it,
+        # start reading its stdout) before this thread acts on it.
+        time.sleep(0.2)
+        return finished, outcome
+
+    def test_cancel_does_not_wait_behind_a_cold_load(self):
+        obj = self._speech()
+        self._spawn_stub_worker()
+        finished, outcome = self._start_load(obj)
+
+        before = time.monotonic()
+        speaking = obj.cancel()
+        elapsed = time.monotonic() - before
+
+        self.assertLess(elapsed, 2.0,
+                        "cancel() must not block behind the cold load")
+        self.assertTrue(speaking, "a load in progress counts as speaking")
+        # The cancel above must have actually aborted the load (killed the
+        # in-progress worker), not merely returned before it was done.
+        self.assertTrue(finished.wait(5.0), "the load never noticed the cancel")
+        self.assertIsInstance(outcome[0], speech.SpeechUnavailable)
+
+    def test_status_does_not_wait_behind_a_cold_load(self):
+        obj = self._speech()
+        self._spawn_stub_worker()
+        finished, _outcome = self._start_load(obj)
+        self.addCleanup(finished.wait, 5.0)   # let the load's own kill happen
+        self.addCleanup(obj.cancel)
+
+        before = time.monotonic()
+        st = obj.status()
+        elapsed = time.monotonic() - before
+
+        self.assertLess(elapsed, 2.0,
+                        "status() must not block behind the cold load")
+        self.assertFalse(st["loaded"], "no usable worker exists yet")
 
 
 if __name__ == "__main__":

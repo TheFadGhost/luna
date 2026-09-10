@@ -72,9 +72,28 @@ class VoicePick(Field):
     default: str = ""
 
 
+@dataclass(frozen=True)
+class ModelPick(Text):
+    """A model slug for `assistant.model`. Free text, exactly like Text —
+    a slug for a model released after this file was last touched must not
+    be rejected — but marked as its own kind so the GUI can offer
+    per-agent suggestions (jarvis.models) and an inline "not a known slug
+    for this agent" hint instead of treating it as an ordinary string
+    field with no guidance at all."""
+
+
 # "never" (just do it) | "ask" (confirm first) | "deny" (refuse outright)
 TRI = ("never", "ask", "deny")
-TRI_LABELS = {"never": "Never ask", "ask": "Ask first", "deny": "Never allow"}
+# Display labels only — the stored values are the three keys above and are
+# part of the config contract. The labels are not: they used to read "Never
+# ask" and "Never allow", a permissive answer and a restrictive one that
+# differed by one word in the middle of a row of identical buttons. Three
+# words now, no shared prefix, different lengths and different initials.
+TRI_LABELS = {"never": "Allow", "ask": "Ask first", "deny": "Refuse"}
+# What each answer actually does, said in the row's trailing column. "ask" is
+# the safe default and says nothing; the two that change what the machine
+# will do on its own announce themselves in opposite plain words.
+TRI_NOTES = {"never": "runs unattended", "ask": "", "deny": "never runs"}
 
 
 @dataclass(frozen=True)
@@ -108,9 +127,9 @@ SPEC: tuple[Section, ...] = (
             Choice("agent", "Agent",
                    "Headless CLI that does the thinking. Falls back to "
                    "~/.config/omarchy/defaults/agent.",
-                   default="claude", options=("claude", "codex")),
-            Text("model", "Model", "Empty means the agent's own default.",
-                 default="", placeholder="agent default"),
+                   default="codex", options=("claude", "codex")),
+            ModelPick("model", "Model", "Empty means the agent's own default.",
+                      default="", placeholder="agent default"),
         ),
     ),
     Section(
@@ -184,6 +203,17 @@ SPEC: tuple[Section, ...] = (
             Tri("network_send", "Send data off the machine",
                 "Posting anything outward."),
             Tri("git_push", "git push", "Publishing commits to a remote."),
+            Tri("git_merge", "Merge her own pull request",
+                "Separate from git push: pushing a branch is reversible with "
+                "one command and nobody else sees it, merging writes to the "
+                "default branch, closes the review and — by default — "
+                "deletes the branch that held the evidence. Allow merges on "
+                "green with no prompt; Ask first puts a toast up before "
+                "each merge; Refuse makes her open the pull request and "
+                "stop there. None of the three can make her merge a pull "
+                "request that is not green — that gate is in code and this "
+                "cannot reach it.",
+                default="never"),
             Tri("long_job", "Long-running jobs",
                 "Anything estimated over the threshold below."),
             Number("long_job_seconds", "Long job threshold",
@@ -224,6 +254,12 @@ SPEC: tuple[Section, ...] = (
             Number("decay_half_life_days", "Salience half-life",
                    "Trivia ages out on its own. Corrections never decay.",
                    default=30, min=1, max=365, step=1, unit="days"),
+            Toggle("semantic_recall", "Match meaning, not just words",
+                   "Off, recall is keyword-only, so \u201chow much charge is "
+                   "left\u201d finds nothing about the battery. On, it also "
+                   "needs the embedding model — `luna embed status` says "
+                   "whether it is there. Absent, this silently does nothing.",
+                   default=True),
         ),
     ),
     Section(
@@ -245,6 +281,156 @@ SPEC: tuple[Section, ...] = (
                    "0 keeps them forever. Running and queued jobs are never "
                    "collected, whatever their age.",
                    default=14, min=0, max=365, step=1, unit="days"),
+            Toggle("requeue_on_start", "Resume queued jobs after a restart",
+                   "On, a job still waiting in the queue when lunad stops "
+                   "is put back in the same place when it starts again, "
+                   "keeping the confirmations you already gave. Off, the "
+                   "queue is cancelled on shutdown and a restart is a clean "
+                   "slate. Either way, a job that was actually running is "
+                   "never re-run — its process is gone and its side effects "
+                   "are not, so it is recorded as interrupted for a person "
+                   "to look at, not resumed on its own.",
+                   default=True),
+        ),
+    ),
+    Section(
+        key="vcs", title="GitHub workflow", pane="vcs",
+        doc="How her work reaches GitHub. Every piece of it goes branch → "
+            "commit → push → pull request; she never pushes to the "
+            "default branch. What “green” means for a merge is "
+            "decided in code, in `lunad/vcs.py`, not by anything here.",
+        fields=(
+            Text("branch_prefix", "Branch prefix",
+                 "Branches are named <prefix>/<topic>-<yymmdd>. Reusing the "
+                 "date is deliberate: a job re-run the same day lands back "
+                 "on the branch it already had, rather than leaving the "
+                 "repository full of near-identical abandoned ones.",
+                 default="luna", placeholder="luna", allow_empty=False),
+            Toggle("auto_merge",
+                   "Merge her own pull requests without a human reading "
+                   "them first",
+                   "Off (the careful choice): she branches, commits, "
+                   "pushes and opens the pull request, then stops — the "
+                   "report says she stopped on purpose, and a person reads "
+                   "it before anything reaches the default branch. On: the "
+                   "moment CI comes back all green, she merges it herself "
+                   "— no review, no pause, no second chance to catch a "
+                   "green build that was still a bad idea. This is not a "
+                   "way around the checks; there is no way around the "
+                   "checks. `Merge her own pull request` on the "
+                   "Confirmations pane can still put a toast in front of "
+                   "every one of these.",
+                   default=True),
+            Choice("merge_method", "Merge method",
+                   "Passed to `gh pr merge`. Anything else is refused "
+                   "before gh is ever reached.",
+                   default="squash", options=("squash", "merge", "rebase")),
+            Toggle("delete_branch", "Delete the branch after a merge",
+                   "Only on a merge that actually lands — a refused merge "
+                   "changes nothing, so nothing here gets deleted either.",
+                   default=True),
+            Toggle("notify_on_refusal", "Notify when an auto-merge is "
+                   "refused",
+                   "A critical-urgency toast carrying the refusal reasons. "
+                   "A green merge needs nobody's attention; a pull request "
+                   "that quietly stayed open is one you would otherwise "
+                   "find out about days later. A missing notifier is "
+                   "logged and swallowed, never a reason to fail the ship.",
+                   default=True),
+            Number("check_wait_seconds", "Wait for CI up to",
+                   "How long she waits for checks to finish before "
+                   "deciding — she stops early the moment the verdict can "
+                   "no longer change. 0 means do not wait, not wait "
+                   "forever: a check that has not finished reporting is "
+                   "refused, not ignored. An unattended merge that gave up "
+                   "waiting and went ahead anyway is exactly what this "
+                   "exists to prevent.",
+                   default=900, min=0, max=7200, step=30, unit="s"),
+        ),
+    ),
+    Section(
+        key="ambient", title="Ambient", pane="ambient",
+        doc="The three things she notices on her own. An ambient event "
+            "notifies; it never speaks.",
+        fields=(
+            Toggle("enabled", "Notice things on her own",
+                   "Off, the thread still ticks and every hook is skipped, so "
+                   "switching it back on needs no restart.",
+                   default=True),
+            # The daemon clamps this to a 5 s floor; the schema states the same
+            # floor so the GUI refuses out of range rather than writing a value
+            # that would be silently raised. There is no ceiling in the daemon
+            # — an hour is this app's, and it is a very long time between
+            # three stat()s.
+            Number("poll_seconds", "Tick every",
+                   "One tick is three stat()s and a 12-byte read. A floor, "
+                   "not an override: raising it slows every hook, lowering it "
+                   "will not outrun a hook's own cadence.",
+                   default=60, min=5, max=3600, step=5, unit="s"),
+            Toggle("crash", "A process dumped core",
+                   "Off by default — the desktop already announces crashes. "
+                   "Hers adds the audit-log entry and the job.",
+                   default=False),
+            Toggle("crash_diagnose", "Diagnose from the toast",
+                   "The toast's one action runs `luna ambient diagnose`. "
+                   "Never automatic: a diagnosis is a model call and a "
+                   "terminal window.",
+                   default=True),
+            Toggle("battery", "The battery is getting low",
+                   "Off by default — Omarchy already warns at 10%. Turn it on "
+                   "for a warning earlier than the desktop's.",
+                   default=False),
+            # 0 would mean never and 100 would mean always, so neither is a
+            # threshold; the range is the open interval between them.
+            Number("battery_low_pct", "Warn at", default=20, min=1, max=99,
+                   step=1, unit="%"),
+            Number("battery_critical_pct", "Warn again at",
+                   "Clamped to the warning above if you set it higher — a "
+                   "critical above the low would make the low unreachable.",
+                   default=5, min=1, max=99, step=1, unit="%"),
+            Toggle("update", "An Omarchy update landed",
+                   "The version file's contents and its mtime, plus "
+                   "/tmp/omarchy-update.log. Not whether one is available.",
+                   default=True),
+        ),
+    ),
+    Section(
+        key="hud", title="Overlay", pane="hud",
+        doc="The orb the desktop draws for her, and the caption beside it. "
+            "Drawn by a Quickshell plugin, not by lunad — these six keys "
+            "are published to a file it reads.",
+        fields=(
+            Toggle("enabled", "Draw the overlay",
+                   "Off, nothing is drawn and nothing is clickable — the "
+                   "overlay is a click-through layer, so off means it is not "
+                   "there rather than there and invisible.",
+                   default=True),
+            Choice("corner", "Corner",
+                   "Which corner of the screen the sprite sits in.",
+                   default="bottom-right",
+                   options=("top-left", "top-right", "bottom-left",
+                            "bottom-right")),
+            # A Real, and a spin button, exactly like [voice] speed — the
+            # other multiplier in this app. There is no slider widget in
+            # jarvis/widgets.py and inventing one for a single row would be a
+            # second control kind to keep themed for no gain.
+            #
+            # 0.5–3.0 matches the daemon's clamp, so the GUI refuses out of
+            # range rather than writing a value that is silently pulled back.
+            Real("scale", "Size", "A multiplier on the sprite's base size.",
+                 default=1.0, min=0.5, max=3.0, step=0.1, digits=2, unit="x"),
+            Toggle("idle_visible", "Keep it on screen while she is idle",
+                   "Off, it appears when she starts listening, thinking or "
+                   "speaking, and fades out after. The bar icon is the "
+                   "always-on surface.",
+                   default=False),
+            Toggle("caption", "Show what she says beside it",
+                   "The spoken form of a reply, one message per answer. A "
+                   "`luna hush` takes it off the screen.",
+                   default=True),
+            Choice("sprite", "Sprite",
+                   "Reserved. Only the orb exists so far.",
+                   default="orb", options=("orb",)),
         ),
     ),
     Section(

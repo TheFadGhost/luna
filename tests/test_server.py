@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 import uuid
+from pathlib import Path
 from typing import Any
 
 from lunad import agent, config, dispatch, protocol
@@ -24,10 +25,15 @@ class FakeAdapter(agent.BaseAdapter):
     name = "fake"
 
     def __init__(self, reply: str = "Fine.", raises: Exception | None = None,
-                 delay: float = 0.0) -> None:
+                 delay: float = 0.0, early: bool = False) -> None:
         self.reply = reply
         self.raises = raises
         self.delay = delay
+        #: Whether to hand the reply out at "turn.completed" the way
+        #: `CodexAdapter` does. Off by default so every existing case still
+        #: exercises the post-hoc path, which is the fallback that has to keep
+        #: working for adapters with no event stream.
+        self.early = early
         self.last_system_prompt = ""
         self.last_prompt = ""
         self.calls: list[dict[str, Any]] = []
@@ -45,6 +51,8 @@ class FakeAdapter(agent.BaseAdapter):
             time.sleep(self.delay)
         if self.raises:
             raise self.raises
+        if self.early and kw.get("on_reply") is not None:
+            kw["on_reply"](self.reply)
         return agent.AgentReply(text=self.reply, agent="fake", model="fake-1",
                                 cost_usd=0.001, wall_ms=1)
 
@@ -55,6 +63,7 @@ class MuteSpeech:
     def __init__(self) -> None:
         self.said: list[str] = []
         self.cancels = 0
+        self.prewarms = 0
 
     # Part of the real interface: `Daemon._publish_state` reads it on every
     # transition, and this double is never mid-utterance because nothing here
@@ -68,6 +77,10 @@ class MuteSpeech:
     def cancel(self) -> bool:
         self.cancels += 1
         return True
+
+    def prewarm(self) -> bool:
+        self.prewarms += 1
+        return False
 
     def status(self) -> dict[str, Any]:
         return {"loaded": False, "speaking": False, "counters": {}}
@@ -97,6 +110,80 @@ class ProtocolTests(unittest.TestCase):
     def test_oversized_line_is_rejected(self):
         with self.assertRaises(protocol.ProtocolError):
             protocol.decode(b"x" * (protocol.MAX_LINE_BYTES + 1))
+
+
+class _BoundedProbe:
+    """A file-like object standing in for ``rfile`` that records exactly what
+    ``readline(size)`` was asked for and always honours the cap — the way a
+    real buffered socket stream does — so a caller that forgot to bound its
+    own reads is caught here rather than only by the end result.
+    """
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._pos = 0
+        self.sizes_requested: list[Any] = []
+
+    def readline(self, size: int = -1) -> bytes:
+        self.sizes_requested.append(size)
+        if not isinstance(size, int) or size < 0:
+            raise AssertionError(
+                f"read_line must always pass a bounded size, got {size!r}")
+        # A real `readline(size)` stops at the first newline *within* the
+        # size-bounded window, not just at `size` bytes flat.
+        window = self._data[self._pos:self._pos + size]
+        nl = window.find(b"\n")
+        chunk = window[:nl + 1] if nl != -1 else window
+        self._pos += len(chunk)
+        return chunk
+
+
+class ReadLineTests(unittest.TestCase):
+    """``protocol.read_line``: the fix for the unbounded ``rfile.readline()``
+    in ``_Handler.handle()`` (server.py — see HANDOFF-core.md for the one-line
+    change that call site still needs).
+
+    ``decode()`` already rejected an oversized request, but only after the
+    whole line had been buffered — a client sending gigabytes with no newline
+    grew the daemon's memory by exactly that much first. These prove the read
+    itself is bounded, not just the rejection at the end.
+    """
+
+    def test_a_normal_line_is_returned_whole(self) -> None:
+        rfile = _BoundedProbe(b'{"op": "ping"}\n{"op": "next"}\n')
+        self.assertEqual(protocol.read_line(rfile), b'{"op": "ping"}\n')
+
+    def test_a_line_landing_exactly_on_the_limit_still_reads_its_newline(self):
+        line = b"a" * protocol.MAX_LINE_BYTES + b"\n"
+        rfile = _BoundedProbe(line)
+        self.assertEqual(protocol.read_line(rfile), line)
+
+    def test_an_oversized_line_with_no_newline_is_rejected(self) -> None:
+        # A client that never stops sending: three times the limit, and no
+        # newline anywhere in it.
+        huge = b"x" * (protocol.MAX_LINE_BYTES * 3)
+        rfile = _BoundedProbe(huge)
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.read_line(rfile)
+
+        # Bounded *while reading*: nothing close to the 3x-oversized input was
+        # ever pulled off the stream, and no single request for more than the
+        # line limit (plus one, so a line landing exactly on it still reads
+        # its own newline) was ever made.
+        self.assertLess(rfile._pos, protocol.MAX_LINE_BYTES * 2,
+                        "read_line buffered close to the whole oversized "
+                        "line before giving up")
+        for size in rfile.sizes_requested:
+            self.assertLessEqual(size, protocol.MAX_LINE_BYTES + 1)
+
+    def test_a_smaller_explicit_limit_is_honoured(self) -> None:
+        rfile = _BoundedProbe(b"abcdefghij\n")
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.read_line(rfile, max_bytes=5)
+        self.assertLessEqual(rfile._pos, 6)
+
+    def test_an_empty_stream_reads_as_an_empty_line(self) -> None:
+        self.assertEqual(protocol.read_line(_BoundedProbe(b"")), b"")
 
 
 class DaemonCase(TempMemoryCase):
@@ -178,6 +265,64 @@ class _StuckJob:
 
     def __init__(self) -> None:
         self.done = threading.Event()
+
+
+class EarlySpeechTests(DaemonCase):
+    """She starts talking when the turn completes, not when the child exits.
+
+    `codex exec` writes its session rollout after `turn.completed` and only
+    then closes stdout — measured at 350-490 ms on this machine, on every ask.
+    The adapter hands the finished reply out during that window, so the
+    ordering asserted here is the whole point: spoken first, everything else
+    after.
+    """
+
+    def daemon(self, adapter: agent.BaseAdapter) -> Daemon:
+        d = self.build_daemon()
+        d.adapter = adapter
+        d.speech = MuteSpeech()                        # type: ignore[assignment]
+        return d
+
+    def test_an_early_reply_is_spoken_exactly_once(self):
+        d = self.daemon(FakeAdapter("Your call.", early=True))
+        reply = d.op_ask({"prompt": "hi", "surface": "voice"})
+        self.assertEqual(d.speech.said, ["Your call."])
+        self.assertEqual(reply["spoken"], "Your call.")
+
+    def test_an_adapter_with_no_event_stream_is_still_spoken(self):
+        """claude has no turn.completed to fire on. She must not go silent."""
+        d = self.daemon(FakeAdapter("Your call.", early=False))
+        reply = d.op_ask({"prompt": "hi", "surface": "voice"})
+        self.assertEqual(d.speech.said, ["Your call."])
+        self.assertEqual(reply["spoken"], "Your call.")
+
+    def test_a_silent_surface_speaks_nothing_and_pre_warms_nothing(self):
+        d = self.daemon(FakeAdapter("Your call.", early=True))
+        d.op_ask({"prompt": "hi", "surface": "cli"})
+        self.assertEqual(d.speech.said, [])
+        self.assertEqual(d.speech.prewarms, 0)
+
+    def test_speaking_pre_warms_the_speech_path_before_the_agent_runs(self):
+        d = self.daemon(FakeAdapter("Your call.", early=True))
+        d.op_ask({"prompt": "hi", "surface": "voice"})
+        self.assertEqual(d.speech.prewarms, 1)
+
+    def test_the_episode_is_still_recorded_when_speech_ran_first(self):
+        """Speaking early must not cost the memory write that follows it."""
+        d = self.daemon(FakeAdapter("Your call.", early=True))
+        reply = d.op_ask({"prompt": "remember this", "surface": "voice"})
+        self.assertIn("episode", reply)
+        self.assertTrue(d.memory.episodes.search("remember this"))
+
+    def test_a_mute_speaker_does_not_break_an_early_ask(self):
+        class Deaf(MuteSpeech):
+            def say(self, text, wait=False, timeout=0.0):
+                raise RuntimeError("no audio device")
+
+        d = self.daemon(FakeAdapter("Your call.", early=True))
+        d.speech = Deaf()                              # type: ignore[assignment]
+        reply = d.op_ask({"prompt": "hi", "surface": "voice"})
+        self.assertEqual(reply["reply"], "Your call.")
 
 
 class DispatchTests(DaemonCase):
@@ -410,6 +555,58 @@ class DispatchTests(DaemonCase):
         self.assertEqual(resp["cancelled"], 0)
 
 
+class StartupRehydrationTests(DaemonCase):
+    """The daemon resolves what the last one left behind, before it serves.
+
+    Nothing here opens a terminal: ``build_daemon`` pins the dispatcher's
+    terminal to ``/bin/bash`` and its agent to ``/bin/true``, so the resumed
+    job runs headlessly in the temporary tree.
+    """
+
+    def stale_job(self, job_id: str, **fields) -> Path:
+        job_dir = self.root / "jobs" / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        data = {"id": job_id, "task": f"the {job_id} task", "to": "worker",
+                "state": "queued", "pid": None, "started": time.time(),
+                "iso": "x", "elapsed_s": 0.0, "exit_code": None,
+                "dir": str(job_dir)}
+        data.update(fields)
+        (job_dir / "job.json").write_text(json.dumps(data), encoding="utf-8")
+        return job_dir
+
+    def test_the_daemon_resumes_queued_work_it_did_not_accept(self):
+        job_dir = self.stale_job("a1b2")
+        (job_dir / "run.sh").write_text("#!/bin/bash\nexit 0\n",
+                                        encoding="utf-8")
+        (job_dir / "queued.json").write_text(
+            json.dumps({"id": "a1b2", "timeout": 30.0, "confirmed": None}),
+            encoding="utf-8")
+        d = self.build_daemon()
+        d.speech.close()
+        d.speech = MuteSpeech()
+        listed = {j["id"]: j for j in d.dispatch({"op": "jobs"})["jobs"]}
+        self.assertIn("a1b2", listed)
+        self.assertTrue(listed["a1b2"]["rehydrated"])
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            state = d.dispatcher._jobs["a1b2"].state
+            if state != "running":
+                break
+            time.sleep(0.05)
+        self.assertIn(d.dispatcher._jobs["a1b2"].state,
+                      ("finished", "failed"), "the resumed job must have run")
+
+    def test_a_job_that_was_running_is_reported_interrupted_not_restarted(self):
+        self.stale_job("c3d4", state="running", pid=1)
+        d = self.build_daemon()
+        d.speech.close()
+        d.speech = MuteSpeech()
+        listed = {j["id"]: j for j in d.dispatch({"op": "jobs"})["jobs"]}
+        self.assertEqual(listed["c3d4"]["state"], "interrupted")
+        self.assertEqual(len(self.ledger), 0,
+                         "an interrupted job must not be re-run at boot")
+
+
 class SocketTests(DaemonCase):
     """End-to-end over a real Unix socket, including concurrency."""
 
@@ -524,6 +721,58 @@ class Phase2OpTests(DaemonCase):
 
     def test_dispatch_requires_a_task(self):
         resp = self.daemon().dispatch({"op": "dispatch", "task": "  "})
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"], "ProtocolError")
+
+    def test_a_tasks_list_is_a_fan_out_under_one_plan_id(self):
+        """The wire shape. How many of them *run* is the gate's business and
+        is asserted in tests/test_dispatch.py, where a job can be held open;
+        here the stub terminal exits at once, so counting runners would be
+        counting the scheduler's timing."""
+        d = self.daemon()
+        resp = d.dispatch({"op": "dispatch",
+                           "tasks": ["survey the css", "survey the js"]})
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["count"], 2)
+        self.assertEqual({j["plan"] for j in resp["jobs"]}, {resp["plan"]})
+        self.assertEqual([j["plan_index"] for j in resp["jobs"]], [1, 2])
+        self.assertIn(resp["plan"], resp["announce"])
+        self.assertEqual(resp["errors"], [])
+        d.dispatcher.cancel_plan(resp["plan"])
+
+    def test_the_plan_id_cancels_the_whole_group_through_jobs(self):
+        d = self.daemon()
+        plan = d.dispatch({"op": "dispatch",
+                           "tasks": ["one", "two", "three"]})["plan"]
+        resp = d.dispatch({"op": "jobs", "cancel": plan})
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["found"], 3, "one id has to reach all three")
+        # Deliberately not "all three were cancelled", and deliberately not
+        # asserted the instant the call returns. Members leave the group by
+        # three different routes: cancelled outright; stopped at the admission
+        # gate by the thread that a cancel freed a slot on, a beat later; or
+        # refused by the spawn firewall because the job finished and was
+        # reaped first, which is the firewall working. What the group cancel
+        # promises is the state the group settles in.
+        members = [j for j in d.dispatcher._jobs.values() if j.plan == plan]
+        self.assertEqual(len(members), 3)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if not any(j.state in ("queued", "running") for j in members):
+                break
+            time.sleep(0.05)
+        self.assertEqual([j.state in ("queued", "running") for j in members],
+                         [False] * 3,
+                         "a cancelled plan must leave nothing waiting or running")
+
+    def test_a_plan_of_one_is_refused_rather_than_quietly_dispatched(self):
+        resp = self.daemon().dispatch({"op": "dispatch", "tasks": ["just this"]})
+        self.assertFalse(resp["ok"])
+        self.assertIn("at least two", resp["message"])
+
+    def test_a_blank_entry_in_a_plan_is_a_protocol_error(self):
+        resp = self.daemon().dispatch({"op": "dispatch",
+                                       "tasks": ["real", "   "]})
         self.assertFalse(resp["ok"])
         self.assertEqual(resp["error"], "ProtocolError")
 

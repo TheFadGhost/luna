@@ -1,9 +1,11 @@
 """Agent invocation. ARCHITECTURE.md section 6.
 
 lunad never talks to a model API directly. It shells out to whichever headless
-agent CLI the desktop is configured for, reading the choice from
-``~/.config/omarchy/defaults/agent`` so Luna follows the same default as the
-rest of Omarchy rather than inventing her own.
+agent CLI it is configured for. The choice is `[assistant] agent` in Luna's own
+config, falling back to ``~/.config/omarchy/defaults/agent`` when that key is
+empty. The fallback is the fallback and not the source of truth: that file is
+the *desktop's* default agent and several other things read it, so Luna picking
+her own brain must not mean editing it out from under them.
 
 Two adapters are real: ``claude`` (Claude Code 2.1.241) and ``codex``
 (codex-cli 0.149.1). Both were verified against the binaries actually installed
@@ -37,7 +39,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Sequence
 
 from . import config, safety
 
@@ -152,6 +154,23 @@ class AgentReply:
 class BaseAdapter:
     name = "base"
 
+    #: Whether a conversational ask through this adapter can actually run
+    #: commands. Read by the server so Luna's operating notes describe the
+    #: machine she is on rather than the machine she used to be on: a prompt
+    #: that promises a shell to an agent invoked with the tools switched off
+    #: produces an assistant who says she will check and then guesses, and a
+    #: prompt that denies a shell to an agent that has one produces an
+    #: assistant who refuses work she could have done in a single command.
+    #: Both were observed. See persona.operating_notes.
+    ask_has_tools = False
+
+    #: Whether a turn can carry an image. Asked as a capability rather than
+    #: inferred from the adapter's class, because the alternative — dropping an
+    #: image the agent cannot take and answering anyway — produces a confident
+    #: description of a screen nobody looked at, assembled from the window
+    #: title in the context line. Better to say "this agent cannot see".
+    accepts_images = False
+
     def binary(self) -> str:
         raise NotImplementedError
 
@@ -189,6 +208,7 @@ class BaseAdapter:
         run: "AgentRun | None" = None,
         stdin_data: str | None = None,
         note: str = "",
+        on_line: "Callable[[str], None] | None" = None,
     ) -> tuple[str, str, int, int]:
         """Run an agent CLI to completion. Returns (stdout, stderr, rc, wall_ms).
 
@@ -196,6 +216,17 @@ class BaseAdapter:
         timeout path and one place where the pid enters and leaves the signal
         ledger. Interpreting the output is the adapter's business; owning the
         process is not.
+
+        ``on_line`` opts into reading stdout **as it arrives** rather than in
+        one lump at exit, and is handed each line the moment it lands. It
+        changes nothing about what this method returns or raises: the full
+        stdout, stderr, return code and timeout behaviour are identical either
+        way. It exists because of a measurement — ``codex exec`` emits
+        ``turn.completed`` and then spends a further 359-687 ms (median ~470)
+        writing its session rollout before it closes stdout and exits. Waiting
+        for the exit costs that half second on *every* ask, and it buys
+        nothing: the answer is already on the wire. See
+        ``docs/_latency-notes.md``.
         """
         started = time.monotonic()
 
@@ -232,7 +263,12 @@ class BaseAdapter:
             run.attach(proc)
 
         try:
-            stdout, stderr = proc.communicate(input=stdin_data, timeout=timeout)
+            if on_line is None:
+                stdout, stderr = proc.communicate(input=stdin_data,
+                                                  timeout=timeout)
+            else:
+                stdout, stderr = self._stream(proc, stdin_data, timeout,
+                                              on_line)
         except subprocess.TimeoutExpired:
             self._terminate(proc)
             stdout, stderr = proc.communicate()
@@ -249,6 +285,69 @@ class BaseAdapter:
             raise AgentCancelled(f"request {run.request_id} was cancelled")
 
         return stdout or "", stderr or "", proc.returncode, wall_ms
+
+    @staticmethod
+    def _stream(proc: subprocess.Popen, stdin_data: str | None,
+                timeout: float,
+                on_line: "Callable[[str], None]") -> tuple[str, str]:
+        """``communicate()``, but stdout is handed out line by line as it lands.
+
+        Same contract as ``communicate``: returns the *complete* stdout and
+        stderr, and raises :class:`subprocess.TimeoutExpired` on the same
+        deadline, so the caller's error handling does not have to know which
+        path it took. stdin and stderr get a thread each for the same reason
+        ``communicate`` uses threads — a child that fills a pipe nobody is
+        draining deadlocks, and codex writes progress text to stderr.
+
+        ``on_line`` is called on this thread and is not allowed to be slow;
+        anything it starts must be started, not waited for. An exception out
+        of it is logged and swallowed: an early-dispatch optimisation must
+        never be able to lose a reply that the agent successfully produced.
+        """
+        out_chunks: list[str] = []
+        err_chunks: list[str] = []
+
+        def pump_stderr() -> None:
+            try:
+                if proc.stderr is not None:
+                    err_chunks.append(proc.stderr.read() or "")
+            except Exception:  # noqa: BLE001 - stderr is diagnostic, not the reply
+                pass
+
+        def push_stdin() -> None:
+            try:
+                if proc.stdin is not None:
+                    if stdin_data is not None:
+                        proc.stdin.write(stdin_data)
+                    proc.stdin.close()
+            except Exception:  # noqa: BLE001 - a closed pipe shows up as rc anyway
+                pass
+
+        threads = [threading.Thread(target=push_stdin, daemon=True,
+                                    name="agent-stdin"),
+                   threading.Thread(target=pump_stderr, daemon=True,
+                                    name="agent-stderr")]
+        for thread in threads:
+            thread.start()
+
+        deadline = time.monotonic() + timeout
+        try:
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    out_chunks.append(line)
+                    if time.monotonic() > deadline:
+                        raise subprocess.TimeoutExpired(proc.args, timeout)
+                    try:
+                        on_line(line)
+                    except Exception:  # noqa: BLE001
+                        log.exception("agent stream callback failed")
+        finally:
+            remaining = max(0.0, deadline - time.monotonic())
+            for thread in threads:
+                thread.join(remaining)
+
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        return "".join(out_chunks), "".join(err_chunks)
 
     @staticmethod
     def _terminate(proc: subprocess.Popen, reason: str = "agent run ended") -> bool:
@@ -286,7 +385,7 @@ def shell_lines(argv: list[str]) -> list[str]:
     return lines
 
 
-def _first_existing(candidates: list[Path | str]) -> str | None:
+def _first_existing(candidates: Sequence[Path | str]) -> str | None:
     for cand in candidates:
         p = Path(cand)
         if p.is_file() and os.access(p, os.X_OK):
@@ -315,6 +414,13 @@ class ClaudeAdapter(BaseAdapter):
     """
 
     name = "claude"
+
+    # `--tools ""` above. Unchanged, and the reason Luna's default brain is no
+    # longer this adapter: a resident assistant that cannot look at the machine
+    # she lives on is a chatbot with a persona file. Switching
+    # `[assistant] agent` back to claude is still supported and still works —
+    # her operating notes simply tell the truth about what she can do.
+    ask_has_tools = False
 
     _CANDIDATES = [
         Path.home() / ".local/share/mise/installs/claude/latest/claude",
@@ -548,20 +654,34 @@ class CodexAdapter(BaseAdapter):
 
     name = "codex"
 
-    _CANDIDATES = [
-        Path.home() / ".local/share/mise/installs/codex/latest/bin/codex",
-        Path.home() / ".local/share/mise/shims/codex",
-        "/usr/bin/codex",
-    ]
-
     #: Name of the profile file Luna will write for the user's *own* codex
     #: sessions. A profile-v2 is `$CODEX_HOME/<name>.config.toml`, a separate
     #: file — not a `[profiles.x]` table inside the user's config.toml, which
     #: Luna never touches.
     PROFILE_NAME = "luna"
 
-    def __init__(self, model: str | None = config.DEFAULT_MODEL) -> None:
-        self.model = model
+    def __init__(self, model: str | None = None) -> None:
+        # Read late from `config`, not bound as a signature default: a default
+        # is fixed at import, and `CODEX_ASK_MODEL` is exactly the sort of name
+        # a test wants to move. `""` means the same as None here — the config
+        # contract says an empty `[assistant] model` is "the agent's own
+        # default", and for codex-as-Luna that default is a real slug rather
+        # than whatever codex would have picked.
+        self.model = model or config.CODEX_ASK_MODEL
+
+    #: `codex exec -i/--image <FILE>...`, and `gpt-5.6-luna` has vision
+    #: natively. No second model, no vision service, no HTTP call.
+    accepts_images = True
+
+    @property
+    def ask_has_tools(self) -> bool:
+        """codex has no `--tools ""`; the sandbox *is* the tool policy.
+
+        So this is not a constant, it is a reading of `CODEX_ASK_SANDBOX`:
+        under "read-only" she genuinely cannot run anything that changes the
+        machine, and her prompt must not claim otherwise.
+        """
+        return config.CODEX_ASK_SANDBOX != "read-only"
 
     def binary(self) -> str:
         # LUNA_CODEX_BIN, not LUNA_AGENT_BIN: dispatch may run codex while the
@@ -574,15 +694,18 @@ class CodexAdapter(BaseAdapter):
                     f"LUNA_CODEX_BIN={override} is not an executable file"
                 )
             return override
-        found = _first_existing(self._CANDIDATES)
+        # Read from `config`, not a class attribute: a name baked into the
+        # class body is fixed at import and a test cannot redirect it — see
+        # `config.CODEX_BIN_CANDIDATES` for the rest of that reasoning.
+        found = _first_existing(config.CODEX_BIN_CANDIDATES)
         if found:
             return found
-        which = shutil.which("codex")
+        which = shutil.which(config.CODEX_BIN_NAME)
         if which:
             return which
         raise AgentUnavailable(
             "codex CLI not found. Looked at: "
-            + ", ".join(str(c) for c in self._CANDIDATES)
+            + ", ".join(str(c) for c in config.CODEX_BIN_CANDIDATES)
             + " and $PATH. Set LUNA_CODEX_BIN to its absolute path."
         )
 
@@ -627,6 +750,7 @@ class CodexAdapter(BaseAdapter):
         output_file: str | None = None,
         sandbox: str | None = None,
         mode: str = "ask",
+        images: Sequence[str] = (),
     ) -> list[str]:
         """The argv for one turn. The prompt is *not* here — it goes on stdin.
 
@@ -668,6 +792,17 @@ class CodexAdapter(BaseAdapter):
         chosen_model = model or self.model
         if chosen_model:
             argv += ["-m", chosen_model]
+        # Last, and deliberately last. `-i/--image <FILE>...` is variadic: clap
+        # keeps eating tokens until it meets one that looks like a flag, so an
+        # image list in the middle of the command line would swallow whatever
+        # followed it. At the end there is nothing left to swallow. One `-i`
+        # per file rather than one `-i` with many, for the same reason.
+        #
+        # gpt-5.6-luna has vision natively and `codex exec -i` attaches the
+        # image to the turn. There is no second model here and no HTTP call:
+        # OpenRouter is for text-to-speech and nothing else.
+        for image in images:
+            argv += ["-i", str(image)]
         return argv
 
     def dispatch_argv(self, job_dir: str, system_file: str,
@@ -689,6 +824,14 @@ class CodexAdapter(BaseAdapter):
         argv += ["-C", job_dir, "--add-dir", job_dir]
         for extra in add_dirs:
             argv += ["--add-dir", extra]
+        # Sol's model, not Luna's, and not the caller's. `self.model` is the
+        # conversational slug and belongs to the ask path; a dispatched session
+        # is a coding agent doing coding-agent work, and the two are different
+        # models on purpose. Read from `config` at script-generation time so a
+        # change to the constant reaches the next job rather than the next
+        # daemon restart.
+        if config.CODEX_DISPATCH_MODEL:
+            argv += ["-m", config.CODEX_DISPATCH_MODEL]
         argv += ["-c", f'"{config.CODEX_PERSONA_KEY}=$(cat {system_file})"']
         return argv
 
@@ -703,6 +846,8 @@ class CodexAdapter(BaseAdapter):
         resume: str | None = None,
         timeout: float = config.AGENT_TIMEOUT_S,
         run: "AgentRun | None" = None,
+        images: Sequence[str] = (),
+        on_reply: "Callable[[str], None] | None" = None,
         **_: Any,
     ) -> AgentReply:
         # `session_id` is accepted and ignored, on purpose. claude lets the
@@ -716,9 +861,10 @@ class CodexAdapter(BaseAdapter):
         os.close(fd)
         try:
             argv = self.build_argv(system_prompt, model=model, resume=resume,
-                                   output_file=out_path)
+                                   output_file=out_path, images=images)
             stdout, stderr, rc, wall_ms = self._spawn_and_wait(
-                argv, timeout=timeout, run=run, stdin_data=prompt)
+                argv, timeout=timeout, run=run, stdin_data=prompt,
+                on_line=self._early_reply_watcher(on_reply))
             try:
                 last_message = Path(out_path).read_text(encoding="utf-8")
             except OSError:
@@ -731,6 +877,59 @@ class CodexAdapter(BaseAdapter):
                 os.unlink(out_path)
             except OSError:
                 pass
+
+    @staticmethod
+    def _early_reply_watcher(
+        on_reply: "Callable[[str], None] | None",
+    ) -> "Callable[[str], None] | None":
+        """Hand the finished reply out at ``turn.completed``, not at exit.
+
+        ``turn.completed`` is the earliest point that is safe to act on, and
+        deliberately not ``item.completed``/``agent_message``, which arrives
+        21-37 ms sooner. A turn may complete more than one message (see
+        :meth:`parse_output`, "last one wins") and may still fail after one,
+        so a message is a candidate and only the completed turn makes it the
+        answer. Those 30 ms are not worth speaking something the model went on
+        to retract; the ~470 ms of codex shutdown that follow are.
+
+        The callback fires at most once, never for a turn that reported an
+        error, and never for an empty message. Everything after this — the
+        full parse, the return code check, the ``-o`` fallback, every
+        exception :meth:`parse_output` can raise — is unchanged and still
+        happens. This only moves *when* the caller is told, not whether.
+        """
+        if on_reply is None:
+            return None
+        state = {"text": "", "failed": False, "fired": False}
+
+        def watch(line: str) -> None:
+            if state["fired"]:
+                return
+            line = line.strip()
+            if not line:
+                return
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                return
+            if not isinstance(event, dict):
+                return
+            kind = event.get("type")
+            if kind in ("turn.failed", "error", "thread.failed"):
+                state["failed"] = True
+            elif kind == "item.completed":
+                item = event.get("item")
+                if isinstance(item, dict) and item.get("type") == "agent_message":
+                    candidate = item.get("text")
+                    if isinstance(candidate, str) and candidate.strip():
+                        state["text"] = candidate
+            elif kind == "turn.completed":
+                if state["failed"] or not state["text"].strip():
+                    return
+                state["fired"] = True
+                on_reply(state["text"].strip())
+
+        return watch
 
     def parse_output(self, stdout: str, stderr: str, rc: int, wall_ms: int,
                      last_message: str = "",

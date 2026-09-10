@@ -134,10 +134,25 @@ SCHEMA: tuple[Section, ...] = (
             Key("name", "Luna", "str",
                 comment="display name + how she refers to herself"),
             Key("specialist", "Sol", "str", comment="the delegate persona"),
-            Key("agent", "claude", "str", choices=("claude", "codex"),
+            # codex, not claude. Luna's brain is `codex` running
+            # `gpt-5.6-luna`: it has a shell, web access and native vision, and
+            # the ask path now runs with all three switched on. This key is the
+            # one that decides — deliberately here and NOT in
+            # ~/.config/omarchy/defaults/agent, which is the whole desktop's
+            # default agent and is read by things that are not Luna. Changing
+            # that file to change her brain would have been a change to
+            # everyone else's.
+            Key("agent", "codex", "str", choices=("claude", "codex"),
                 comment="claude | codex   (falls back to "
                         "~/.config/omarchy/defaults/agent)"),
-            Key("model", "", "str", comment='"" = agent default'),
+            # Still "", and still meaning "the agent's own default" — which for
+            # codex is `gpt-5.6-luna` (config.CODEX_ASK_MODEL) and for claude is
+            # whatever claude picks. A model slug is not portable between
+            # agents, so pinning one here would be wrong the moment `agent`
+            # changed; the default belongs to the adapter, and this key is the
+            # override for someone who wants a different one.
+            Key("model", "", "str",
+                comment='"" = agent default (codex: gpt-5.6-luna)'),
         ),
     ),
     Section(
@@ -201,6 +216,16 @@ SCHEMA: tuple[Section, ...] = (
             Key("network_send", "ask", "policy",
                 comment="posting data off the machine"),
             Key("git_push", "ask", "policy"),
+            # "never" — just do it — because the user chose branch, commit,
+            # PR, wait for CI, auto-merge on green. The *green* half of that
+            # is not a policy and cannot be turned off here: `lunad.vcs`
+            # refuses a merge whose checks have not all concluded
+            # successfully whatever this key says. Set it to "ask" to be
+            # consulted before each merge, or "deny" to have her open the
+            # pull request and stop.
+            Key("git_merge", "never", "policy",
+                comment="merging her own PR; the green-checks gate is in "
+                        "code, not here"),
             Key("long_job", "ask", "policy",
                 comment="anything estimated over `long_job_seconds`"),
             Key("long_job_seconds", 300, "int", minimum=1, maximum=86_400),
@@ -229,6 +254,13 @@ SCHEMA: tuple[Section, ...] = (
             Key("consolidate_every_turns", 12, "int", minimum=0, maximum=1000,
                 comment="0 = never; the pass costs tokens"),
             Key("decay_half_life_days", 30, "int", minimum=1, maximum=3650),
+            # Read late, on every recall, so a change takes effect on the next
+            # question without a restart. Off is not a degraded mode: recall
+            # falls back to the keyword index it has always had, which is also
+            # what happens on its own when the model is absent.
+            Key("semantic_recall", True, "bool",
+                comment="search episodes by meaning as well as by keyword; "
+                        "needs `luna embed fetch`"),
         ),
     ),
     Section(
@@ -249,6 +281,46 @@ SCHEMA: tuple[Section, ...] = (
             Key("job_retention_days", 14, "int", minimum=0, maximum=3650,
                 comment="finished job directories older than this are "
                         "collected; 0 = never"),
+            # Queued only. A job that was *running* when the daemon died is
+            # never re-run whatever this says: its process is gone but its
+            # side effects are not, and nothing on disk records how far it
+            # got. Off restores the old behaviour, where a restart meant a
+            # clean slate and the wait was simply lost.
+            Key("requeue_on_start", True, "bool",
+                comment="queued jobs are picked back up after a restart; "
+                        "running ones are never re-run"),
+        ),
+    ),
+    Section(
+        "vcs",
+        align=20,
+        header=(
+            "How her work reaches GitHub. Every piece of it goes branch ->",
+            "commit -> push -> pull request; she never pushes to the default",
+            "branch, and she merges her own pull request only when CI is",
+            "green. What \"green\" means is in `lunad/vcs.py` and is not a",
+            "setting: all checks concluded successfully, none pending, none",
+            "missing, not a draft, mergeable. A repository with no CI",
+            "configured therefore never auto-merges.",
+        ),
+        keys=(
+            Key("branch_prefix", "luna", "str",
+                comment="branches are `<prefix>/<topic>-<yymmdd>`"),
+            Key("auto_merge", True, "bool",
+                comment="attempt the merge once the checks are green"),
+            Key("merge_method", "squash", "str",
+                choices=("squash", "merge", "rebase")),
+            Key("delete_branch", True, "bool",
+                comment="delete the head branch when the merge lands"),
+            Key("notify_on_refusal", True, "bool",
+                comment="toast when an auto-merge was refused"),
+            # 0 means do not wait: read the checks once and decide. It does
+            # not mean "wait forever", and it is not an off switch for the
+            # gate — a `ship` with 0 simply refuses anything CI has not
+            # finished reporting on yet, which is the safe direction.
+            Key("check_wait_seconds", 900, "int", minimum=0, maximum=21_600,
+                comment="how long `luna vcs ship` waits for CI; 0 = do not "
+                        "wait"),
         ),
     ),
     Section(
@@ -269,6 +341,96 @@ SCHEMA: tuple[Section, ...] = (
                 comment="rotate once the live log passes this; 0 = never"),
             Key("keep", 5, "int", minimum=1, maximum=100,
                 comment="numbered siblings kept; the oldest is deleted"),
+        ),
+    ),
+    Section(
+        "ambient",
+        align=22,
+        header=(
+            "The three things she notices on her own. Ambient events NOTIFY;",
+            "they never speak -- speaking aloud is reserved for a job the "
+            "user started.",
+        ),
+        keys=(
+            Key("enabled", True, "bool",
+                comment="master switch for all three hooks"),
+            Key("poll_seconds", 60, "int", minimum=5, maximum=3600,
+                comment="one tick; each hook is a stat(), not a fork"),
+            # OFF, and for the same reason `battery` is: Omarchy already
+            # ships `omarchy-crash-watch.service`, it is running, and it does
+            # this better -- it streams the coredump MESSAGE_ID out of the
+            # journal (so it has the signal name and the full exe path, which
+            # a core filename does not) and its toast already offers a
+            # click-to-diagnose against the same skill. Luna's exists for
+            # anyone who has turned that one off, or who wants the crash and
+            # the diagnosis in her audit log and her job list instead.
+            Key("crash", False, "bool",
+                comment="OFF: omarchy-crash-watch already announces these"),
+            Key("crash_diagnose", True, "bool",
+                comment="when crash is on, the toast's click dispatches it"),
+            # OFF by default, and the only hook that is. Omarchy already
+            # notifies at 10% from its own bar service, and UPower hibernates
+            # at 2%. A second source nagging about the same battery at the
+            # same moment is worse than none, so this stays off until somebody
+            # decides they want an *earlier* warning than the desktop's.
+            Key("battery", False, "bool",
+                comment="OFF: Omarchy already warns at 10%"),
+            Key("battery_low_pct", 20, "int", minimum=1, maximum=100,
+                comment="above Omarchy's 10% toast"),
+            Key("battery_critical_pct", 5, "int", minimum=1, maximum=100,
+                comment="below it, above UPower's 2% hibernate"),
+            Key("update", True, "bool",
+                comment="an omarchy update landed and rewrote /usr/share"),
+        ),
+        footer=(
+            "'An update is available' is deliberately NOT checked here: that "
+            "costs a",
+            "network sync (checkupdates), and Omarchy's own bar widget "
+            "already polls it",
+            "every six hours and shows the answer.",
+        ),
+    ),
+    Section(
+        "hud",
+        align=14,
+        header=(
+            "The orb overlay -- the sprite the desktop draws for her, and the "
+            "caption",
+            "beside it. Read by the Quickshell plugin, NOT by lunad: the "
+            "daemon's only",
+            "job here is to project these six keys into "
+            "$XDG_RUNTIME_DIR/luna/hud.json,",
+            "which is a file QML can actually read. See docs/CONFIG-SCHEMA.md "
+            "[hud].",
+        ),
+        keys=(
+            Key("enabled", config.HUD_ENABLED, "bool",
+                comment="false draws nothing and unmasks nothing"),
+            Key("corner", config.HUD_CORNER, "str",
+                choices=config.HUD_CORNERS,
+                comment="top-left | top-right | bottom-left | bottom-right"),
+            Key("scale", config.HUD_SCALE, "float",
+                minimum=config.HUD_SCALE_MIN, maximum=config.HUD_SCALE_MAX,
+                comment="multiplier on the sprite's base size"),
+            # False, so the overlay is a thing that appears when she is doing
+            # something rather than a thing that is always on the screen. The
+            # bar icon is the always-on surface and it already exists; a second
+            # permanent one is clutter until somebody asks for it.
+            Key("idle_visible", config.HUD_IDLE_VISIBLE, "bool",
+                comment="true keeps the sprite on screen while she is idle"),
+            Key("caption", config.HUD_CAPTION, "bool",
+                comment="draw what she says beside the sprite"),
+            Key("sprite", config.HUD_SPRITE, "str",
+                choices=config.HUD_SPRITES,
+                comment="only \"orb\" exists; anything else falls back to it"),
+        ),
+        footer=(
+            "There is no ttl key. How long a caption stays up is the pane's "
+            "own contract",
+            "(HANDOFF-hud.md): the countdown does not even start while she is "
+            "still",
+            "speaking, so a number here would not mean what it looked like it "
+            "meant.",
         ),
     ),
     Section(

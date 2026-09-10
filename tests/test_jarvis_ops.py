@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import unittest
 from typing import Any
+from unittest import mock
 
-from lunad import agent, confirm as confirm_mod, dispatch, settings as settings_mod
+from lunad import (agent as agent_mod, confirm as confirm_mod, dispatch,
+                   server, settings as settings_mod)
 from lunad.server import Daemon
 
 from ._support import FakeHyprland, TempMemoryCase
@@ -146,8 +148,18 @@ class HotReloadInDaemonCase(JarvisDaemonCase):
     def test_switching_to_a_bad_agent_keeps_the_working_one(self) -> None:
         d = self.daemon()
         before = d.agent_name
-        d._settings_changed([{"key": "assistant.agent", "from": "claude",
-                              "to": "nonsense"}])
+        # The handler re-reads the setting rather than trusting the change
+        # record, and the schema will not store a value outside its choices —
+        # so the failure is staged where it actually happens, at the adapter
+        # lookup. (This used to lean on `assistant.agent` still defaulting to
+        # "claude"; it defaults to "codex" now, and the test was passing for
+        # the wrong reason.)
+        def refuse(_name: str, **_kw: object) -> object:
+            raise agent_mod.AgentUnavailable("no such agent")
+
+        with mock.patch.object(server.agent, "get_adapter", refuse):
+            d._settings_changed([{"key": "assistant.agent", "from": before,
+                                  "to": "nonsense"}])
         self.assertEqual(d.agent_name, before)
 
 

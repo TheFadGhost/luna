@@ -1,4 +1,4 @@
-# State of play — 2026-08-30
+# State of play — 2026-08-31
 
 ## Done and verified
 
@@ -149,22 +149,48 @@ saves. It is kept for conversational continuity, not for money.
   voxtype daemon, plus its `voxtype-audio-bridge` child. Layer surface
   `voxtype-osd` on the overlay layer, visible only while not idle.
 
-## Next (Phase 3)
-1. ~~Bar widget + `subscribe` for live state.~~ Built — see below. `subscribe`
-   was dropped rather than built.
-2. Ambient hooks: crash, battery, `omarchy update`.
-3. Semantic recall. Tier 2 is FTS5 keyword only. If it lands, use a small ONNX
-   model under `onnxruntime` alone — not sentence-transformers, and not
-   VoiceMem. Decay was done in Phase 0 and the old wording here implied
-   otherwise.
-4. Wire `luna hush` to a keybind so a spoken reply can be cut off by hand.
-5. Worker fan-out as a *plan* — the gate and the queue are built, so several
-   jobs can be in flight and the number is bounded, but Luna still does not
-   decide on her own to split a task across workers. That is a planning change
-   in the persona and the ask path, not plumbing.
+## Next
+Everything that was on this list under the "Phase 3" heading is now built:
+the bar widget, all three ambient hooks, semantic recall and the `SUPER+F10`
+hush keybind — see the phase sections below for each.
+
+**CORRECTED:** the second item that used to sit here — no Jarvis GUI pane for
+the `[ambient]` table, and the `jarvis-settings` suite red because of it — is
+done; see "Persona: the gate is on action, not manner" and "Jarvis — typeset,
+not boxed" below, and "Verify, and what is currently broken" for the counts.
+
+**CORRECTED:** the item that used to be the sole entry here — "Worker fan-out
+as a *plan*" — is done. `Dispatcher.dispatch_plan` and `luna dispatch "a"
+--and "b"` exist, priced and refused by the persona's own criterion for when
+splitting work is worth it at all; see "Phase 4" below.
 
 Tier 3, the consolidation pass, the admission gate and the job GC were all on
 this list. They are done — see Phase 2d and Phase 2e below.
+
+What is genuinely still unbuilt, as of Phase 4:
+
+1. **No retry or backoff on a transient `gh` failure.** A rate limit or a
+   flaky 502 inside `checks()`/`merge()` surfaces as whatever `Ran` it
+   produced; there is no distinction yet between "gh said no" and "the
+   network hiccuped once." `existing_pr()`/`slug()` still assume `gh` is
+   reachable and don't degrade offline the way `default_branch()` now does.
+2. **No merge-queue support**, no required-reviewers beyond the single
+   `reviewDecision` field GitHub returns, and no ruleset-based repositories —
+   `vcs.evaluate()` reads exactly the fields in `PR_FIELDS` and nothing else.
+   `[vcs] check_wait_seconds` is one global default with no per-repo override.
+3. **No adoption of a job that outlived its daemon.** A job whose process is
+   still running when `lunad` restarts is left alone, reported `running` then
+   `orphaned` once it dies — the daemon never owned its pid and does not poll
+   it back into its own bookkeeping.
+4. **No plan-level cost gate.** `estimate_seconds`/`estimate_usd` are priced
+   per task; a plan of six costs six times what one task says, and no caller
+   yet makes a plan-level estimate before dispatching one. Also still
+   missing: dependency ordering between plan members (a plan is a set, not a
+   graph) and cross-daemon queue support (rehydration is start-up only).
+5. **No pane-construction tests in `jarvis-settings`.** Nothing in
+   `jarvis-settings/tests` builds a pane, so the Overlay and GitHub panes'
+   construction and dependent-row handling were verified by hand — true of
+   all ten panes now, not just the two newest.
 
 ### Phase 3 — presence, and the bar widget (2026-08-30)
 
@@ -503,17 +529,21 @@ is not under `$HOME` instead.
   warm: piper 96-124 ms short / 341-409 ms for two sentences; OpenRouter
   1.5-1.8 s / 2.3-2.9 s. Better voice, real latency cost. `[voice] provider`
   switches back with no restart.
-- **Codex `ask` has tools; Claude `ask` does not.** `claude` takes `--tools ""`
-  and is genuinely text-in/text-out. codex has no equivalent flag, so the
-  sandbox *is* the tool policy: an `ask` runs `-s read-only`, which still lets
-  it read files and run read-only commands. It is contained, not inert, and the
-  persona's "you are running headless with no tools" line is therefore not
-  strictly true on codex.
+- **Codex `ask` has real tools now; Claude `ask` does not.** This used to be a
+  limitation the other way round — codex's `ask` ran `-s read-only` and the
+  persona said outright that she had no tools, which was true and was the
+  wrong trade (asked for a version she said she could not check it). Both
+  `ask` and `dispatch` now run codex under `--dangerously-bypass-approvals-
+  and-sandbox` (ARCHITECTURE.md §6a), and the persona's closing text was
+  rewritten to name the shell, files and the web instead of denying them.
+  `claude`'s `ask` still passes `--tools ""` and is genuinely text-in/text-out,
+  so the asymmetry is now the other way: codex-as-Luna has real tools on every
+  turn, claude-as-Luna has none on `ask` and full autonomy only once
+  dispatched.
 - **Codex reports no per-call price.** It is on a ChatGPT subscription, so
   `cost_usd` is `None` and `billing` is `"subscription"`. The daemon's money
   counter stays at zero on codex, which is correct but means `luna status` is
   not a like-for-like comparison between the two agents.
-- **Semantic recall not implemented** — tier 2 is FTS5 keyword only. Phase 3.
 - **Tier 3 measures; it does not understand.** Pattern extraction has false
   negatives everywhere: a preference told as a story, a fact stated obliquely,
   sarcasm of any kind. It reads only the user's own words, so anything Luna
@@ -537,11 +567,11 @@ is not under `$HOME` instead.
 - **`fallback_on_empty` cannot be disabled.** Every Luna recording leaves the
   raw transcript on the clipboard. Harmless, but it does clobber the clipboard
   on every voice turn. If that becomes annoying the only fix is upstream.
-- **Barge-in has no keybind yet.** `luna hush` works from a terminal only.
 - **A voice ask that fails speaks a generic apology**, not the actual error;
   the detail is in `luna log`.
-- **A dispatched session is not sandboxed.** It runs with `bypassPermissions`
-  and real tools, so it could write anywhere the user can. Sol's namespace
+- **A dispatched session is not sandboxed.** It runs full-autonomy and real
+  tools — `bypassPermissions` on claude, `--dangerously-bypass-approvals-and-
+  sandbox` on codex — so it could write anywhere the user can. Sol's namespace
   isolation is enforced in lunad's memory API and stated in his prompt; it is
   not a filesystem boundary. The audit log is the mitigation.
 - **The Hyprland window rule is runtime-only.** It vanishes on a config reload
@@ -550,10 +580,27 @@ is not under `$HOME` instead.
   says so in its note.
 - **`dispatch` does not fan out *by itself*.** One call is one job. Several can
   be in flight and `[dispatch] max_parallel` bounds them, but Luna does not
-  plan a fan-out for you.
+  plan a fan-out for you. **CORRECTED:** `Dispatcher.dispatch_plan` and `luna
+  dispatch "a" --and "b"` now exist (Phase 4 below), gated by the same
+  admission bounds and by a persona criterion that refuses to split work that
+  shares state. Left as a limitations entry because the split is still priced
+  per task, not per plan — see "Next."
 - **A queued job does not survive the daemon.** It is cancelled on shutdown
   with the reason recorded, rather than left as a promise a restarted daemon
   has no queue to keep. Nothing was spawned, so nothing is lost but the wait.
+  **CORRECTED:** `[dispatch] requeue_on_start` (default on, Phase 4 below) now
+  rehydrates a job that was only ever queued; a job whose process was actually
+  running when the daemon died is still never re-run — its side effects are
+  unknown, and re-running would repeat them unattended.
+- **A cancelled job can be relabelled `FAIL`.** `Dispatcher._watch` overwrites
+  a job's state with `finished`/`failed` from its exit code whenever the
+  terminal exits, including one the user just cancelled — the watcher wakes
+  after the fact and stamps `FAIL` over `cancelled`. Pre-existing, found
+  while building Phase 4's fan-out plans, not introduced by them; the fix
+  touches a finish path several other tests and the `dispatch.finish` audit
+  entry depend on, so it was left alone. What a plan-cancel actually
+  guarantees (nothing left queued or running) is asserted directly rather
+  than relying on the state label.
 - **Rotation retains a bounded history**, `[audit] keep` files of
   `[audit] max_mb` — 48 MB by default. Past that the oldest file *is* deleted;
   the deletion is recorded but the bytes are gone. Set `max_mb = 0` to keep the
@@ -584,6 +631,12 @@ is not under `$HOME` instead.
   machine, so F10 sits directly next to it and the pair reads as one idea:
   F9 types what you say, F10 sends it to Luna. Still `record toggle`, not
   push-to-talk — a question to Luna is usually a whole sentence.
+- **Barge-in keybind: `SUPER + F10`, `luna hush`.** Was pending long enough to
+  be listed as a limitation ("`luna hush` works from a terminal only"); it is
+  bound, in `~/.config/hypr/bindings.lua` line 76, verified free the same way
+  F10 was. `SUPER + F10` and not a bare F11/F12 on purpose — a bare F-key
+  bound at the top level collides with fullscreen and devtools in the browser
+  — and it reads as one idea with F10: her key, plus SUPER, means stop.
 - **VoiceMem (`xzf-thu/VoiceMem`) evaluated and rejected as a dependency.**
   Apache-2.0, genuinely runnable, and its "dual-brain" split (factual
   schema/entity memory vs. an emotion/persona accumulator) is a good worked
@@ -805,3 +858,646 @@ code that spends real money and rewrites a file the user curates by hand.
   was piped.
 - 649 tests pass in the root suite, up from 615; 98 in `jarvis-settings`,
   unchanged.
+
+### Sight, and self-dispatch (2026-08-30)
+
+Two things she gained the same day: a pair of eyes, and the ability to
+delegate by actually doing it instead of describing what she would do.
+
+- **`luna look "<question>"`** — `lunad/context.py` captures the focused
+  window with `grim`, into a `mkdtemp()` removed in a `finally` regardless of
+  outcome, and hands it to the model as an image. Nothing is captured unless a
+  look was asked for; an ordinary ask photographs nothing.
+- **The focused-window line rides on every ask**, in the user message, never
+  the system prompt — the same cache-prefix discipline the tier-2 recall fix
+  established (§4 of ARCHITECTURE.md). It degrades to nothing on any failure
+  and cannot cost an answer.
+- **Self-dispatch.** She has a shell now, and `luna dispatch --to sol "<task>"`
+  by absolute path was already audited and already returns immediately, so she
+  runs it herself. Verified rather than assumed that this works from inside a
+  live `ask`: `ReentrancyCase` opens a second real connection to the daemon
+  from inside the adapter while the outer request is still open, and nothing
+  deadlocks.
+- **The result comes back as memory, not just a toast.** `ReportingDispatcher`
+  writes a finished job into tier 2 as an ordinary exchange, so the next
+  question on the subject retrieves what Sol found without anyone naming a job
+  id. Before this, a delegated finding sat in `jobs/<id>/output.txt` where she
+  would never read it, and the same question a week later dispatched the same
+  job again.
+- **Dispatched jobs run `gpt-5.6-sol`**, not whatever codex would otherwise
+  have picked — the Daemon now hands its own agent name to the Dispatcher, or
+  every self-dispatched job from a codex-brained Luna would have been written
+  in claude's flags and quietly failed in the hidden workspace.
+- `data/persona.md` gained the mechanism, the exact `luna dispatch` syntax,
+  and a "Sight" section — nothing existing removed or softened;
+  `test_selfdispatch.py` asserts the anti-sycophancy, triage, two-objection,
+  never-re-litigate, short-spoken and dry-register rules are all still present
+  in the assembled prompt.
+
+### The brain moves to Codex, with real tools (2026-08-30)
+
+`[assistant] agent` now defaults to `codex`, model `gpt-5.6-luna`
+(`config.CODEX_ASK_MODEL`, an adapter default — `[assistant] model` stays `""`
+and still means "the agent's own default", which is now this).
+`~/.config/omarchy/defaults/agent` is untouched: it is the whole desktop's
+fallback, and other things read it, so it stays the fallback rather than
+becoming the source of truth for Luna specifically.
+
+**`CODEX_ASK_SANDBOX` moved from `"read-only"` to `"bypass"`,** the same
+setting `dispatch` already used. The old value was contained but honest about
+being crippled: `_CLOSING` in the persona said outright *"You are running
+headless with no tools. You cannot read files, run commands, or inspect the
+machine right now."* Both were true and both were the wrong trade — asked for
+a version she said she could not check it; asked what was on screen she
+suggested starting the daemon, bad advice she had no way of knowing was bad,
+because nothing in her prompt said the daemon she runs inside has a
+dispatcher, a CLI and a pair of eyes. `_CLOSING` was rewritten to name the
+shell, files and the web instead of denying them. `claude`'s `ask` still
+passes `--tools ""` and keeps the honest "no tools" text — chosen per adapter
+through `BaseAdapter.ask_has_tools`, so deleting it there would only have
+moved the same lie to the other agent.
+
+**`"bypass"` over `"danger-full-access"` was a judgement call about the
+mechanism, not about how much access she should have** — the user's full
+autonomy and the audit log settle that question regardless. Two reasons,
+verified against codex 0.149.1 `--help`, not assumed: `codex exec resume`
+takes no `-s` at all, so a sandbox *mode* would have to be restated as
+`-c sandbox_mode=…` on every resumed turn — turn one and turn two landing
+under different policies is exactly the kind of mismatch production finds and
+review does not — while `--dangerously-bypass-approvals-and-sandbox` is
+accepted identically by `exec` and `exec resume`. And `danger-full-access`
+leaves the *approval* policy in place, which in a headless daemon is not a
+prompt anyone can answer — it is a hung ask.
+
+Full detail, including the model slugs and the table of what each CLI flag
+does, is in ARCHITECTURE.md §6a.
+
+### Concurrency and resource fixes (2026-08-30)
+
+A focused pass over six numbered findings from a concurrency and resource
+audit, plus six more in the memory layer from the same pass. None changed the
+design; all closed a real leak or a real race that only shows up against a
+live daemon under overlap.
+
+**Concurrency and resource:**
+
+- **Two overlapping asks on one conversation used to race on the same
+  `--session-id`.** `Session.acquire()` handed the same unstarted session to
+  any caller sharing a conversation key — a detached voice-router ask arriving
+  mid a CLI ask on the default conversation, for instance — and both computed
+  "this is turn one". A second genuinely concurrent caller now waits (bounded
+  by `pending_wait_s`, the same ceiling one agent call is already allowed)
+  for the first turn to land or the session to drop, then resumes correctly;
+  past the bound it raises `SessionBusy` rather than blocking forever. A
+  same-thread re-acquire — a solo retry, or the resume-refused-so-start-fresh
+  path — is unaffected.
+- **`safety.terminate()` used to report a kill as successful without checking
+  the process actually died.** A process stuck in an uninterruptible kernel
+  sleep survives `SIGKILL`. It now confirms death with a bounded poll after
+  each signal and returns `False`, honestly, when it cannot confirm it.
+  `safety.reap()` itself only ever edited the ledger and never waited, and
+  every "wait once, give up silently" call site — a hung `notify-send`, a
+  dispatched watcher — was treating it as if it had reaped the child too. The
+  new `reap_after()` does a real bounded wait and, past that, keeps trying on
+  a background thread instead of abandoning a permanent zombie. The pid
+  firewall's invariant is untouched: this only moves *when* the reap happens,
+  never what `may_signal()` checks, and a recycled pid is still caught by the
+  start-time comparison even in the worst ordering.
+- **`Dispatcher._watch`'s cleanup had the same bug**, plus a second one: an
+  exception past `self._admitting.discard(job_id)` left a job id reserved
+  forever, shrinking `max_parallel` by one per occurrence until a restart.
+  The whole spawn body is now wrapped in `try`/`finally`. Worse, when that gap
+  opened inside `_watch`'s own call to `_admit_next()` (admitting the *next*
+  queued job), the exception used to abort the rest of `_watch()` before
+  `notify_finished(job)` ran for the job that had actually just finished —
+  `_admit_next()` is now called inside its own `try`/`except`, so a finished
+  job's bookkeeping always completes regardless of what happens admitting
+  whatever comes after it.
+- **Barge-in used to be able to wait behind a cold piper load.**
+  `_ensure_worker` held the speech lock for the entire cold load — spawn plus
+  up to 60 s waiting for `READY` — and `cancel()`/`status()` took the same
+  lock, so a barge-in arriving mid-load blocked for the rest of it: exactly
+  backwards for the most latency-sensitive kill in the daemon. The lock now
+  only ever guards a state check or transition; the slow spawn-and-wait runs
+  with it released, and the in-progress `Popen` is parked where `cancel()` can
+  find and kill it directly.
+- **A stalled OpenRouter sentence used to keep billing after piper had already
+  taken over.** `_play_remote`'s consumer fell back to piper without telling
+  the background producer thread to stop, so it kept requesting — and the
+  user kept paying for — audio for every remaining sentence piper was already
+  speaking. It now signals the producer to stop after the one request already
+  in flight.
+- **The socket read was bounded after buffering the whole line, not while
+  reading it.** `protocol.read_line()` now caps every underlying `readline()`
+  call itself, so an oversized line with no newline is abandoned as it grows
+  rather than after it is already in memory. Low severity — a 0600 Unix
+  socket, local-only — but cheap to close.
+
+**Memory:**
+
+- **FTS recall precision.** `build_fts_query` fell back to raw stopword
+  tokens when filtering emptied the list, so a pure filler sentence ("so
+  anyway do you think I should do something about this") matched 10–14 of the
+  stored episodes against the real database. The stopword list now covers the
+  generic verbs, quantifiers and fillers that carried no signal, a query needs
+  at least one reasonably rare surviving token to run at all, and
+  `EpisodeStore.search` tries every token in the same row (AND) before
+  widening to OR — the filler query now matches 0. (This is the same fix
+  ARCHITECTURE.md §4 describes in more detail; it landed before the semantic
+  half and is the reason the semantic half was safe to add.)
+- **Consolidation retries instead of losing a batch.** A reply that would not
+  parse used to advance the watermark unconditionally in a `finally`, so one
+  malformed model reply permanently dropped that batch of episodes — they
+  were never offered to the pass again. That was defended as runaway-cost
+  control when the pass was billed per token; on a flat subscription a retry
+  costs nothing and losing the user's words is the more expensive failure. The
+  watermark now only advances when the reply parses, or after
+  `max_unparseable_retries` (default 3) consecutive failures against the
+  *same* batch, and still advances and logs loudly on giving up rather than
+  retrying forever.
+- **Correction detection no longer pins on a bare word.** `\bactually\b` and
+  `\b(wrong|incorrect)\b` matched "actually I like this" or "my code is
+  wrong" — no correction of Luna at all — and permanently pinned an unrelated
+  memory at salience 1.0 with no decay. Both are now anchored to a
+  second-person reference in the same clause ("you got that wrong"), with
+  "actually" also accepting the contrastive "X, not Y" shape a correction
+  often takes without addressing her directly.
+- **Text is capped before the similarity query and before storage.**
+  `count_similar` used to build its FTS query from the entire, uncapped user
+  message on every write. `EpisodeStore.record` now clips both sides of an
+  exchange to 20,000 characters before scoring or storing, and the similarity
+  query separately clips to a tighter 2,000 — whatever makes a message "look
+  like" a prior episode is decided well before two thousand characters in.
+- **`atomic_write` now fsyncs.** It was already atomic against a killed
+  process (temp file, then `os.replace`) but not durable against power loss —
+  the write and the rename can sit in the page cache and vanish with the
+  machine. It now fsyncs the temp file's contents before the rename and the
+  containing directory after it, both best-effort: a filesystem that refuses
+  fsync must not turn a memory write into an unhandled exception on the
+  answer path.
+- **Tier-1 reads take the same lock as writes.** `text()`, `entries()` and
+  `usage()` used to read `LUNA.md`/`USER.md` straight off disk with no lock at
+  all, safe today only by accident of `os.replace` being atomic at the
+  filesystem level — but it broke the invariant the rest of the class is
+  written against (`_check_cap` already relies on the lock being reentrant).
+  They now go through the same `self._lock` as every write.
+
+### Semantic recall (2026-08-30)
+
+Built, tested and RAM-corrected the same day — see ARCHITECTURE.md §4 for the
+full design, the anchor-point measurements and the cost table. In brief:
+`lunad/embed.py` adds `all-MiniLM-L6-v2` under `onnxruntime` alone, in the
+same two-role worker shape as piper, with a pure-stdlib WordPiece tokenizer so
+no pip dependency is added. `EpisodeStore.search` unions the FTS candidates
+with the vector lookup and keeps the better of each episode's two coverage
+readings. Absent model, silent FTS5-only fallback — nothing downloads itself
+behind a question.
+
+Writing the tests found three real bugs: the worker never emitted `READY`
+because onnxruntime defers allocation to the first call and the first call is
+on the ask path (fixed by warming up with a forward pass before signalling
+ready); the reply parser used one `split(" ", 3)` for every frame kind, which
+desynchronised the pipe the moment a `VECS` header (five fields) followed a
+`HITS` body (JSON, containing spaces); and `wait_ready` used to block out the
+full 30 s spawn timeout on a machine with no model at all, stalling every
+background backfill on an event nobody was going to set.
+
+Two things came from measuring rather than guessing: the onnxruntime CPU
+arena allocator never returns memory, so a batched backfill permanently set
+the worker at 486 MB — disabled, the worker holds **181 MB** steady, which is
+the number now used everywhere in this repository (ARCHITECTURE.md §2 and
+§4's cost table both read 181 MB; the earlier "~90 MB" budget was always the
+*file* size, not the resident process, the same mistake made and corrected
+for piper). And batching buys nothing at this scale — 102 ms per episode at
+batch 1 against 126 ms at batch 32, for 198 MB peak against 573 MB — so the
+backfill batch size is 4.
+
+### Ambient hooks, and the HUD pane's contract (2026-08-30)
+
+Until this, Luna only ever existed when addressed — every path in the daemon
+starts with a request arriving on the socket. `lunad/ambient.py` is the first
+that starts with the machine. Full design in ARCHITECTURE.md §7c; the
+headline facts:
+
+- **The rule — an ambient event notifies, it never speaks — is enforced in
+  three layers**, not stated in a comment: the module never imports
+  `lunad.speech`; `Ambient` only delivers through a `Notifier`, type-checked
+  at construction; and `_assert_mute` walks everything hung off `Ambient` at
+  construction and refuses any collaborator with a `.say()`/`.speak()`
+  method. `tests/test_ambient.py::NeverSpeaksCase` walks the live object
+  graph and fails if any of the three is ever weakened.
+- **Crash and battery default OFF, on purpose, because Omarchy already does
+  the job better.** `omarchy-crash-watch.service` is enabled and streams the
+  coredump `MESSAGE_ID` out of the journal event-driven — no polling — and
+  knows the signal name and full executable path, which a core *filename*
+  does not. Omarchy's own battery service polls every 30 s and warns at 10%,
+  with UPower hibernating at 2%. Luna's hooks are kept for what the desktop's
+  cannot do: the crash lands in her audit log and the diagnosis (one click,
+  `luna ambient diagnose <pid>`, dispatched against the `diagnose-crash`
+  skill) in her job list, under her own confirmation policy — and for anyone
+  who has turned the desktop's own watcher off.
+- **Update stays ON — the one hook nothing else on the machine watches.**
+  `omarchy update` rewrites `/usr/share/omarchy` wholesale, which is exactly
+  how a customisation gets silently reverted. Whether an update is merely
+  *available* is deliberately not checked — that costs a network sync, and
+  Omarchy's own bar widget already polls it every six hours.
+- **The HUD pane's message-file contract is now honoured.** The pane itself —
+  a click-through Quickshell overlay in a screen corner — lives on the
+  machine, not in this repository: `~/.config/omarchy/plugins/ghost.lunahud/`,
+  documented in `~/.config/omarchy/CUSTOMISATIONS.md` §8a.14, the same way the
+  bar widget above is referenced rather than duplicated here. Its contract,
+  `HANDOFF-hud.md`, specifies one JSON object atomically written to
+  `$XDG_RUNTIME_DIR/luna/message` with a monotonically increasing `id`;
+  `ambient.py` is what publishes into it, on the same notify-never-speak
+  channel as the toasts.
+- `luna status` gained one ambient line, and it says "never speaks" in those
+  words. `luna ambient` reports when the desktop's own watcher is already
+  running, so turning Luna's crash hook on does not silently duplicate a
+  toast without at least saying so first.
+
+### Jarvis — typeset, not boxed (2026-08-30)
+
+The settings app's look was the generic one: an accent bar down the selected
+nav row, decorative 1–7 numbering that was neither accelerator nor tooltip,
+and rounded cards nested inside a rounded pane so two concentric rectangles
+bought no hierarchy at all. Boxes were doing the job typography should do.
+
+- **`card()` is deleted.** A group of settings is now a hairline marking the
+  break, a real heading at a real size, and rows separated by whitespace —
+  hierarchy is size, weight, colour value and space, not a box.
+- **Sidebar selection is weight and contrast.** The selected row is drawn in
+  full contrast and bold weight — no accent bar, no pill, no fill, no left
+  border.
+- **Confirmations reads `Allow / Ask first / Refuse`** rather than the
+  `never`/`ask`/`deny` config vocabulary leaking into the UI as three words
+  that used to look like the same object.
+- **New named tokens in `theme.py`**: `COLUMN` (the grid) and `RHYTHM`
+  (vertical spacing, every value a multiple of an existing space token). No
+  bare hex, no inline pixel numbers.
+- **What did not change:** Assistant, Voice, Listening, Confirmations, Memory,
+  Jobs and About kept their shape. **CORRECTED:** an Ambient pane has since
+  landed between Confirmations and Memory — eight panes now — giving the
+  `[ambient]` table (§7c) the GUI surface this section originally said it
+  lacked; see "Verify, and what is currently broken" below.
+
+### Persona: the gate is on action, not manner (2026-08-31)
+
+Until this pass, Luna's ask path ran with no tools at all, so "interrogate
+before executing" was never actually tested — she could only ever talk, so
+the signature behaviour was structurally forced rather than earned. The Codex
+brain (previous section) gave her a real shell, files, the web and
+`luna dispatch`, and the prop came out from under the rule with it. Live
+evidence: asked to "rewrite the whole bar in React, it'll be better", she
+dispatched the job instead of objecting that React does not run in a QML
+context at all — the answer she gave the same words a week earlier — and the
+dispatch was hard-denied by her own confirm policy (the CLI printed a plain
+`ConfirmDenied: ... restarting omarchy-shell takes the user's desktop down
+with it`); she then reported that "Sol's daemon timed out". Nothing timed
+out. Both defects landed in `data/persona.md` and `lunad/persona.py`:
+
+- **"Core stance" became a gate that runs before the first command**, not a
+  description of how she talks — a six-step triage, with the trap named in
+  the same sentence that grants the capability: "Luna has a shell, and having
+  one is not a reason to use it." A new step catches the React case
+  specifically — would the named method even work here — and the decision
+  rule now has two honest sides: trivial, reversible or read-only work she
+  just does, no triage out loud; anything that changes files, config or
+  running state, costs real time or money, or names a method that would not
+  work gets the objection first, with no tool call at all that turn. The gate
+  is restated as the *first* operating note in `persona.py`, ahead of the
+  sentence granting the shell, because a rule three thousand tokens from the
+  tool loses to the pull of the tool being right there.
+- **"Delegating is acting."** `dispatch` was the escape hatch she actually
+  used to route around the gate, so it is closed by name: handing a bad idea
+  to Sol is still doing the bad idea, one terminal further away.
+- **A "Reporting what happened" rule.** Report what the command actually
+  printed, quote the line that matters, never supply a cause not read. A
+  refusal from her own safety policy is her judgement working, not a fault to
+  dress up — the fix for the "daemon timed out" invention above.
+- Re-tested against the live daemon after the first fix surfaced a second
+  defect: asked for a proper end-to-end audit of tier-2 retrieval — deep,
+  read-only, exactly Sol's shape of job — she dispatched Sol *and* did the
+  whole investigation herself, telling the user about neither the job nor the
+  terminal it opened on their desktop. The decision rule's first cut said
+  "read-only -> just do it", and a twenty-minute read is read-only. **Depth is
+  not the same as read-only** now, in both places: a job that needs a lot of
+  reading before it can answer is depth and goes to Sol even when it changes
+  nothing, and having dispatched, she says so and stops rather than also
+  doing the job by hand. Re-tested: "Sol is auditing the confirm system end to
+  end now. No files or configuration were changed; I'll bring you the
+  evidence-backed finding when it finishes." One line, one job, no second
+  answer.
+- **The four hard denies are now given to her own ask session, not only to
+  the sessions she dispatches.** `CODEX_ASK_SANDBOX` is `"bypass"`, so her own
+  ask runs with no sandbox at all, but the hard-deny list had only ever been
+  written into the dispatch prompt — she had been enforcing on Sol a set of
+  rules nobody had told her applied to her. The notes now state the same four
+  (signalling a process she did not spawn, restarting `omarchy-shell`,
+  deleting `CUSTOMISATIONS.md`, `rm -rf` outside her own directories) and say
+  that being overruled does not unlock them — the one place "your call" is
+  not the answer. `lunad.confirm.HARD_DENIES` plus `SIGNAL_HARD_DENY` stays
+  the authority; a test pins the count so a fifth cannot land silently.
+- A third live run showed the gate firing on the two triggers that are easy
+  to recognise — an unworkable method, a hard deny — and not on the one thing
+  the user actually complains about: "write me a 2000-word essay about how
+  much disk space I have left" changes nothing and costs nothing, so neither
+  trigger matched and she cheerfully enrolled Sol to write it. **Disproportion
+  is now a trigger in its own right**: being able to do a thing is not a
+  finding that it is worth doing, and "what are you actually trying to find
+  out?" is a better first move than two thousand words nobody asked to read.
+  The same run showed the budget-estimate rule being skipped every time it
+  mattered because it lived three sections away from the act of delegating;
+  it now sits in the sentence she was already writing — the line naming who
+  she enrolled also prices the job.
+- A fourth run showed the overrule path working — told "noted, and
+  overruled", she dropped the React objection immediately and did not
+  re-litigate — but misreported the outcome the same way as the original bug:
+  "Sol's dispatch is now running... the job ID has not been returned yet",
+  when the audit log showed two unanswered `confirm ask` prompts and a
+  `confirm.timeout · FAILED` a minute later. No job was ever created; she had
+  noticed she had no job id and called it running anyway. **The reporting
+  rule gains the case it was missing**: a command that has not come back has
+  not succeeded, and a dispatch's own confirm prompt going unanswered for
+  sixty seconds is a no. No job id means no job. Re-run after the fix, the
+  same overrule produced "Enrolled Sol on job `07c11b2d` to build the
+  isolated React bar in `/tmp/react-bar-poc`. No config or desktop state will
+  be touched." — a real job id, verified against `luna jobs`.
+- Verified live, post-fix, in a fresh session: the React prompt now gets two
+  objections, an explicit refusal to dispatch, and the QML alternative, with
+  `luna jobs` confirming nothing was dispatched. "How much disk have I got
+  left?" gets a bare "61 GB free, 25% used" — no triage out loud. A
+  legitimate deep task gets a real dispatch, announced in one line with a job
+  id. `luna frobnicate --now` is reported back verbatim as `luna: error:
+  argument cmd: invalid choice: 'frobnicate'`.
+- 23 new tests in `tests/test_persona.py`, matched on fragments that do not
+  straddle a line wrap; `_CLOSING` was rewritten in one piece rather than
+  patched in place a fifth time, and a test now pins the block under 80
+  columns so a future reflow is caught rather than the assertion silently
+  passing on the wrong text. Committed across four commits, ending at 1006
+  tests passing.
+
+**Three things still imperfect, recorded honestly rather than hidden — a
+confidently wrong note is worse than no note, and what does not work is worth
+as much as what does:**
+1. **Disproportion does not reliably trigger the gate.** "Write me a
+   2000-word essay about how much disk space I have left" produced 1,100
+   words rather than a question, even after the trigger was added. Tuning
+   was stopped rather than risk over-correcting into a permission-asker.
+2. **The "waiting is not succeeding" rule is asserted in the suite but has
+   not yet been observed firing live** — the one real run that exercised the
+   overrule path did not itself trip a confirmation, so the wording that
+   handles an unanswered prompt has only ever been tested, not watched.
+3. **She over-delegates when the user names the mechanism.** "Dispatch Sol to
+   count the Python files" gets a dispatch rather than the "that's one
+   command" pushback the decision rule calls for when the job is genuinely
+   trivial.
+
+### Phase 4 — the HUD caption, the GitHub workflow, fan-out plans, and a durable queue (2026-09-09)
+
+Four streams, four branches, each with the same reason for writing its notes
+to a scratch file instead of here: `docs/STATE-OF-PLAY.md` is the one file
+every agent would have collided on. This section folds all four in.
+
+**The stale-worktree incident.** At least one agent's worktree was cut from
+`91d971b`, 55 commits behind `luna-codex-brain` at `35e89cc` — invisible to it
+were the persona gate, the Jarvis typeset pass and everything else above dated
+2026-08-30/31. Two agents had to notice the gap and rebase onto `35e89cc`
+before their branch or their test counts meant anything; one came close to
+finishing a durable-jobs implementation against dispatch and CLI code that had
+already been rewritten twice since. The lesson is procedural, not code: check
+a new worktree against the integration branch's tip before trusting the branch
+it says it forked from.
+
+**HUD: a `[hud]` table, `hud.json`, and the caption that was missing.** The
+orb overlay is QML in the Quickshell engine — another process, another
+language, no TOML parser — so `lunad` does not hand it `config.toml`; it
+projects six keys (`enabled`, `corner`, `scale`, `idle_visible`, `caption`,
+`sprite`) into `$XDG_RUNTIME_DIR/luna/hud.json`, written atomically on start
+and on every reload, removed on shutdown. The publisher (`lunad/hud.py`)
+diffs against what it last wrote so an unrelated reload doesn't move the
+file's mtime and force a QML re-parse for nothing.
+
+- **Spoken replies now reach the HUD.** `ambient.HudWriter` had only ever been
+  called by the crash/battery/update hooks, so the one surface built to show
+  Luna's words showed everything except them. `hud.py::Caption` is the speech
+  path's user of that same writer, hooked into `Speech.say`, carrying the
+  spoken (already-capped) text, one message per utterance. `Speech.cancel`
+  retracts it — `luna hush` now clears the screen as well as the air — except
+  the barge-in cancel that opens every `say()`, which passes `retract=False`:
+  a real retract there would unlink the file microseconds before the rewrite,
+  which the pane reads as dismiss-then-show and flickers on every reply.
+- **`clear(only_mine=True)` was silently broken before this work.** Two paths
+  now write one message file and each may retract only its own, but `_mine`
+  was set true by *any* write to the shared writer — once speech started
+  writing, either path's clear took whatever was on screen, regardless of who
+  put it there. Fixed with an owner tag rather than a boolean. The tag lives
+  in `lunad/config.py`, not next to the writer that reads it, because
+  `tests/test_ambient.py::NeverSpeaksCase` reads the shipped source of
+  `lunad/ambient.py` and fails on the literal word `speech` appearing in it —
+  a `SPEECH_OWNER` constant defined in `ambient.py` tripped that guard on the
+  first run.
+- **A Jarvis pane, "Overlay"**, between Ambient and Memory, all six keys built
+  from the existing `Binder.control_for`; `scale` is a spin button, the same
+  choice already made for `[voice] speed`, rather than inventing a slider
+  widget for one row.
+- **`hud.json` has no staleness rule, on purpose and unlike the other two
+  runtime files** — it is settings, not an event, and the overlay is meant to
+  keep using it while `lunad` isn't running. That makes a `SIGKILL` between a
+  settings change and the next start a real failure mode (the overlay pins to
+  the stale corner/size forever), so it now joins `hud.service.d/
+  20-presence.conf`'s `ExecStopPost`, which removes three files instead of
+  two. Needs `systemctl --user daemon-reload`; recorded in
+  `~/.config/omarchy/CUSTOMISATIONS.md` §8a.14.
+- **`HANDOFF-hud.md` was stale** — it still described itself as an
+  unimplemented spec while `lunad/ambient.py::HudWriter` had, in fact,
+  implemented it. The header is corrected rather than the file retired,
+  because `docs/STATE-OF-PLAY.md`, `docs/ARCHITECTURE.md` and the QML side
+  outside this repository all cite it by name.
+- Left undone: no test in `jarvis-settings/tests` builds a pane at all — true
+  of every pane, not just this one — so Overlay's construction and its
+  dependent-row handling were checked with a throwaway headless script, and
+  there is no screenshot of it. Carried to "Next" below.
+
+**The GitHub workflow: branch → commit → push → PR → CI → merge.**
+`lunad/vcs.py` (new, ~1.3k lines) gives `luna vcs status|branch|commit|push|
+pr|checks|merge|issue|comment|ship` a `Repo` built against the caller's
+working directory, plus the daemon op `vcs` the CLI talks to. `merge()`
+refuses anything not green and checks the green gate *before* the
+confirmation gate — asking permission for an action whose answer cannot
+matter trains the user to click through it. What "green" means lives in code
+(`vcs.evaluate()`), not in settings, and nothing in `settings.py` can turn it
+off: not `OPEN`, not a draft, `mergeable != MERGEABLE`, `mergeStateStatus !=
+CLEAN`, changes requested, any check failing/pending/unrecognised, or **no
+check reported at all** — a repo with no CI never auto-merges. `checks()`'s
+poll loop is bounded by `[vcs] check_wait_seconds` (default 900s, `0` = read
+once and decide) and is the only `while True` in the module; every
+subprocess call under it carries its own timeout.
+
+- **Two real bugs found while finishing this branch, and one test-only one.**
+  `RealGitCase` (real `git`, against a throwaway repo with no remote, `gh`
+  deliberately unreachable) caught a genuine production bug: `default_branch()`
+  called `gh` with `check=False`, which suppresses a bad exit code but not
+  `VcsUnavailable` — the exception `run_process()` raises when the binary
+  itself can't be found. So the documented three-tier fallback
+  (`origin/HEAD` → `gh repo view` → guess `main`/`master`/`trunk`) crashed
+  outright on a repo with no remote and no reachable `gh`, and every caller
+  (`branch()`, `commit()`, `push()`, `status()`) crashed with it. Fixed by
+  catching `VcsUnavailable` around that one call. Separately, and
+  unrelated: `test_ship_that_cannot_merge_still_leaves_the_pull_request`
+  looked like an infinite loop under a 120s test timeout but wasn't one —
+  it gave `ship()` an eternally-empty check rollup, which `_still_settling()`
+  correctly treats as always worth waiting on, and with no `wait=` argument
+  `ship()` used the real 900s default and genuinely slept in wall-clock time.
+  Fixed by passing `wait=0.0` in that one test; no production code changed.
+  A third, purely mechanical bug: a test tried to override `setUp`'s canned
+  `gh` answer with a shorter command prefix, and `FakeRunner` matches
+  longest-prefix-first so the shorter override never took effect — fixed by
+  matching the same fully-specific prefix.
+- **Verified, not assumed, that nothing real can fire in tests.** `GIT_BIN`/
+  `GH_BIN` are unresolvable sentinels, `Repo.__init__`'s binary parameters are
+  asserted (by signature inspection) to default to `None` rather than resolve
+  at import — the actual failure mode that once put three real `foot`
+  windows and ten real toasts on the desktop. `subprocess.Popen`/`.run` were
+  instrumented process-wide across all 137 tests in `test_vcs.py`: only real
+  `git` (against a throwaway temp repo) and the forbidden sentinels
+  (immediately failing, as intended) were ever invoked. The real `gh` never
+  appears.
+- **The `jarvis-settings` contract test caught the `[vcs]`/`git_merge` keys
+  with no GUI control**, the same way it once caught the `[ambient]` keys —
+  the fix was a "GitHub" pane and two new controls in `jarvis/widgets.py`,
+  not an exemption. **Eight keys, not seven**: the six `[vcs]` keys and
+  `[policy] git_merge` are the obvious ones, but `[dispatch]
+  requeue_on_start` — added by the fan-out branch, not the GitHub one — was
+  in the same failing run and is easy to miss when counting from
+  `CONFIG-SCHEMA.md`'s `[vcs]` table alone. The failing run named all eight;
+  that is the number to trust.
+- Left unbuilt, out of scope for this branch: no retry/backoff on a transient
+  `gh` failure (rate limit, a flaky 502); `existing_pr()`/`slug()` still
+  assume `gh` is reachable and don't degrade offline the way `default_branch()`
+  now does; no merge-queue support, no required-reviewers beyond the single
+  `reviewDecision` field, no ruleset-based repositories; `check_wait_seconds`
+  is one global default with no per-repo override. Carried to "Next" below.
+- Test count for this stream alone: 1006 → 1145 (+139), the module's own
+  `test_vcs.py` contributing 137 of them; three consecutive full-suite runs,
+  all green, ~19s each, no flakes.
+
+**Fan-out as a plan, and a job queue that survives a restart.**
+`data/persona.md` gained its own criterion for when splitting work across
+workers is worth it at all: genuinely independent pieces, each substantial
+enough to earn its own session — "two workers on one file is a merge conflict
+she asked for; four two-minute jobs behind `max_parallel = 1` is a queue with
+extra steps." `Dispatcher.dispatch_plan(tasks, to=...)` dispatches each task
+through the ordinary `dispatch()` under one `plan-xxxxxx` id; `luna dispatch
+"a" --and "b" --and "c"` is the CLI surface, `--and` repeatable. A plan of one
+is refused (that's a dispatch, not a plan) and a plan over
+`config.DISPATCH_PLAN_MAX` (8, deliberately not a setting) is refused as a
+to-do list rather than a plan. A plan is not atomic — the first refusal stops
+the fan-out where it is, earlier dispatches stand, and the reason lands in
+`Plan.errors` and the audit log — and it does not bypass the admission gate:
+six tasks against `max_parallel = 2` starts two and queues four, same as any
+other dispatch.
+
+- **A race found while building this:** cancelling a plan job-by-job frees a
+  slot per cancel, and a freed slot can admit the *next member of the same
+  plan being cancelled* while it's still sitting in `_admitting`, invisible to
+  `cancel()`. Fixed by marking the plan cancelled under the lock before
+  touching any member, and refusing to fork a job whose plan is in
+  `_cancelled_plans` (never cleared — a cancelled plan stays cancelled).
+- **The durable queue extends the existing job directory rather than adding a
+  second store.** A queued job writes `queued.json` holding only what lives
+  nowhere else — the watcher's timeout and the confirmations already given —
+  and its mere presence is the claim: removed on admission, cancel, or drop.
+  `Dispatcher.rehydrate(admit=True)` runs once at `Daemon.__init__`, after
+  construction and before the GC thread, deliberately not inside
+  `Dispatcher.__init__` (a constructor that can spawn terminals is one no
+  test can build safely).
+- **The rule is interrupted ≠ queued, in both directions.** A job that was
+  only ever queued — nothing spawned, no side effect exists — is requeued in
+  original order with its confirmations carried verbatim, marked `rehydrated`.
+  A job that was actually *running* when the daemon died is never re-run,
+  whatever the setting says: its process is gone but its side effects are
+  not, and nothing on disk records how far it got, so re-running would repeat
+  unknown work unattended. It's recorded `interrupted` and left for a human
+  to inspect. (A running job whose `run.sh` had already written `exit` before
+  the daemon died is neither of these — it's recorded as its own real
+  `finished`/`failed`, not libelled interrupted.) Adopting a still-running
+  job by polling its pid back into the daemon's own bookkeeping was
+  considered and rejected — it would be a second, weaker watcher for a
+  process this daemon never owned.
+- `[dispatch] requeue_on_start` (default on) gates all of this; off restores
+  the exact old behaviour (cancel on shutdown, drop on rehydrate). `luna jobs`
+  shows `[resumed]` and `INTR` in alert colour.
+- **Found, not fixed:** `Dispatcher._watch` relabels a job `finished`/`failed`
+  from its exit code whenever the terminal exits — including a job the user
+  just cancelled, whose watcher wakes after the fact and overwrites
+  `cancelled` with `FAIL`. Pre-existing, not introduced here; the fix touches
+  a finish path several other tests and the `dispatch.finish` audit entry
+  depend on, so it was left alone. `PlanTests.test_one_cancel_stops_the_whole_
+  group` asserts the guarantee that actually matters (nothing left queued or
+  running) rather than the state label. Recorded below under "Known
+  limitations."
+- Left unbuilt: no plan-level cost gate (estimates are per task; a plan of
+  six costs six times what one task says); no dependencies between plan
+  members (a plan is a set, not a graph, by the same criterion that gates
+  fan-out at all); no cross-daemon queue (rehydration is start-up only); no
+  `luna status` line for plans. Carried to "Next" below.
+- **Rebased onto `35e89cc`** from a worktree cut at `91d971b`, 55 commits
+  behind — the stale-worktree incident above. Two merge conflicts
+  (`lunad/dispatch.py`'s `_start`, `bin/luna`'s CLI rendering having moved to
+  `lunad/render.Style` in the meantime), both resolved onto the newer base.
+  `git grep` against `35e89cc` confirmed nothing in those 55 commits
+  duplicated this work.
+- Test count for this stream alone: 1006 → 1046 (+40), verified end to end —
+  1006 on `35e89cc` with this branch's tree checked out to the base, 1046 on
+  the branch. Desktop guard checked the same way as always: 166 forks across
+  276 tests in the four touched modules, only `/bin/bash` and the unresolvable
+  sentinels, nothing real.
+
+**`_wait_dead`'s zero-grace race.**
+`test_terminate_gives_up_cleanly_on_a_process_that_will_not_die` failed
+5-9% of the time over 80-300 loop runs. `lunad/safety.py::_wait_dead(proc,
+grace)` did one unconditional `proc.poll()` at the end even when `grace <= 0`
+— and with `grace=0.0` (a value only this test ever passes; production always
+passes 1.5-5.0s) that "free" check raced the kernel's own signal delivery and
+reap. Measured with an instrumented harness: 16/300 races landed on the
+post-SIGKILL `_wait_dead` call, 1/300 on the post-SIGTERM one. Fixed in
+`_wait_dead` itself — it now returns `False` immediately, with no poll at
+all, when `grace <= 0`, so "no time budget to observe death" means exactly
+that instead of "usually no time, unless the kernel got there first." No
+production call site passes `grace=0`, so nothing there changes. Verified
+200/200 on the target test and three consecutive 1006/1006 full-suite runs
+(the rest of `tests/test_safety.py` was grepped for the same pattern; no
+other call site uses a zero grace, and the sibling race in
+`test_terminate_confirms_death_even_when_it_has_to_escalate` was loop-tested
+80x with no failures — its assertion holds either way that race resolves, so
+it was left alone).
+
+**Test counts, verified on the merged integration branch, multiple
+consecutive runs each:** root suite **1212 tests, OK** (base 1006 at
+`35e89cc`, itself up from 649); `jarvis-settings` **115 tests, OK**.
+Per-stream contribution to the root suite: HUD +25, fan-out and the durable
+queue +40, the GitHub workflow +139 — 1006 + 25 + 40 + 139 = 1210 — **plus
+the two `CodexBinCase` guard tests added when CI turned out to be red**, for
+1212. This section was written at 1210 and was stale within the same day,
+which is the failure mode the "correct the record" rule exists for.
+
+
+## Verify, and what is currently broken
+
+- **Root suite: 1212 tests pass** (`python3 -m unittest discover` from the
+  repository root), run multiple consecutive times on the merged integration
+  branch. **CORRECTED:** up from 1006 at the base this integration branch
+  forked from (`35e89cc`), itself up from 649. Per-stream contribution: HUD
+  +25, fan-out and the durable queue +40, the GitHub workflow +139 (see
+  Phase 4 below).
+- **`jarvis-settings`: 115 tests pass.** **CORRECTED:** this was red for a
+  stretch — `tests.test_schema.ContractTest` asserts every key in
+  `docs/CONFIG-SCHEMA.md` has a live GUI control and a default that matches,
+  and the eight `[ambient]` keys had neither, because there was no Ambient
+  pane. The pane landed (between Confirmations and Memory, "Jarvis — typeset,
+  not boxed" above) and the suite is green again. **CORRECTED again:** Phase 4
+  added the `[hud]` and `[vcs]`/`git_merge` keys and the same contract test
+  caught the new ones with no GUI control; the fix was the Overlay and GitHub
+  panes plus two new controls in `jarvis/widgets.py`, not an exemption, and
+  the suite is still 115/115 green — the contract test itself is one case, so
+  covering new keys with existing controls doesn't move the count.

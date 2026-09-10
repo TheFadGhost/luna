@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import tomllib
 import unittest
 from pathlib import Path
@@ -81,10 +82,43 @@ class ArgvTests(unittest.TestCase):
         self.assertNotIn("What is 2+2?", argv)
         self.assertIn("-", argv)
 
-    def test_ask_is_read_only(self):
+    def test_ask_has_the_run_of_the_machine(self):
+        """CHANGED: the ask path was read-only, and it made her useless.
+
+        codex has no `--tools ""`, so the sandbox is the tool policy: under
+        "read-only" she could not check a version, read a file or look at the
+        desktop she lives on, and her prompt said so. Full autonomy is the
+        user's stated choice and the audit log is the backstop.
+        """
         argv = self.a.build_argv(PERSONA, mode="ask")
-        self.assertEqual(argv[argv.index("-s") + 1], "read-only")
-        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertNotIn("-s", argv)
+
+    def test_the_prompt_only_promises_a_shell_when_there_is_one(self):
+        """`ask_has_tools` is a reading of the sandbox, not a constant.
+
+        It is what the server hands `persona.operating_notes`, so putting the
+        sandbox back to read-only has to put the honest "no tools" wording
+        back with it. A prompt that promises a shell the sandbox has taken
+        away is the original bug, pointing the other way.
+        """
+        self.assertTrue(self.a.ask_has_tools)
+        old = config.CODEX_ASK_SANDBOX
+        config.CODEX_ASK_SANDBOX = "read-only"
+        try:
+            self.assertFalse(self.a.ask_has_tools)
+        finally:
+            config.CODEX_ASK_SANDBOX = old
+
+    def test_a_still_read_only_sandbox_reaches_argv(self):
+        old = config.CODEX_ASK_SANDBOX
+        config.CODEX_ASK_SANDBOX = "read-only"
+        try:
+            argv = self.a.build_argv(PERSONA, mode="ask")
+            self.assertEqual(argv[argv.index("-s") + 1], "read-only")
+            self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        finally:
+            config.CODEX_ASK_SANDBOX = old
 
     def test_dispatch_bypasses_the_sandbox(self):
         argv = self.a.build_argv(PERSONA, mode="dispatch")
@@ -100,23 +134,60 @@ class ArgvTests(unittest.TestCase):
         self.assertIn("--ignore-user-config", argv)
         self.assertIn("--ignore-rules", argv)
 
-    def test_resume_uses_the_subcommand_and_the_long_way_round_to_a_sandbox(self):
+    def test_resume_uses_the_subcommand_and_carries_the_same_policy(self):
         """`codex exec resume` accepts neither -s nor -C. Passing them anyway
-        would abort the turn, so the sandbox goes through -c instead."""
+        would abort the turn.
+
+        The bypass flag *is* accepted by `exec resume` — verified against
+        `codex exec resume --help` on 0.149.1 — which is half the reason the
+        ask path bypasses rather than naming `danger-full-access`: one spelling
+        works on both subcommands, so turn one and turn two cannot end up under
+        different policies.
+        """
         argv = self.a.build_argv(PERSONA, resume="01a0-thread")
         self.assertEqual(argv[1:4], ["exec", "resume", "01a0-thread"])
         self.assertNotIn("-s", argv)
         self.assertNotIn("-C", argv)
-        self.assertIn("sandbox_mode=read-only", argv)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
+
+    def test_a_resumed_sandbox_mode_still_goes_the_long_way_round(self):
+        old = config.CODEX_ASK_SANDBOX
+        config.CODEX_ASK_SANDBOX = "read-only"
+        try:
+            argv = self.a.build_argv(PERSONA, resume="01a0-thread")
+            self.assertNotIn("-s", argv)
+            self.assertIn("sandbox_mode=read-only", argv)
+        finally:
+            config.CODEX_ASK_SANDBOX = old
 
     def test_a_fresh_turn_names_a_working_root(self):
         argv = self.a.build_argv(PERSONA)
         self.assertEqual(argv[argv.index("-C") + 1], str(config.AGENT_CWD))
 
-    def test_the_model_is_passed_when_asked_for(self):
-        self.assertNotIn("-m", self.a.build_argv(PERSONA))
+    def test_the_conversational_model_is_lunas_own(self):
+        """Not codex's default and not the desktop's: `gpt-5.6-luna`.
+
+        It is an adapter default rather than `[assistant] model`, because a
+        model slug is not portable between agents — pinning one in the config
+        would be wrong the instant `[assistant] agent` changed to claude.
+        """
+        argv = self.a.build_argv(PERSONA)
+        self.assertEqual(argv[argv.index("-m") + 1], config.CODEX_ASK_MODEL)
+        self.assertEqual(config.CODEX_ASK_MODEL, "gpt-5.6-luna")
+
+    def test_an_explicit_model_still_wins(self):
         argv = self.a.build_argv(PERSONA, model="gpt-5")
         self.assertEqual(argv[argv.index("-m") + 1], "gpt-5")
+        self.assertEqual(agent.CodexAdapter(model="gpt-5").model, "gpt-5")
+
+    def test_an_empty_model_setting_means_the_adapters_own_default(self):
+        # `[assistant] model = ""` is the documented "agent default", and the
+        # server forwards it as None. Neither may end up as a `-m ` with an
+        # empty value.
+        self.assertEqual(agent.CodexAdapter(model="").model,
+                         config.CODEX_ASK_MODEL)
+        self.assertEqual(agent.CodexAdapter(model=None).model,
+                         config.CODEX_ASK_MODEL)
 
     def test_dispatch_argv_gives_the_job_its_directory(self):
         argv = self.a.dispatch_argv('"$JOB"', '"$JOB/system.txt"',
@@ -124,6 +195,42 @@ class ArgvTests(unittest.TestCase):
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
         self.assertIn("/sol", argv)
         self.assertTrue(any("system.txt" in tok for tok in argv))
+
+    def test_a_dispatched_session_runs_sols_model_not_lunas(self):
+        """Luna thinks, Sol works, and they are different models.
+
+        The dispatched slug is read from `config` inside `dispatch_argv`
+        rather than from `self.model`, because the adapter object that writes
+        a job's script is the same one answering conversations — it holds
+        Luna's model, and a job that ran on it would be paying for reasoning
+        it does not need.
+        """
+        argv = self.a.dispatch_argv('"$JOB"', '"$JOB/system.txt"',
+                                    binary="/fake/codex")
+        self.assertEqual(argv[argv.index("-m") + 1], config.CODEX_DISPATCH_MODEL)
+        self.assertEqual(config.CODEX_DISPATCH_MODEL, "gpt-5.6-sol")
+        self.assertNotIn(config.CODEX_ASK_MODEL, argv)
+
+    def test_images_are_attached_last_and_one_flag_each(self):
+        """`-i/--image <FILE>...` is variadic, so position is load-bearing.
+
+        Anywhere but the end of argv it would swallow the tokens after it.
+        """
+        argv = self.a.build_argv(PERSONA, images=["/tmp/a.png", "/tmp/b.png"])
+        self.assertEqual(argv[-4:], ["-i", "/tmp/a.png", "-i", "/tmp/b.png"])
+        # A second, otherwise-untouched adapter: this is about argv shape
+        # with no images, not about resolving a real binary, so it gets the
+        # same local stub as `self.a` rather than reaching for codex itself.
+        bare = agent.CodexAdapter()
+        bare.binary = lambda: "/fake/codex"              # type: ignore[method-assign]
+        self.assertNotIn("-i", bare.build_argv(PERSONA))
+
+    def test_images_survive_a_resume(self):
+        # `codex exec resume` documents -i as "images to attach to the prompt
+        # sent after resuming", so a look mid-conversation does not have to
+        # throw the warm session away.
+        argv = self.a.build_argv(PERSONA, resume="01a0", images=["/tmp/a.png"])
+        self.assertEqual(argv[-2:], ["-i", "/tmp/a.png"])
 
 
 class ShellLineTests(unittest.TestCase):
@@ -308,6 +415,125 @@ class FakeCodexTests(TempMemoryCase):
         with self.assertRaises(agent.AgentMalformedOutput):
             a.ask("hi", PERSONA, timeout=30)
         self.assertEqual(list(self.cwd.glob("codex-last-*")), [])
+
+
+class EarlyReplyTests(unittest.TestCase):
+    """`on_reply` fires at turn.completed, once, and only for a good turn.
+
+    The point of the callback is that speech starts while codex is still
+    shutting down — measured at 350-490 ms of dead time per ask. That is only
+    worth having if it can never speak something the turn went on to retract,
+    so most of what is asserted here is when it must stay *silent*.
+    """
+
+    def fired(self, stream: str) -> list[str]:
+        seen: list[str] = []
+        watch = agent.CodexAdapter._early_reply_watcher(seen.append)
+        assert watch is not None
+        for line in stream.splitlines(keepends=True):
+            watch(line)
+        return seen
+
+    def test_no_callback_means_no_watcher_at_all(self):
+        self.assertIsNone(agent.CodexAdapter._early_reply_watcher(None))
+
+    def test_it_fires_once_with_the_agent_message(self):
+        self.assertEqual(self.fired(events("Fine.")), ["Fine."])
+
+    def test_it_does_not_fire_before_the_turn_completes(self):
+        partial = events("Fine.").splitlines(keepends=True)[:-1]
+        self.assertEqual(self.fired("".join(partial)), [])
+
+    def test_a_failed_turn_is_never_spoken(self):
+        stream = (json.dumps({"type": "item.completed",
+                              "item": {"type": "agent_message",
+                                       "text": "half an answer"}}) + "\n"
+                  + json.dumps({"type": "turn.failed",
+                                "error": {"message": "usage limit"}}) + "\n"
+                  + json.dumps({"type": "turn.completed", "usage": {}}) + "\n")
+        self.assertEqual(self.fired(stream), [])
+
+    def test_an_error_event_is_never_spoken(self):
+        stream = (json.dumps({"type": "error", "message": "boom"}) + "\n"
+                  + json.dumps({"type": "item.completed",
+                                "item": {"type": "agent_message",
+                                         "text": "hi"}}) + "\n"
+                  + json.dumps({"type": "turn.completed", "usage": {}}) + "\n")
+        self.assertEqual(self.fired(stream), [])
+
+    def test_a_turn_with_no_message_is_never_spoken(self):
+        stream = (json.dumps({"type": "turn.started"}) + "\n"
+                  + json.dumps({"type": "turn.completed", "usage": {}}) + "\n")
+        self.assertEqual(self.fired(stream), [])
+
+    def test_the_last_message_wins_and_it_still_fires_only_once(self):
+        stream = (json.dumps({"type": "item.completed",
+                              "item": {"type": "agent_message",
+                                       "text": "first"}}) + "\n"
+                  + json.dumps({"type": "item.completed",
+                                "item": {"type": "agent_message",
+                                         "text": "second"}}) + "\n"
+                  + json.dumps({"type": "turn.completed", "usage": {}}) + "\n"
+                  + json.dumps({"type": "turn.completed", "usage": {}}) + "\n")
+        self.assertEqual(self.fired(stream), ["second"])
+
+    def test_junk_lines_do_not_upset_it(self):
+        self.assertEqual(self.fired("not json\n\n[1,2]\n" + events("Ok.")),
+                         ["Ok."])
+
+
+class EarlyReplyEndToEndTests(FakeCodexTests):
+    """The saving, through a real subprocess: spoken before the child exits."""
+
+    def test_the_reply_arrives_before_the_process_does(self):
+        stream_file = self.root / "stream.jsonl"
+        stream_file.write_text(events("Fine."), encoding="utf-8")
+        # The sleep stands in for the 359-687 ms codex spends writing its
+        # session rollout after turn.completed. The callback must land during
+        # it, not after it.
+        a = self.write_fake(
+            "cat > /dev/null\n"
+            "while [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\n"
+            f"cat {stream_file}\n"
+            "printf 'Fine.' > \"$out\"\n"
+            "sleep 1\n")
+        marks: list[float] = []
+        start = time.monotonic()
+        reply = a.ask("hello", PERSONA, timeout=30,
+                      on_reply=lambda _t: marks.append(time.monotonic() - start))
+        returned = time.monotonic() - start
+        self.assertEqual(reply.text, "Fine.")
+        self.assertEqual(len(marks), 1)
+        self.assertLess(marks[0], returned - 0.5,
+                        "on_reply should fire a whole sleep before ask() returns")
+
+    def test_streaming_still_returns_the_complete_stdout(self):
+        """The callback may not cost us any output: same reply either way."""
+        stream_file = self.root / "stream.jsonl"
+        stream_file.write_text(events("Fine.", usage={"input_tokens": 7}),
+                               encoding="utf-8")
+        body = ("cat > /dev/null\n"
+                "while [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\n"
+                f"cat {stream_file}\n"
+                "echo 'progress chatter' >&2\n"
+                "printf 'Fine.' > \"$out\"\n")
+        plain = self.write_fake(body).ask("hi", PERSONA, timeout=30)
+        streamed = self.write_fake(body).ask("hi", PERSONA, timeout=30,
+                                             on_reply=lambda _t: None)
+        self.assertEqual(plain.text, streamed.text)
+        self.assertEqual(plain.usage, streamed.usage)
+        self.assertEqual(plain.session_id, streamed.session_id)
+
+    def test_a_failing_turn_speaks_nothing_and_still_raises(self):
+        a = self.write_fake(
+            "cat > /dev/null\n"
+            "printf '{\"type\":\"turn.failed\",\"error\":"
+            "{\"message\":\"usage limit\"}}\\n'\n"
+            "exit 1\n")
+        spoke: list[str] = []
+        with self.assertRaises(agent.AgentFailed):
+            a.ask("hi", PERSONA, timeout=30, on_reply=spoke.append)
+        self.assertEqual(spoke, [])
 
 
 class CodexDispatchTests(TempMemoryCase):

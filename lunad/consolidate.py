@@ -92,6 +92,28 @@ from .memory import (CONSOLIDATED_THROUGH, Episode, Memory, MemoryCapExceeded,
 
 log = logging.getLogger("lunad.consolidate")
 
+# Meta-table keys for the unparseable-reply retry (see `run_once`). Kept
+# beside `CONSOLIDATED_THROUGH` in spirit -- both are facts about *these
+# rows*, not about the process -- but defined here rather than in
+# `lunad.memory` because they are this module's bookkeeping, not the store's:
+# the episode store's `meta` table is a generic key/value side table with no
+# schema of its own to extend.
+_RETRY_AFTER_KEY = "consolidate_retry_after"
+_RETRY_COUNT_KEY = "consolidate_retry_count"
+
+#: How many consecutive unparseable replies for the *same* batch (same
+#: watermark) are tolerated before giving up and advancing anyway.
+#:
+#: Used to defend against runaway cost when a per-token bill made every retry
+#: a metered risk. That reasoning no longer holds -- the brain runs on Codex
+#: against a flat ChatGPT subscription, so a bounded retry here costs the
+#: same nothing a retry anywhere else in this codebase costs -- but losing a
+#: batch of episodes to one malformed reply is still a real cost (the user's
+#: words, gone for good), so the retry stays bounded rather than unbounded:
+#: three tries catches a transient bad answer without a persistently broken
+#: prompt or model retrying forever on every turn count.
+DEFAULT_MAX_UNPARSEABLE_RETRIES = 3
+
 
 # =========================================================================
 # The prompt
@@ -326,6 +348,7 @@ class Consolidator:
         min_interval_s: float | None = None,
         episode_limit: int | None = None,
         timeout_s: float | None = None,
+        max_unparseable_retries: int | None = None,
     ) -> None:
         self.memory = memory
         self.adapter = adapter
@@ -338,6 +361,9 @@ class Consolidator:
                               if episode_limit is None else episode_limit)
         self.timeout_s = (config.CONSOLIDATE_TIMEOUT_S if timeout_s is None
                           else timeout_s)
+        self.max_unparseable_retries = (DEFAULT_MAX_UNPARSEABLE_RETRIES
+                                        if max_unparseable_retries is None
+                                        else max_unparseable_retries)
         self.turns = 0
         self.passes = 0
         # Dry runs. Counted apart from `passes` because they cost money and
@@ -520,6 +546,29 @@ class Consolidator:
         profile = self.memory.profile.rebuild(store, persist=persist_profile)
         return after, episodes, profile
 
+    def _bump_retry(self, store: Any, after: int) -> int:
+        """Record one more unparseable reply for the batch starting at ``after``.
+
+        Keyed on ``after`` (the watermark this batch was read from) rather
+        than the batch's highest episode id, because new episodes can arrive
+        between retries and grow the batch -- the watermark is what stays
+        fixed for as long as this batch is still being offered to the pass.
+        Stored as a raw string and compared as one, not through ``_as_int``:
+        ``after == 0`` is the ordinary case for a store that has never been
+        consolidated, and collapsing "no retry recorded" to the same ``0``
+        would make the very first batch's retries invisible.
+        """
+        stored_after = store.get_meta(_RETRY_AFTER_KEY, "")
+        count = _as_int(store.get_meta(_RETRY_COUNT_KEY)) + 1 \
+            if stored_after == str(after) else 1
+        store.set_meta(_RETRY_AFTER_KEY, str(after))
+        store.set_meta(_RETRY_COUNT_KEY, str(count))
+        return count
+
+    def _clear_retry(self, store: Any) -> None:
+        store.set_meta(_RETRY_AFTER_KEY, "")
+        store.set_meta(_RETRY_COUNT_KEY, "0")
+
     def _ask_model(self, episodes: list[Episode],
                    profile: dict[str, Any]) -> agent_mod.AgentReply:
         """The one paid step, shared by the real pass and the dry run.
@@ -592,15 +641,20 @@ class Consolidator:
             return {"ran": False, "reason": "agent unavailable",
                     "detail": str(exc)}
 
-        # From here the call is paid for, so the watermark moves whatever
-        # happens next. A reply that cannot be parsed is a reply that would
-        # not parse the second time either, and paying twice for the same
-        # unusable answer is the runaway this avoids.
+        # From here the call is paid for. A reply that cannot be parsed gets a
+        # bounded number of retries before the watermark moves -- see
+        # `DEFAULT_MAX_UNPARSEABLE_RETRIES`. That used to be unconditional
+        # (moved every time, from a `finally`) as a defence against runaway
+        # per-token cost; the brain now runs on Codex against a flat
+        # subscription, so a retry costs nothing and a batch is worth more
+        # than the token spend it would take to save it.
         if self.on_spend is not None:
             self.on_spend(reply.cost_usd)
         applied: dict[str, Any] = {}
         note = ""
         parsed = False
+        gave_up = False
+        retry_count = 0
         try:
             proposal = parse_proposal(reply.text)
             note = str(proposal.get("note") or "")[:300]
@@ -610,11 +664,37 @@ class Consolidator:
             with self._lock:
                 self.failures += 1
                 self.last_note = f"unparseable proposal: {exc}"[:200]
-            log.warning("consolidation reply was not usable",
-                        extra={"why": why, "detail": str(exc)[:300],
-                               "cost_usd": reply.cost_usd})
-        finally:
+            retry_count = self._bump_retry(store, after)
+            if retry_count < self.max_unparseable_retries:
+                log.warning(
+                    "consolidation reply was not usable, retrying "
+                    "(%d/%d) rather than losing the batch",
+                    retry_count, self.max_unparseable_retries,
+                    extra={"why": why, "detail": str(exc)[:300],
+                           "cost_usd": reply.cost_usd,
+                           "retry_count": retry_count,
+                           "max_retries": self.max_unparseable_retries})
+            else:
+                gave_up = True
+                log.error(
+                    "consolidation giving up on %d episodes after %d "
+                    "unparseable replies in a row -- advancing the "
+                    "watermark; this batch will not be offered again",
+                    len(episodes), retry_count,
+                    extra={"why": why, "detail": str(exc)[:300],
+                           "cost_usd": reply.cost_usd,
+                           "retry_count": retry_count,
+                           "through_id": highest, "episodes": len(episodes)})
+
+        if parsed or gave_up:
             store.set_meta(CONSOLIDATED_THROUGH, str(highest))
+            self._clear_retry(store)
+
+        # The watermark this pass leaves behind: `highest` if it moved
+        # (parsed, or given up on), `after` — unchanged — if this batch is
+        # still being retried.
+        through_id = highest if (parsed or gave_up) else after
+        retried = not parsed and not gave_up
 
         wall_ms = int((time.monotonic() - started) * 1000)
         adds = sum(len(v["added"]) for v in applied.values())
@@ -637,8 +717,9 @@ class Consolidator:
                  extra={"why": why, "manual": manual, "wall_ms": wall_ms,
                         "cost_usd": reply.cost_usd, "billing": reply.billing,
                         "reply_chars": len(reply.text),
-                        "episodes": len(episodes), "through_id": highest,
-                        "parsed": parsed, "added": adds, "removed": drops,
+                        "episodes": len(episodes), "through_id": through_id,
+                        "parsed": parsed, "retried": retried,
+                        "gave_up": gave_up, "added": adds, "removed": drops,
                         "over_cap": over,
                         "input_tokens": usage.get("input_tokens"),
                         "output_tokens": usage.get("output_tokens"),
@@ -646,14 +727,21 @@ class Consolidator:
         # `ok` is whether the answer was usable, not whether the thread got to
         # the end of itself: a pass that spent money and produced nothing
         # applicable is a failure worth seeing in `luna audit`.
+        why_note = note or (
+            "consolidation pass ({})".format(why) if parsed
+            else "the model's answer could not be read, giving up after "
+                 f"{retry_count} attempts" if gave_up
+            else f"the model's answer could not be read, retry "
+                 f"{retry_count}/{self.max_unparseable_retries}")
         self._audit(parsed,
-                    why=note or (f"consolidation pass ({why})" if parsed
-                                 else "the model's answer could not be read"),
+                    why=why_note,
                     manual=manual, episodes=len(episodes), added=adds,
                     removed=drops, over_cap=over, cost_usd=reply.cost_usd,
-                    through_id=highest, files=applied)
-        return {"ran": True, "parsed": parsed, "episodes": len(episodes),
-                "through_id": highest, "added": adds, "removed": drops,
+                    through_id=through_id, files=applied)
+        return {"ran": True, "parsed": parsed, "retried": retried,
+                "gave_up": gave_up, "retry_count": retry_count,
+                "episodes": len(episodes),
+                "through_id": through_id, "added": adds, "removed": drops,
                 "over_cap": over, "cost_usd": reply.cost_usd,
                 "wall_ms": wall_ms, "note": note, "files": applied}
 

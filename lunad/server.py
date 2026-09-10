@@ -23,19 +23,93 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from . import (__version__, agent, audit as audit_mod, config, confirm,
-               consolidate, dispatch, log as luna_log, persona,
-               presence as presence_mod, protocol, safety,
-               session as sessions, settings as settings_mod, speech)
+from . import (__version__, agent, ambient as ambient_mod, audit as audit_mod,
+               hud as hud_mod,
+               config, confirm, consolidate, context as context_mod, dispatch,
+               log as luna_log, persona, presence as presence_mod, protocol,
+               safety, session as sessions, settings as settings_mod, speech,
+               vcs)
 from .memory import (Memory, MemoryCapExceeded, MemoryError as LunaMemoryError,
                      SolMemory)
 
 log = logging.getLogger("lunad.server")
 
 
+class _EarlySpeaker:
+    """Speaks a reply the moment the agent's turn completes, once.
+
+    A callable rather than a bare lambda because the ask path needs two things
+    back from it afterwards: whether it fired at all (if not, the reply has to
+    be spoken the old way) and what it said (which goes in the response payload
+    as ``spoken``). Callable from the adapter's stdout-reader thread, so it
+    does the least it can — ``Speech.say`` returns as soon as the utterance is
+    handed to its own thread, and nothing here waits for audio.
+
+    Never raises into the reader thread: ``_speak_safely`` already swallows a
+    mute speaker, and this adds the same protection to the bookkeeping around
+    it. A reply that could not be spoken is still a reply.
+    """
+
+    __slots__ = ("_say", "spoken", "fired")
+
+    def __init__(self, say: Callable[[str], str | None]) -> None:
+        self._say = say
+        self.spoken: str | None = None
+        self.fired = False
+
+    def __call__(self, text: str) -> None:
+        try:
+            self.spoken = self._say(text)
+        except Exception:  # noqa: BLE001 - never break the reply for the audio
+            log.exception("early speech dispatch failed")
+            self.spoken = None
+        self.fired = True
+
+
 # =========================================================================
 # Daemon state
 # =========================================================================
+
+
+class ReportingDispatcher(dispatch.Dispatcher):
+    """A dispatcher that closes the loop back to Luna.
+
+    The user's requirement, in their words: "it will go do that, and then it
+    will report back to me whenever everything is done, and then update memory
+    accordingly." The first half already existed — a finished job puts a toast
+    on the desktop. The second did not: the job's output lived in
+    ``jobs/<id>/output.txt`` and nowhere Luna would ever read it, so every
+    delegated piece of work was forgotten the moment it succeeded and she
+    could be told the same finding twice in a week.
+
+    So a finished job is written into tier 2 as an episode, in the same place
+    and the same shape as an exchange the user had with her directly. It is
+    then searchable by the ordinary recall path, which means the next question
+    on the subject retrieves what Sol found without anyone naming a job id.
+
+    Implemented as a subclass rather than a change to ``dispatch.py`` because
+    the dispatcher has no business knowing what memory is: it owns terminals,
+    pids and exit codes. ``notify_finished`` is the one hook it already calls
+    exactly once per job, at the point the outcome is known and written.
+    """
+
+    def __init__(self, *args: Any, on_finished: Any = None, **kw: Any) -> None:
+        super().__init__(*args, **kw)
+        self.on_finished = on_finished
+
+    def notify_finished(self, job: dispatch.Job) -> bool:
+        # The toast first and unconditionally. Recording is the part that can
+        # be got wrong; telling the user is the part that must not be lost to
+        # it, and `[ui] notify_on_finish` is the only thing allowed to
+        # suppress it.
+        notified = super().notify_finished(job)
+        if self.on_finished is not None:
+            try:
+                self.on_finished(job)
+            except Exception:  # noqa: BLE001 - a memory fault is not a failed job
+                log.exception("could not record a finished job",
+                              extra={"job_id": job.id})
+        return notified
 
 
 class Daemon:
@@ -67,26 +141,53 @@ class Daemon:
         safety.set_audit_hook(self.audit.hook)
         self.confirm = confirm.ConfirmBroker(settings=self.settings,
                                              audit=self.audit)
+        # Before the dispatcher, because the dispatcher needs it. `--agent`
+        # beats the config, the config beats Omarchy's default. The CLI flag is
+        # an operator override for one run and must not be silently replaced by
+        # a file the operator did not look at; the Omarchy file is the fallback
+        # and not the source of truth, because it is the *desktop's* default
+        # agent and other things read it.
+        self.agent_name = (agent_name
+                           or str(self.settings.get("assistant.agent") or "")
+                           or agent.read_default_agent()).lower()
+        self.adapter = agent.get_adapter(self.agent_name)
+        # `agent_name=` is not optional here even though it looks it. Without
+        # it Dispatcher falls back to `read_default_agent()` — the Omarchy
+        # file, which says "claude" on this machine — and every job Luna
+        # delegated would have been written in the wrong CLI's flags while she
+        # herself ran on codex. Nothing would have crashed; the jobs would just
+        # all have failed.
         self.dispatcher = (dispatcher if dispatcher is not None
-                           else dispatch.Dispatcher(audit=self.audit,
-                                                    confirm=self.confirm))
+                           else ReportingDispatcher(
+                               audit=self.audit, confirm=self.confirm,
+                               agent_name=self.agent_name,
+                               on_finished=self._job_finished))
         # Exactly one broker in the process, whoever built the dispatcher. Two
         # would mean a question raised by a dispatch could not be answered
         # through `luna confirm`, because the pending map it looks in would be
         # the other object's.
         self.dispatcher.confirm = self.confirm
+        # What the last daemon left behind, resolved before anything new is
+        # accepted. Queued work is picked back up (`[dispatch]
+        # requeue_on_start`); work that was *running* when the daemon died is
+        # recorded as interrupted and never re-run, because its side effects
+        # are on the user's machine and nothing on disk says how far it got.
+        # Here rather than in `Dispatcher.__init__` on purpose: a constructor
+        # that spawns terminals is a constructor no test can build safely.
+        try:
+            resumed = self.dispatcher.rehydrate()
+        except Exception:  # noqa: BLE001 - a bad jobs tree must not stop boot
+            log.exception("could not rehydrate the jobs tree")
+        else:
+            if any(resumed.get(k) for k in ("requeued", "interrupted",
+                                            "completed", "dropped")):
+                log.info("resumed the jobs tree",
+                         extra={k: len(v) for k, v in resumed.items()})
         # `[dispatch] job_retention_days`, on a timer in its own thread. Not on
         # the request path: it walks a directory tree, and nobody should wait
         # for it to answer a question about the weather.
         self.dispatcher.start_gc()
         self.runs = agent.RunRegistry()
-        # `--agent` beats the config, the config beats Omarchy's default. The
-        # CLI flag is an operator override for one run and must not be silently
-        # replaced by a file the operator did not look at.
-        self.agent_name = (agent_name
-                           or str(self.settings.get("assistant.agent") or "")
-                           or agent.read_default_agent()).lower()
-        self.adapter = agent.get_adapter(self.agent_name)
         self.persona_spec = persona.load_spec()
         self.counters: dict[str, int] = {"ask": 0, "errors": 0, "cancelled": 0,
                                          "said": 0}
@@ -105,6 +206,11 @@ class Daemon:
         # it: it publishes `idle`/`thinking`/`speaking` to the file the bar
         # widget watches.
         self.presence = presence_mod.Presence()
+        # The overlay's settings, published beside `state` in the same tmpfs
+        # directory. Built before Speech because Speech captions into the
+        # third file there, and the surface should know how it is meant to be
+        # drawn before anything is drawn on it.
+        self.hud = hud_mod.HudSettings(settings=self.settings)
         self.speech = speech.Speech(settings=self.settings,
                                     on_activity=self._publish_state)
         # The consolidation pass. `adapter` is a callable and not the adapter
@@ -114,6 +220,18 @@ class Daemon:
         self.consolidator = consolidate.Consolidator(
             self.memory, adapter=lambda: self.adapter, audit=self.audit,
             settings=self.settings, on_spend=self._spend)
+        # Ambient awareness. Built last and deliberately given almost nothing:
+        # a Notifier, the audit log and the settings, and no reference to
+        # `self` at all. That is the "ambient never speaks" rule as wiring
+        # rather than as a comment -- there is no path from a watcher to
+        # `self.speech`, because the object that runs the watchers has never
+        # been shown the daemon. `Ambient.__init__` additionally refuses any
+        # collaborator with a `.say()`, so a later edit that passes one in
+        # fails at construction instead of talking six weeks later.
+        self.ambient = ambient_mod.Ambient(
+            notifier=ambient_mod.Notifier(), audit=self.audit,
+            settings=self.settings)
+        self.ambient.start()
         self.settings.on_change(self._settings_changed)
         self.settings.start_watching()
         log.info(
@@ -121,6 +239,11 @@ class Daemon:
             extra={"agent": self.agent_name, "version": __version__},
         )
         self._publish_state()
+        # The overlay reads an absent hud.json as "every default", so this is
+        # not required for it to work -- it is required for it to be *right*,
+        # and a user who set `corner = "top-left"` should not have to change a
+        # setting again to make the daemon notice.
+        self.hud.publish()
         self.audit.append("daemon.started", ok=True, agent=self.agent_name,
                           version=__version__,
                           why="lunad came up",
@@ -163,6 +286,13 @@ class Daemon:
         work sits there until something else moves and the setting looks inert.
         """
         keys = {c["key"] for c in changes}
+        # Unconditional, and deliberately not gated on a `hud.` prefix.
+        # `publish()` compares against what it last wrote and does nothing when
+        # nothing moved, so the gate would buy no syscalls and would be one
+        # more place to forget a key -- which is how a settings app comes to
+        # lie. The cheap correct thing is to offer every reload and let the
+        # publisher decide.
+        self.hud.publish()
         self.audit.append("settings.reloaded", ok=True,
                           why="config.toml changed on disk",
                           changed=[f"{c['key']}: {c['from']!r} -> {c['to']!r}"
@@ -201,6 +331,7 @@ class Daemon:
 
     def op_status(self, req: dict[str, Any]) -> dict[str, Any]:
         available, detail = self.adapter.available()
+        can_see, see_detail = context_mod.available()
         with self._lock:
             counters = dict(self.counters)
             cost = round(self.cost_usd, 6)
@@ -222,7 +353,18 @@ class Daemon:
                 "available": available,
                 "detail": detail,
                 "timeout_s": config.AGENT_TIMEOUT_S,
+                # What she can do this session, not what she could in theory.
+                # `tools` is what her operating notes were written against, so
+                # a status that disagreed with it would be the harder of the
+                # two bugs to find.
+                "model": str(self.settings.get("assistant.model") or "")
+                         or getattr(self.adapter, "model", None),
+                "tools": bool(self.adapter.ask_has_tools),
+                "sandbox": (config.CODEX_ASK_SANDBOX
+                            if self.agent_name == "codex" else None),
             },
+            vision={"available": can_see, "detail": see_detail,
+                    "scopes": list(context_mod.SCOPES)},
             memory=self.memory.usage(),
             consolidation=self.consolidator.snapshot(),
             activity={
@@ -240,6 +382,7 @@ class Daemon:
                       "specialist": settings_mod.specialist_name(),
                       "secrets": settings_mod.secrets_status()},
             confirm=self.confirm.snapshot(),
+            ambient=self.ambient.snapshot(),
             dispatch=self.dispatcher.snapshot(),
             audit=self.audit.stats(),
             spawned={"tracked": len(safety.ledger()),
@@ -306,9 +449,19 @@ class Daemon:
         # unchanged from turn to turn and the prompt cache is read rather than
         # rewritten. Recall belongs to this turn, so it goes in the message.
         who = settings_mod.assistant_name()
-        system_prompt = persona.build_system_prompt(tier1, self.persona_spec,
-                                                    name=who)
-        message = persona.build_user_message(prompt, recall, surface)
+        # `tools` is a reading of the adapter, not a constant: her operating
+        # notes must describe the agent actually answering. It is stable for
+        # the life of a session, so it does not disturb the prefix.
+        system_prompt = persona.build_system_prompt(
+            tier1, self.persona_spec, name=who,
+            tools=bool(self.adapter.ask_has_tools))
+        # The focused window, in the *user* message. Always on, by the user's
+        # explicit request, and bounded hard: one hyprctl query with a one
+        # second ceiling, and any failure at all means the ask goes out without
+        # it. A context line is worth twenty tokens; it is not worth a question
+        # that does not get answered.
+        message = persona.build_user_message(
+            prompt, recall, surface, context_line=context_mod.context_line())
         # Her name is in the prefix, so it is in the fingerprint: renaming her
         # must retire the warm sessions rather than resume one whose cached
         # prefix still introduces her by the old name.
@@ -327,9 +480,37 @@ class Daemon:
                                "recalled": bool(recall),
                                "conversation": conversation,
                                "resuming": bool(args.get("resume"))})
+        # Speech is dispatched from inside the agent call, the moment the
+        # turn completes, rather than here after the child process has
+        # finished shutting down. Measured: ~470 ms earlier, every ask. The
+        # adapter fires it at most once and only for a turn that succeeded;
+        # if it never fires (claude, a stream with no events, voice off) the
+        # post-hoc call below still speaks, exactly as before.
+        speaker = _EarlySpeaker(self._speak_safely) if speak else None
+        if speak:
+            # Overlap piper's 1.47 s cold model load with the model's own
+            # thinking time instead of paying them one after the other. A
+            # no-op unless piper is the configured provider; see
+            # `Speech.prewarm`.
+            try:
+                self.speech.prewarm()
+            except Exception:  # noqa: BLE001 - a warm-up may never break an ask
+                log.exception("speech pre-warm failed")
+        scope = req.get("look")
         try:
-            reply = self._ask_agent(req, message, system_prompt, args, run,
-                                    sess, conversation, prefix, request_id)
+            if scope:
+                # The screenshot exists only inside this block. `look()` deletes
+                # it in a `finally`, so an agent call that raised leaves no
+                # picture of the user's screen behind on disk.
+                with context_mod.look(str(scope)) as shot:
+                    reply = self._ask_agent(req, message, system_prompt, args,
+                                            run, sess, conversation, prefix,
+                                            request_id, images=(str(shot),),
+                                            on_reply=speaker)
+            else:
+                reply = self._ask_agent(req, message, system_prompt, args, run,
+                                        sess, conversation, prefix, request_id,
+                                        on_reply=speaker)
         finally:
             self.runs.done(run)
             self._publish_state()
@@ -353,7 +534,13 @@ class Daemon:
 
         spoken = None
         if speak:
-            spoken = self._speak_safely(reply.text)
+            # Already said, in almost every case, by the callback above. This
+            # is the fallback for the paths that cannot fire it — an adapter
+            # with no event stream, or a reply recovered from `-o` after the
+            # stream lost it — and it must stay, because "she answered but
+            # said nothing" is the worst failure this path has.
+            spoken = (speaker.spoken if speaker is not None and speaker.fired
+                      else self._speak_safely(reply.text))
 
         log.info("reply", extra={"req_id": request_id, "wall_ms": reply.wall_ms,
                                  "cost_usd": reply.cost_usd,
@@ -373,6 +560,38 @@ class Daemon:
         payload["consolidating"] = self.consolidator.turn()
         return protocol.ok(request_id, **payload)
 
+    def _job_finished(self, job: dispatch.Job) -> None:
+        """Write a finished job into tier 2, so delegation compounds.
+
+        Recorded as an exchange, because that is what it is: the "user" side is
+        the task Luna sent out and the "assistant" side is what came back. It
+        lands in her own namespace rather than Sol's — Sol keeps his working
+        notes in `memory/sol/SOL.md`, but the *finding* belongs to the person
+        who asked for it, and Luna is the one who will be asked about it again.
+
+        `surface="dispatch"` distinguishes it from something the user said out
+        loud. Nothing filters on it today; it is there so that a later reader
+        of the episode store can tell a delegated result from a conversation,
+        which is a distinction that cannot be recovered afterwards.
+        """
+        output = (job.read_output(limit=config.CONSOLIDATE_EPISODE_CHARS * 8)
+                  or "").strip()
+        if job.state != "finished":
+            outcome = f"[{job.state}"
+            if job.exit_code is not None:
+                outcome += f", exit {job.exit_code}"
+            outcome += "] " + (output or "no output")
+        else:
+            outcome = output or "finished with no output"
+        who = (settings_mod.specialist_name() if job.to == "sol"
+               else "a worker")
+        episode = self.memory.episodes.record(
+            f"[delegated to {who} — job {job.id}] {job.task.strip()}",
+            outcome, surface="dispatch")
+        log.info("recorded a finished job in tier 2",
+                 extra={"job_id": job.id, "episode": episode.id,
+                        "state": job.state})
+
     def _spend(self, cost_usd: float | None) -> None:
         """Add a metered cost to the session total, from any thread.
 
@@ -390,7 +609,10 @@ class Daemon:
     def _ask_agent(self, req: dict[str, Any], message: str, system_prompt: str,
                    args: dict[str, Any], run: agent.AgentRun,
                    sess: sessions.Session | None, conversation: str,
-                   prefix: str, request_id: str) -> agent.AgentReply:
+                   prefix: str, request_id: str,
+                   images: tuple[str, ...] = (),
+                   on_reply: "_EarlySpeaker | None" = None,
+                   ) -> agent.AgentReply:
         """One agent call, with a single retry if a resume is refused.
 
         A resumable session id can go stale under the daemon — the agent's own
@@ -409,7 +631,8 @@ class Daemon:
                                     model=model,
                                     session_id=args.get("session_id"),
                                     resume=args.get("resume"),
-                                    timeout=timeout, run=run)
+                                    timeout=timeout, run=run, images=images,
+                                    on_reply=on_reply)
         except agent.AgentFailed as exc:
             if not args.get("resume") or sess is None:
                 raise
@@ -422,7 +645,8 @@ class Daemon:
             return self.adapter.ask(message, system_prompt,
                                     model=model,
                                     session_id=fresh.session_id, resume=None,
-                                    timeout=timeout, run=run)
+                                    timeout=timeout, run=run, images=images,
+                                    on_reply=on_reply)
 
     def _speak_safely(self, text: str) -> str | None:
         """Speak, but never let a mute speaker turn into a failed ask."""
@@ -435,6 +659,40 @@ class Daemon:
         with self._lock:
             self.counters["said"] += 1
         return result.get("spoken") or None
+
+    def op_look(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Ask about what is on the screen, with a screenshot attached.
+
+        An ask with a picture, and nothing more than that: the same session,
+        the same memory, the same recall, the same episode written afterwards.
+        Luna does not have a separate "vision mode" because the model does not
+        — `gpt-5.6-luna` sees natively and `codex exec -i` attaches the file to
+        the turn. There is no second model here and no HTTP call of any kind.
+
+        The capture happens inside `_ask`, so it is bounded by the same request
+        and deleted by the same `finally`. Nothing is captured unless this op
+        was called: the daemon never photographs the screen on its own.
+        """
+        scope = str(req.get("scope") or "window").strip().lower()
+        if scope not in context_mod.SCOPES:
+            raise protocol.ProtocolError(
+                f"unknown look scope {scope!r}; expected one of "
+                + ", ".join(context_mod.SCOPES))
+        if not self.adapter.accepts_images:
+            # Said plainly rather than answered from the window title, which is
+            # what a silently-dropped image would produce: a confident
+            # description of a screen nobody looked at.
+            return protocol.err(
+                req.get("id"), "LookUnavailable",
+                f"the {self.agent_name} adapter cannot be shown an image. "
+                "Luna sees through codex + gpt-5.6-luna: set "
+                "`[assistant] agent = \"codex\"`.")
+        prompt = req.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            prompt = ("What is on the screen right now? Describe what matters, "
+                      "briefly.")
+        return self.op_ask({**req, "op": "ask", "prompt": prompt,
+                            "look": scope})
 
     def op_say(self, req: dict[str, Any]) -> dict[str, Any]:
         text = req.get("text")
@@ -668,7 +926,16 @@ class Daemon:
     # -- Phase 2: delegation, the workspace, and the record -------------
 
     def op_dispatch(self, req: dict[str, Any]) -> dict[str, Any]:
-        """Hand a task to a real agent session in the `luna` workspace."""
+        """Hand a task to a real agent session in the `luna` workspace.
+
+        A ``tasks`` list instead of a ``task`` is a fan-out: the jobs go out
+        under one plan id and come back as a group. Nothing here decides to
+        fan out — that is Luna's judgement, and `data/persona.md` says when it
+        is worth paying for — this only carries the decision once it is made.
+        """
+        tasks = req.get("tasks")
+        if isinstance(tasks, list) and tasks:
+            return self._op_dispatch_plan(req, tasks)
         task = req.get("task")
         if not isinstance(task, str) or not task.strip():
             raise protocol.ProtocolError("dispatch requires a non-empty 'task'")
@@ -689,6 +956,27 @@ class Daemon:
             payload = self._wait_for_job(job, float(req.get("wait_timeout") or
                                                     config.DISPATCH_TIMEOUT_S))
             payload["announce"] = self.dispatcher.announce(job)
+        return protocol.ok(req.get("id"), **payload)
+
+    def _op_dispatch_plan(self, req: dict[str, Any],
+                          tasks: list[Any]) -> dict[str, Any]:
+        """A fan-out. Never waits: a plan is several jobs, and blocking a
+        socket thread on all of them is a thread held for the length of the
+        slowest one."""
+        cleaned = [t for t in tasks if isinstance(t, str) and t.strip()]
+        if len(cleaned) != len(tasks):
+            raise protocol.ProtocolError(
+                "every entry in 'tasks' must be a non-empty string")
+        to = str(req.get("to") or "worker").lower()
+        block = self.sol_memory.block() if to == "sol" else ""
+        plan = self.dispatcher.dispatch_plan(
+            cleaned, to,
+            timeout=float(req.get("timeout") or config.DISPATCH_TIMEOUT_S),
+            sol_memory_block=block,
+            estimate_seconds=_number(req.get("estimate_seconds")),
+            estimate_usd=_number(req.get("estimate_usd")))
+        payload = plan.to_dict()
+        payload["announce"] = self.dispatcher.announce_plan(plan)
         return protocol.ok(req.get("id"), **payload)
 
     def _wait_for_job(self, job: dispatch.Job, timeout: float) -> dict[str, Any]:
@@ -714,12 +1002,19 @@ class Daemon:
     def op_jobs(self, req: dict[str, Any]) -> dict[str, Any]:
         target = req.get("cancel")
         if target:
-            stopped = self.dispatcher.cancel(str(target))
+            target = str(target)
+            # A plan id cancels the whole group. Routed by looking the id up
+            # rather than by its shape, so nothing depends on how ids happen
+            # to be spelled today.
+            if target in self.dispatcher.plans():
+                return protocol.ok(req.get("id"), target=target,
+                                   **self.dispatcher.cancel_plan(target))
+            stopped = self.dispatcher.cancel(target)
             return protocol.ok(req.get("id"), cancelled=1 if stopped else 0,
-                               target=str(target),
+                               target=target,
                                note="" if stopped else
-                                    "no running or queued job with that id "
-                                    "in this daemon")
+                                    "no running or queued job, and no plan, "
+                                    "with that id in this daemon")
         jobs = self.dispatcher.jobs(limit=int(req.get("limit")
                                               or config.JOB_LIST_LIMIT),
                                     with_output=bool(req.get("output")))
@@ -868,6 +1163,149 @@ class Daemon:
         raise protocol.ProtocolError(
             f"unknown confirm action {what!r}; expected list, yes, no or ask")
 
+    def op_ambient(self, req: dict[str, Any]) -> dict[str, Any]:
+        """What the three hooks are watching, and what they have seen."""
+        return protocol.ok(req.get("id"), ambient=self.ambient.snapshot())
+
+    def op_ambient_diagnose(self, req: dict[str, Any]) -> dict[str, Any]:
+        """The crash toast's one click: hand the diagnosis to a real agent.
+
+        This is the one place an ambient event turns into work, and it is on
+        the *request* path — the user clicked, so this is a job they started,
+        which is exactly the distinction the ambient rule turns on. It still
+        does not speak: the dispatched job reports through `luna jobs` and the
+        ordinary `[ui] notify_on_finish` toast.
+
+        Nothing here trusts the toast. The pid arrives as a number from a
+        command line the daemon wrote itself, but it is re-validated anyway,
+        and it is never signalled or looked up in `/proc` — by the time anyone
+        clicks, the process is long dead and the pid may belong to somebody
+        else. It is a key into `coredumpctl`, nothing more.
+        """
+        raw = req.get("pid")
+        try:
+            pid = int(raw)
+        except (TypeError, ValueError):
+            raise protocol.ProtocolError(
+                "ambient.diagnose requires a numeric 'pid'") from None
+        if pid <= 0:
+            raise protocol.ProtocolError(f"{pid} is not a pid")
+        exe = str(req.get("exe") or "").strip()[:64]
+        when = str(req.get("when") or "").strip()[:64]
+        task = ambient_mod.diagnosis_task(pid, exe=exe, when=when)
+        job = self.dispatcher.dispatch(
+            task, "worker",
+            timeout=float(req.get("timeout")
+                          or config.AMBIENT_DIAGNOSE_TIMEOUT_S))
+        self.audit.append("ambient.diagnose", ok=True,
+                          why=f"the user asked why {exe or 'a process'} "
+                              f"(pid {pid}) crashed",
+                          pid=pid, comm=exe or None, job_id=job.id)
+        payload = job.to_dict()
+        payload["announce"] = self.dispatcher.announce(job)
+        return protocol.ok(req.get("id"), **payload)
+    # -- version control -------------------------------------------------
+
+    def repo_for(self, req: dict[str, Any]) -> vcs.Repo:
+        """A :class:`vcs.Repo` for the caller's working directory.
+
+        The *caller's*, not the daemon's. ``git`` is relative to a checkout and
+        the daemon's own cwd is meaningless — the CLI sends its `os.getcwd()`
+        with every request, and a dispatched agent sends the directory it is
+        working in. Falling back to Luna's own repository is the least
+        surprising answer for a caller that sent nothing, and it is a real
+        repository rather than a job scratch directory.
+
+        Built per request. A cached one would be caching the branch the user
+        was on when the daemon started, and it holds the *live* broker so a
+        confirmation raised here can be answered through `luna confirm`.
+        """
+        where = str(req.get("cwd") or "").strip() or str(config.PROJECT_DIR)
+        return vcs.Repo(where, audit=self.audit, confirm=self.confirm,
+                        settings=self.settings)
+
+    def op_vcs(self, req: dict[str, Any]) -> dict[str, Any]:
+        """The GitHub workflow: branch, commit, push, PR, checks, merge.
+
+        One op with an ``action``, in the shape of ``confirm``, rather than ten
+        ops: they share a repository handle, an error family and a working
+        directory, and splitting them would put the same four lines of setup in
+        ten places.
+        """
+        action = str(req.get("action") or "status").lower()
+        repo = self.repo_for(req)
+        rid = req.get("id")
+        actor = str(req.get("actor") or "luna")
+        why = str(req.get("why") or "")
+        paths = [str(p) for p in (req.get("paths") or [])]
+
+        if action == "status":
+            ok, detail = repo.available()
+            return protocol.ok(rid, available=ok, detail=detail,
+                               **(repo.status() if ok else {}))
+        if action == "branch":
+            result = repo.branch(str(req.get("topic") or ""),
+                                 base=(str(req["base"]) if req.get("base")
+                                       else None),
+                                 exact=bool(req.get("exact")),
+                                 adopt=bool(req.get("adopt", True)))
+            return protocol.ok(rid, **result.to_dict())
+        if action == "commit":
+            commit = repo.commit(str(req.get("message") or ""), paths,
+                                 body=str(req.get("body") or ""))
+            return protocol.ok(rid, **commit.to_dict())
+        if action == "push":
+            branch = repo.push(str(req.get("branch") or "") or None,
+                               actor=actor, why=why)
+            return protocol.ok(rid, branch=branch)
+        if action == "pr":
+            pr = repo.pull_request(
+                str(req.get("title") or ""), str(req.get("body") or ""),
+                base=(str(req["base"]) if req.get("base") else None),
+                head=(str(req["head"]) if req.get("head") else None),
+                draft=bool(req.get("draft")), actor=actor, why=why)
+            return protocol.ok(rid, **pr.to_dict())
+        if action == "checks":
+            status = repo.checks(_opt_int(req.get("number")),
+                                 wait=float(req.get("wait") or 0.0))
+            return protocol.ok(rid, **status.to_dict())
+        if action == "merge":
+            result = repo.merge(
+                _opt_int(req.get("number")),
+                method=(str(req["method"]) if req.get("method") else None),
+                delete_branch=(bool(req["delete_branch"])
+                               if "delete_branch" in req else None),
+                wait=float(req.get("wait") or 0.0), actor=actor, why=why)
+            return protocol.ok(rid, **result.to_dict())
+        if action == "issue":
+            issue = repo.open_issue(str(req.get("title") or ""),
+                                    str(req.get("body") or ""),
+                                    labels=[str(l) for l in
+                                            (req.get("labels") or [])],
+                                    actor=actor)
+            return protocol.ok(rid, **issue.to_dict())
+        if action == "comment":
+            url = repo.comment(int(req.get("number") or 0),
+                               str(req.get("body") or ""),
+                               on=str(req.get("on") or "issue"), actor=actor)
+            return protocol.ok(rid, url=url)
+        if action == "ship":
+            report = repo.ship(
+                topic=str(req.get("topic") or ""),
+                message=str(req.get("message") or ""), paths=paths,
+                title=(str(req["title"]) if req.get("title") else None),
+                body=str(req.get("body") or ""),
+                base=(str(req["base"]) if req.get("base") else None),
+                draft=bool(req.get("draft")),
+                wait=(float(req["wait"]) if req.get("wait") is not None
+                      else None),
+                merge=(bool(req["merge"]) if "merge" in req else None),
+                actor=actor, why=why)
+            return protocol.ok(rid, **report)
+        raise protocol.ProtocolError(
+            f"unknown vcs action {action!r}; expected one of status, branch, "
+            "commit, push, pr, checks, merge, issue, comment, ship")
+
     def op_shutdown(self, req: dict[str, Any]) -> dict[str, Any]:
         # Present so a supervisor or the CLI can stop the daemon cleanly; the
         # actual stop is scheduled after the response is flushed.
@@ -882,6 +1320,7 @@ class Daemon:
             "ping": self.op_ping,
             "status": self.op_status,
             "ask": self.op_ask,
+            "look": self.op_look,
             "say": self.op_say,
             "speak.cancel": self.op_speak_cancel,
             "session.reset": self.op_session_reset,
@@ -896,9 +1335,12 @@ class Daemon:
             "peek": self.op_peek,
             "audit": self.op_audit,
             "spawned": self.op_spawned,
+            "ambient": self.op_ambient,
+            "ambient.diagnose": self.op_ambient_diagnose,
             "settings.get": self.op_settings_get,
             "settings.set": self.op_settings_set,
             "confirm": self.op_confirm,
+            "vcs": self.op_vcs,
             "cancel": self.op_cancel,
             "shutdown": self.op_shutdown,
         }
@@ -924,10 +1366,25 @@ class Daemon:
                 self.counters["errors"] += 1
             log.warning("agent error", extra={"op": op, "detail": str(exc)})
             return protocol.err(req.get("id"), **_strip(exc.to_dict()))
+        except context_mod.LookUnavailable as exc:
+            # A desktop that cannot be photographed — no grim, no compositor —
+            # is a fact about the machine and belongs in the reply, not in the
+            # error counter and not in a traceback.
+            log.warning("could not take a look", extra={"op": op,
+                                                        "detail": str(exc)})
+            return protocol.err(req.get("id"), **_strip(exc.to_dict()))
         except dispatch.DispatchError as exc:
             with self._lock:
                 self.counters["errors"] += 1
             log.warning("dispatch error", extra={"op": op, "detail": str(exc)})
+            return protocol.err(req.get("id"), **_strip(exc.to_dict()))
+        except vcs.VcsError as exc:
+            # Not an internal error: the workflow said no, or git did. The
+            # decision travels back whole (`NotGreen` carries the entire check
+            # status) so the caller can say which check is red rather than
+            # only that something is.
+            log.info("vcs refused", extra={"op": op, "kind": exc.kind,
+                                           "detail": str(exc)[:200]})
             return protocol.err(req.get("id"), **_strip(exc.to_dict()))
         except confirm.ConfirmDenied as exc:
             # Not an error in the daemon: it is the answer. Reported with the
@@ -959,6 +1416,18 @@ class Daemon:
         # First, so the bar stops claiming she is here while the rest of the
         # shutdown (cancelling runs, draining speech) takes its time.
         self.presence.clear()
+        # Early, next to presence and for the same reason: the three files the
+        # desktop reads should stop claiming things before the slow half of the
+        # shutdown starts. `close()` also retracts an ambient caption from the
+        # HUD, but only one ambient put there.
+        #
+        # `hud.json` goes too. `lunad.service.d/20-presence.conf` removes all
+        # three in `ExecStopPost` for the crash case; this is the clean one,
+        # and both have to exist -- systemd cannot clean up after a daemon
+        # that is still running, and a daemon that was SIGKILLed cannot clean
+        # up after itself.
+        self.hud.clear()
+        self.ambient.close()
         self.settings.stop_watching()
         # Before the memory it writes into is closed, and bounded so a wedged
         # agent cannot hold the daemon's shutdown open.
@@ -983,6 +1452,20 @@ def _number(value: Any) -> float | None:
         return None
 
 
+def _opt_int(value: Any) -> int | None:
+    """A pull request number, or ``None`` for "work it out from the branch".
+
+    ``0`` and ``""`` both mean "not given": JSON has no way to say "absent" in
+    a field the CLI always sends, and a merge of pull request 0 is not a thing
+    anybody meant.
+    """
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number or None
+
+
 def _strip(d: dict[str, Any]) -> dict[str, Any]:
     """Adapt an exception dict to protocol.err's keyword signature."""
     out = dict(d)
@@ -1005,13 +1488,25 @@ class _Handler(socketserver.StreamRequestHandler):
         peer = "unix"
         while True:
             try:
-                line = self.rfile.readline()
+                line = protocol.read_line(self.rfile)
             except (TimeoutError, socket.timeout):
                 log.info("client idle timeout", extra={"peer": peer})
                 return
             except OSError as exc:
                 if exc.errno not in (errno.ECONNRESET, errno.EPIPE):
                     log.warning("read error", extra={"detail": str(exc)})
+                return
+            except protocol.ProtocolError as exc:
+                # An oversized line is refused *while* it is being read, so the
+                # rest of it is still unread in the socket buffer. Resyncing
+                # mid-garbage is not worth attempting: answer once, then close.
+                try:
+                    self.wfile.write(
+                        protocol.encode(
+                            protocol.err(None, "ProtocolError", str(exc))))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
                 return
             if not line:
                 return

@@ -78,6 +78,56 @@ class EditTest(unittest.TestCase):
         with self.assertRaises(TomlEditError):
             set_values(text, {"voice.model": "y"})
 
+    def test_a_hash_inside_a_quoted_value_is_not_a_comment(self):
+        # A literal "#" inside a quoted string must not be treated as the
+        # start of a comment — `model = "gpt#4"` is a complete, valid
+        # value, not a value truncated at the "#".
+        text = '[assistant]\nmodel = "gpt#4"\n'
+        out = set_values(text, {"assistant.model": "gpt#5"})
+        self.assertEqual(tomllib.loads(out)["assistant"]["model"], "gpt#5")
+
+    def test_a_hash_inside_a_single_quoted_value_is_not_a_comment(self):
+        text = "[assistant]\nmodel = 'gpt#4'\n"
+        out = set_values(text, {"assistant.model": "gpt#5"})
+        self.assertEqual(tomllib.loads(out)["assistant"]["model"], "gpt#5")
+
+    def test_a_real_trailing_comment_next_to_a_quoted_hash_still_works(self):
+        text = '[assistant]\nmodel = "gpt#4"   # a model id with a hash\n'
+        out = set_values(text, {"assistant.model": "gpt#5"})
+        self.assertEqual(tomllib.loads(out)["assistant"]["model"], "gpt#5")
+        self.assertIn("# a model id with a hash", out)
+
+    def test_a_decoy_line_inside_an_untouched_multiline_string_is_not_rewritten(self):
+        # `description` is a multi-line string Jarvis is not touching; the
+        # line inside it that reads exactly like `model = "..."` must not
+        # be mistaken for the real [voice] model key below it.
+        text = (
+            '[voice]\n'
+            'description = """\n'
+            'Example config:\n'
+            'model = "sneaky-value"\n'
+            '"""\n'
+            'model = "deepgram/flux-tts:free"\n'
+        )
+        out = set_values(text, {"voice.model": "deepgram/flux-tts:free-v2"})
+        got = tomllib.loads(out)
+        self.assertEqual(got["voice"]["model"], "deepgram/flux-tts:free-v2")
+        # the decoy line inside the string survives untouched
+        self.assertIn('model = "sneaky-value"', out)
+
+    def test_a_decoy_line_inside_a_multiline_array_is_not_rewritten(self):
+        text = (
+            '[voice]\n'
+            'tags = [\n'
+            '  "model = 99",\n'
+            ']\n'
+            'model = "deepgram/flux-tts:free"\n'
+        )
+        out = set_values(text, {"voice.model": "deepgram/flux-tts:free-v2"})
+        got = tomllib.loads(out)
+        self.assertEqual(got["voice"]["model"], "deepgram/flux-tts:free-v2")
+        self.assertIn('"model = 99"', out)
+
 
 class ValidationTest(unittest.TestCase):
     def test_out_of_range_is_refused(self):
