@@ -158,8 +158,140 @@ left. It is not taken here because it does not stand on its own:
 - And a clause split is a real prosody seam in a voice the user chose.
 
 Concurrent-first-two plus a clause split would give ~1,050 ms first audio with
-no gap. That is a voice-quality decision, so it is written down here rather than
-taken.
+no gap. That is a voice-quality decision, so it was written down here rather
+than taken — and then taken, deliberately, in §4a.
+
+## 4a. The win in §4, taken
+
+Everything §4 predicted held up, so it was built: the opening sentence is cut
+at a clause boundary and **both halves are requested at the same time**.
+Measured on this machine on 2026-09-10, live against
+`deepgram/flux-tts:free`, six runs of each interleaved so that neither mode
+gets the good half of the provider's day. Audio was routed to a sink for the
+timing runs, so nothing here was heard; the arithmetic is the same either way.
+
+Opening sentence: *"I checked the logs, and the service came back up about ten
+minutes ago."* (71 characters, cut 19/51 at the comma.)
+
+| | time to first audio, ms |
+|---|---|
+| before (one request, whole sentence) | 2165, 2218, 2773, 2906, 3127, 3270 — **median 2,840** |
+| after (two concurrent requests) | 1052, 1211, 1236, 1313, 1452, 1621 — **median 1,275** |
+
+**−1,565 ms, median, on every spoken reply whose first sentence is long enough
+to split.** A longer opener (94 characters, cut 39/54) went 3,907 → 2,566 ms,
+−1,341 ms. Through the real `aplay` rather than a sink, one live utterance
+each: 2,315 → 1,400 ms.
+
+**No gap at the seam.** The measure is whether the tail's audio is in hand
+before the head's runs out — `t_ready(tail) - (first_audio + duration(head))`,
+with the head's duration taken after trimming. Negative is slack:
+
+| | seam slack, ms (negative = no gap) |
+|---|---|
+| concurrent (shipped) | −263, −255, −860, −280, −531, −907 |
+| naive split, one-ahead producer | **+352, +122, +625** |
+
+So the concurrency is not an optimisation on top of the split, it is the thing
+that makes the split legal. The serial version puts a 122–625 ms hole in the
+middle of her first sentence, exactly as §4 predicted.
+
+**The short case did not regress.** *"It is already running."* (22 characters)
+is under the threshold and is never cut, so both columns are the same code
+path; the difference is provider noise:
+
+| | ms |
+|---|---|
+| split disabled | 1159, 1171, 1254, 1354, 1454 — median 1,254 |
+| split enabled (never fires) | 1056, 1172, 1384, 1476, 1709 — median 1,384 |
+
+### When it splits, and where
+
+`split_lead_sentence` declines unless all of these hold. Declining is the
+common case.
+
+* The first sentence is **at least 50 characters**. At 17 ms/character the most
+  any split of a shorter one could save is ~0.5 s, and the head would be so
+  short that its audio could not cover the tail. 21 characters already
+  synthesises at the 1,047 ms floor (§4), so there is nothing there to win.
+* The cut is at a **real clause boundary** — comma, semicolon, colon, or a
+  spaced dash — never at a character count. The whitespace lookahead keeps
+  "1,234" and "3:15" out; a hyphen only counts when spaced, so "well-known" is
+  safe. Nothing in the sentence with a boundary is split at an arbitrary point,
+  and a sentence with no boundary is left whole.
+* The **tail is at least 24 characters**, or the saving is under 0.4 s.
+* The head's audio **covers the tail's synthesis**: `(54 + 17) x head >= 17 x
+  tail + 250`, from the two measured slopes in §4 (54 ms/char of speech,
+  17 ms/char of synthesis; the fixed floor is the same for both halves and
+  cancels). A head covers a tail about 4.2 times its length. A boundary too
+  early to cover the tail is *passed over*, not given up on — that is what
+  splits "The build is green, the tests all pass, and the branch is ready…" at
+  the second comma rather than abandoning it at the first.
+
+### The seam is real, and it is bounded
+
+The provider pads every request: 200–400 ms of near-silence before the first
+word, and a decay after the last. Mid-sentence that padding is the seam. Across
+nine renderings of three sentences:
+
+| | seam pause, ms |
+|---|---|
+| untrimmed | 20, 60, 60, 90, 230, 240, 390, 390, 620 — median 230 |
+| trimmed (`trim_seam`) | 20, 60, 60, 70, 70, 80, 140, 140, 140 — median 70 |
+| the same voice's longest *internal* pause, whole sentence | 80–180 |
+
+So `trim_seam` cuts the facing edges back to 80 ms each, which puts the seam
+inside the range of pauses the voice already makes on its own. It only ever
+looks at samples under 3% of the chunk's own peak, never cuts more than 400 ms,
+and is a no-op on a chunk with nothing to spare — it cannot clip a word. It
+costs 3.2 ms per chunk, twice, which is noise against 1,275 ms.
+
+**Honest caveat: nobody has listened to it.** The numbers above say the pause
+between the halves is now no longer than the pauses the voice makes inside a
+sentence, and shorter than it was in six of nine renderings. They do not say
+whether the *intonation* matches across the cut — the head is synthesised as a
+complete utterance and gets a terminal contour the whole sentence would not
+have had. That is a judgement for ears. `[voice] provider = "piper"` turns the
+whole thing off, and deleting the `split_lead_sentence` call in `say()` turns
+it off for OpenRouter too.
+
+### What a barge-in costs now
+
+Two requests are in flight only while the opening sentence is out. Timestamped
+live, barging in 500 ms after the first audio frame:
+
+```
+    3 ms  start  "The build is green, the te…"
+    4 ms  start  "and the branch is ready to…"
+ 2106 ms  done   "and the branch is ready to…"
+ 2514 ms  done   "The build is green, the te…"
+ ~3000 ms cancel() returned True in 52 ms; aplay dead; played_bytes 0
+```
+
+Sentence two was never requested, and the tail — which had already arrived —
+was never played. The wasted synthesis is the *two halves of one sentence*.
+Before this change the request in flight during sentence one was sentence
+*two*, so an interruption there wasted two sentences' worth. A barge-in is now
+cheaper, not dearer, and it still goes through `safety.terminate` — no new
+signal path was added, and the ledger came back empty.
+
+### Piper
+
+Untouched. The split is decided in `say()` behind
+`provider == "openrouter"`, so with piper as the *provider* the sentence is
+never cut: it synthesises in ~212 ms pre-warmed and a seam there buys nothing.
+With piper as the *fallback*, the two halves simply arrive as two of the units
+it already streams into one `aplay` — verified live by forcing the remote
+provider to fail: one player, one `said`, all three units spoken, 1,609 ms to
+first audio (the cold load).
+
+### Measured and not taken
+
+The head chunk arrives with 190–390 ms of silence before the first word, and
+the whole-sentence rendering has the same lead-in. Trimming *that* would take
+another ~200 ms off time to first audio, but it is the onset of her first word
+rather than padding between two of them, and getting it wrong clips her. Left
+alone.
 
 ## 5. Other things measured and deliberately left alone
 
@@ -184,10 +316,12 @@ Same short factual voice ask:
 | codex process start | ~250 ms | ~250 ms |
 | model turn | 2,400–3,600 ms | 2,400–3,600 ms |
 | codex shutdown, waited for | **~470 ms** | **0** |
-| TTS first audio, OpenRouter | 1,050–3,700 ms | 1,050–3,700 ms |
+| TTS first audio, OpenRouter | 1,050–3,700 ms | **1,050–1,650 ms** (§4a) |
 | TTS first audio, piper after 5 min idle | 1,609 + 212 ms | **212 ms** |
 
-So: **−420 ms (median) on every ask**, and **−1,609 ms more on the piper path**.
+So: **−420 ms (median) on every ask**, **−1,565 ms more (median) whenever the
+opening sentence is long enough to split**, and **−1,609 ms on the piper
+path**.
 Against a ~6 s total that is the whole of what is addressable on our side of the
 call; the model turn and codex's own 250 ms startup are ~2.9 s of floor that
 Luna does not control, and §3 shows the prompt is not the lever it looks like.
