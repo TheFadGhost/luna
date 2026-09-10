@@ -121,6 +121,13 @@ An **idle** retirement carries nothing on purpose. Half an hour of silence is a
 new conversation, and dragging the last one into it is worse than starting
 clean.
 
+One known limitation, left in: the episode store has a `surface` column but no
+*conversation* column, so "the last few exchanges" is the last few across all
+conversations. Two named conversations rolling over in the same minute could
+cross-contaminate by one block. Fixing it is a schema migration on the user's
+real store; the symptom is one stale-sounding line in a block she is told not
+to remark on. Not worth it yet.
+
 **A token budget.** `config.SESSION_TOKEN_BUDGET = 240_000`, compared against
 the `input_tokens` codex already reports. It is a backstop, not a policy: a
 *conversational* turn will never reach it, but a tool-using turn can add
@@ -158,22 +165,53 @@ was a few months away, not today.
   The consolidation pass already turns episodes into curated memory on a timer;
   a rollover that also summarised would be a second, unbudgeted paid call on
   the latency path, to produce something the episode store already holds.
-* **No episode-store GC.** There is none today and it is not needed yet: 72
-  episodes in 300 KB after two weeks. See §5.
+* **No episode-store GC.** There is none today and it is not needed yet: 84
+  episodes in 328 KB after sixteen days. See §6.
 * **No new config key**, so nothing is owed to `jarvis-settings`'s
   `ContractTest`.
 * **No turn cap change**, for the reason in §3.
 
-## 5. Long-run growth, measured
+## 5. The other slow rot: stale embedding vectors
 
-See the branch report for the current byte counts. The episode store is the
-only tier with no collector at all, and at the observed rate — 72 episodes,
-~4 KB each including its embedding vector, over sixteen days — it reaches
-single-digit megabytes in a decade. It is written down here as a known gap
-rather than fixed, because a GC that fires once every ten years is a GC nobody
-has ever tested.
+Found while auditing growth, fixed here because it is the same class of bug as
+everything above — silent, permanent, and reported as healthy.
 
-## 6. Gotchas found on the way
+`episode_vectors` stores `model` and `dim` per row, and the schema comment says
+why: "change the model and the old rows can be found and re-embedded".
+`_sync_worker` honours it and refuses to load another model's vectors, which is
+correct. `pending_vector_rows` and `vector_stats` did not — they anti-joined on
+`episode_id` alone. So the day the embedding model changes, every already-
+embedded episode counts as done, is never re-embedded, and is never loaded into
+the search matrix again. Semantic recall quietly loses its entire back
+catalogue while `luna status` reports nothing pending.
+
+Both queries now join on `(episode_id, model, dim)`. `store_vectors` already
+upserts on `episode_id`, so re-embedding replaces rather than duplicates, and
+the existing battery guard on `backfill_vectors` already covers the cost of the
+one big catch-up a model change would trigger. The current store has one model
+(`all-MiniLM-L6-v2`, 77 of 84 episodes), so this had not bitten yet.
+
+## 6. Long-run growth, measured
+
+Everything with a collector has one that genuinely runs at daemon start, not
+only from the CLI — verified by tracing each call chain:
+
+| store | bound | triggered by |
+|---|---|---|
+| job directories | `[dispatch] job_retention_days` = 14 | `Dispatcher.start_gc()`, a `luna-job-gc` daemon thread on a 6-hour loop, started from `Daemon.__init__` |
+| `audit.jsonl` | `[audit] max_mb` = 8, `keep` = 5 | `AuditLog.append()` itself, on the write path |
+| `spawned.json` | 200 records, pruned every 32 spawns | `SpawnLedger.record()`, inline |
+| `luna.log` | 1 MiB × 5 | stdlib `RotatingFileHandler` |
+| `voice-router.log` | 256 KiB × 1 | `bin/luna-voice-router`, per write |
+| **tier-2 episodes** | **none** | **nothing** |
+
+The episode store is the only tier with no collector at all. At the observed
+rate — 84 episodes over 16.3 days, ~4 KB each including the embedding vector —
+it reaches single-digit megabytes in a decade. Written down as a known gap
+rather than fixed: a GC that first fires in ten years is a GC nobody has ever
+tested, and deleting a user's memory is not a thing to build speculatively.
+
+## 7. Gotchas found on the way
 
 * **`codex exec resume` without `-m` silently changes model.** Resuming a
   thread recorded under `gpt-5.6-luna` without passing the model again ran it

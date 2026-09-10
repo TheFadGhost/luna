@@ -1109,34 +1109,62 @@ class EpisodeStore:
             return {}
 
     def vector_stats(self) -> dict[str, int]:
-        """How much of tier 2 is embedded. Cheap enough to call per search."""
+        """How much of tier 2 is embedded. Cheap enough to call per search.
+
+        ``pending`` counts episodes with no vector **from the model in use**,
+        which is not the same as no vector at all. The schema stores ``model``
+        and ``dim`` per row precisely so that changing the embedding model is
+        detectable rather than a slow rot in recall quality — but the anti-join
+        that reads it ignored both, so a row carrying a vector from a retired
+        model counted as done, was never re-embedded, and was skipped forever
+        by ``_sync_worker`` (which *does* filter on the model, correctly).
+        The result was episodes vanishing permanently from semantic recall
+        while the backfill reported nothing left to do. Counting them as
+        pending is enough to fix it and keeps this dict's keys where the rest
+        of the daemon expects them; a separate "stale" number would tell a
+        reader nothing the backfill does not already act on.
+        """
         with self._lock:
             row = self._conn.execute(
                 "SELECT (SELECT count(*) FROM episodes) AS episodes, "
                 "(SELECT count(*) FROM episode_vectors) AS vectors, "
-                "(SELECT coalesce(max(episode_id), 0) FROM episode_vectors) "
-                "  AS max_vector_id, "
+                "(SELECT coalesce(max(episode_id), 0) FROM episode_vectors "
+                "  WHERE model = :m AND dim = :d) AS max_vector_id, "
                 "(SELECT count(*) FROM episodes WHERE id NOT IN "
-                "  (SELECT episode_id FROM episode_vectors)) AS pending"
+                "  (SELECT episode_id FROM episode_vectors "
+                "   WHERE model = :m AND dim = :d)) AS pending",
+                {"m": embed_mod.MODEL_NAME, "d": int(embed_mod.EMBED_DIM)},
             ).fetchone()
         return {"episodes": int(row["episodes"]), "vectors": int(row["vectors"]),
                 "max_vector_id": int(row["max_vector_id"]),
                 "pending": int(row["pending"])}
 
     def pending_vector_rows(self, limit: int) -> list[sqlite3.Row]:
-        """Episodes with no vector yet, oldest first.
+        """Episodes with no vector *from the current model*, oldest first.
 
         An anti-join and nothing else, which is the whole of the backfill's
         resumability: progress is the rows that are already in
         ``episode_vectors``, each batch is committed before the next starts,
         and a kill at any point costs at most one batch. There is no cursor
         to keep consistent and nothing to reset.
+
+        The join is on ``(episode_id, model, dim)`` and not on ``episode_id``
+        alone, which is what makes the schema's promise true — "change the
+        model and the old rows can be found and re-embedded". Joining on the
+        id alone made a retired model's vector count as done, so the episode
+        was never re-embedded and, because ``_sync_worker`` filters on the
+        model, never searched semantically again either. ``store_vectors``
+        upserts on ``episode_id``, so re-embedding replaces rather than
+        duplicates.
         """
         with self._lock:
             return self._conn.execute(
                 "SELECT id, user_text, luna_text FROM episodes "
-                "WHERE id NOT IN (SELECT episode_id FROM episode_vectors) "
-                "ORDER BY id LIMIT ?", (int(limit),)).fetchall()
+                "WHERE id NOT IN (SELECT episode_id FROM episode_vectors "
+                "                 WHERE model = ? AND dim = ?) "
+                "ORDER BY id LIMIT ?",
+                (embed_mod.MODEL_NAME, int(embed_mod.EMBED_DIM),
+                 int(limit))).fetchall()
 
     def store_vectors(self, rows: Sequence[tuple[int, bytes]],
                       model: str = embed_mod.MODEL_NAME,
@@ -1827,6 +1855,15 @@ class Memory:
         ``exclude`` drops episodes already rendered by :meth:`recall_block`
         for the same turn, so a rollover costs a handful of lines rather than
         printing the same exchange twice under two different headings.
+
+        **Known limitation, written down rather than designed around:** the
+        episode store has a ``surface`` column but no *conversation* column, so
+        "recent" is recent across all of them. A user running two named
+        conversations at once could see the tail of one bridged into the
+        other. Adding the column is a schema migration on the user's real
+        store to fix a case that needs two concurrent named conversations and
+        a rollover in the same minute; the cost is one stale-sounding line in
+        a block she is told not to remark on. Not worth it yet.
 
         Returns "" when there is nothing to bridge to, and never raises for a
         reason the caller has to care about — a rollover with no bridge is the

@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import unittest
 
-from lunad import agent, config, consolidate, persona
+from lunad import agent, config, consolidate, embed as embed_mod, persona
 from lunad.memory import MemoryCapExceeded
 from lunad.session import SessionManager, fingerprint
 
@@ -507,6 +507,69 @@ class DaemonRolloverTests(DaemonCase):
         d = self.daemon(max_turns=60, token_budget=12_345)
         status = d.dispatch({"op": "status"})
         self.assertEqual(status["sessions"]["token_budget"], 12_345)
+
+
+
+class VectorsSurviveAModelChangeTests(TempMemoryCase):
+    """The other way she degrades quietly over months.
+
+    Not the context window and not the caps: the embedding model. Vectors are
+    stored with the ``model`` and ``dim`` that produced them, and
+    ``_sync_worker`` correctly refuses to load any other model's — so on the
+    day the embedding model changes, every episode already embedded becomes
+    invisible to semantic recall. The backfill is meant to find and re-embed
+    them; it joined on ``episode_id`` alone, so it counted a retired model's
+    vector as done and never looked at those rows again. The symptom is
+    recall getting quietly worse while the indexer reports nothing to do.
+
+    No embedder is loaded here. What is being tested is which rows the
+    backfill is offered, which is a question about SQL.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store = self.episodes()
+        self.ids = [self.store.record(f"question {i}", f"answer {i}").id
+                    for i in range(3)]
+
+    def embed_all(self, model: str, dim: int | None = None) -> None:
+        dim = embed_mod.EMBED_DIM if dim is None else dim
+        self.store.store_vectors([(i, b"\x00" * 4 * dim) for i in self.ids],
+                                 model=model, dim=dim)
+
+    def pending_ids(self) -> list[int]:
+        return [r["id"] for r in self.store.pending_vector_rows(50)]
+
+    def test_unembedded_episodes_are_pending(self):
+        self.assertEqual(self.pending_ids(), self.ids)
+        self.assertEqual(self.store.vector_stats()["pending"], 3)
+
+    def test_the_current_model_settles_them(self):
+        self.embed_all(embed_mod.MODEL_NAME)
+        self.assertEqual(self.pending_ids(), [])
+        self.assertEqual(self.store.vector_stats()["pending"], 0)
+
+    def test_a_retired_model_leaves_them_pending_again(self):
+        self.embed_all("some-older-model")
+        self.assertEqual(self.pending_ids(), self.ids)
+        self.assertEqual(self.store.vector_stats()["pending"], 3)
+
+    def test_a_changed_dimension_counts_the_same_way(self):
+        self.embed_all(embed_mod.MODEL_NAME, dim=embed_mod.EMBED_DIM // 2)
+        self.assertEqual(self.pending_ids(), self.ids)
+
+    def test_re_embedding_replaces_rather_than_duplicates(self):
+        self.embed_all("some-older-model")
+        self.embed_all(embed_mod.MODEL_NAME)
+        self.assertEqual(self.pending_ids(), [])
+        self.assertEqual(self.store.vector_stats()["vectors"], 3)
+
+    def test_the_watermark_only_counts_usable_vectors(self):
+        # `_sync_worker` asks the worker for its watermark and sends
+        # everything above it *for this model*. A high-water mark set by a
+        # retired model's rows would skip the re-embedded ones.
+        self.embed_all("some-older-model")
+        self.assertEqual(self.store.vector_stats()["max_vector_id"], 0)
 
 
 if __name__ == "__main__":  # pragma: no cover
