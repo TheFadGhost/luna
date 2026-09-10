@@ -626,9 +626,18 @@ class Daemon:
         # forwarded as a model name.
         model = req.get("model") or str(self.settings.get("assistant.model")
                                         or "") or None
+        # Read per ask, like `model`, so a change in the GUI reaches the next
+        # question rather than the next daemon restart. "auto" is forwarded as
+        # itself rather than as None: the adapter is the thing that knows what
+        # "let the model decide" means for the CLI it is driving, and None
+        # here would mean "nothing was asked for" and fall back to the
+        # adapter's own constant, which is a different question.
+        effort = req.get("reasoning_effort") or str(
+            self.settings.get("assistant.reasoning_effort") or "") or None
         try:
             return self.adapter.ask(message, system_prompt,
                                     model=model,
+                                    reasoning_effort=effort,
                                     session_id=args.get("session_id"),
                                     resume=args.get("resume"),
                                     timeout=timeout, run=run, images=images,
@@ -644,6 +653,7 @@ class Daemon:
             fresh = self.sessions.acquire(conversation, prefix)
             return self.adapter.ask(message, system_prompt,
                                     model=model,
+                                    reasoning_effort=effort,
                                     session_id=fresh.session_id, resume=None,
                                     timeout=timeout, run=run, images=images,
                                     on_reply=on_reply)

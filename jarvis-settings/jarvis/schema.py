@@ -130,6 +130,12 @@ SPEC: tuple[Section, ...] = (
                    default="codex", options=("claude", "codex")),
             ModelPick("model", "Model", "Empty means the agent's own default.",
                       default="", placeholder="agent default"),
+            Choice("reasoning_effort", "Reasoning effort",
+                   "How hard she is asked to think. \"auto\" leaves it to "
+                   "the model. Higher is not slower to answer by much, but "
+                   "it does make her answer longer \u2014 and on the voice "
+                   "path length is what costs time. codex only.",
+                   default="auto", options=("auto", "low", "medium", "high", "xhigh", "max")),
         ),
     ),
     Section(

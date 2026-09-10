@@ -46,7 +46,9 @@ class FakeAdapter(agent.BaseAdapter):
         self.last_prompt = prompt
         self.calls.append({"prompt": prompt, "system_prompt": system_prompt,
                            "session_id": kw.get("session_id"),
-                           "resume": kw.get("resume")})
+                           "resume": kw.get("resume"),
+                           "model": kw.get("model"),
+                           "reasoning_effort": kw.get("reasoning_effort")})
         if self.delay:
             time.sleep(self.delay)
         if self.raises:
@@ -360,6 +362,28 @@ class DispatchTests(DaemonCase):
         self.assertIn("episode", resp)
         self.assertEqual(d.memory.episodes.stats()["episodes"], 1)
         self.assertEqual(d.counters["ask"], 1)
+
+    def test_the_reasoning_effort_setting_reaches_the_adapter(self):
+        # `[assistant] reasoning_effort` is read per ask, like `model`, so a
+        # change in the GUI reaches the next question and not the next daemon
+        # restart. The value is forwarded as written — "auto" included, because
+        # only the adapter knows what "let the model decide" means for the CLI
+        # it is driving.
+        adapter = FakeAdapter()
+        d = self.daemon(adapter)
+        d.dispatch({"op": "ask", "prompt": "hello"})
+        self.assertEqual(adapter.calls[-1]["reasoning_effort"], "auto")
+
+        d.settings.set("assistant.reasoning_effort", "low")
+        d.dispatch({"op": "ask", "prompt": "hello again"})
+        self.assertEqual(adapter.calls[-1]["reasoning_effort"], "low")
+
+    def test_a_per_request_reasoning_effort_beats_the_setting(self):
+        adapter = FakeAdapter()
+        d = self.daemon(adapter)
+        d.settings.set("assistant.reasoning_effort", "low")
+        d.dispatch({"op": "ask", "prompt": "hello", "reasoning_effort": "high"})
+        self.assertEqual(adapter.calls[-1]["reasoning_effort"], "high")
 
     def test_ask_can_skip_remembering(self):
         d = self.daemon()

@@ -12,6 +12,7 @@ handling is never mocked, only the program on the other end of it.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import tempfile
@@ -25,6 +26,22 @@ from lunad import agent, config, dispatch
 from ._support import FakeHyprland, TempMemoryCase
 
 PERSONA = "You are Luna.\nBe brief.\n\"Quoted\" and `backticked` and \\ backslashed."
+
+
+@contextlib.contextmanager
+def _swap(module, name, value):
+    """Move a module constant for the body of a `with`, and put it back.
+
+    Used for `config.CODEX_*` constants, which exist as module-level names
+    precisely so a test can move them — see the guard contract in
+    `tests/_support.py`.
+    """
+    before = getattr(module, name)
+    setattr(module, name, value)
+    try:
+        yield
+    finally:
+        setattr(module, name, before)
 
 
 def events(text: str = "Fine.", thread: str = "01a0-thread",
@@ -188,6 +205,57 @@ class ArgvTests(unittest.TestCase):
                          config.CODEX_ASK_MODEL)
         self.assertEqual(agent.CodexAdapter(model=None).model,
                          config.CODEX_ASK_MODEL)
+
+    # -- reasoning effort -------------------------------------------------
+
+    def _effort(self, argv):
+        """The value of `-c model_reasoning_effort=`, or None if absent."""
+        for i, tok in enumerate(argv):
+            if tok == "-c" and argv[i + 1].startswith("model_reasoning_effort="):
+                return argv[i + 1].split("=", 1)[1]
+        return None
+
+    def test_a_chosen_reasoning_effort_reaches_argv(self):
+        argv = self.a.build_argv(PERSONA, reasoning_effort="low")
+        self.assertEqual(self._effort(argv), "low")
+
+    def test_auto_sends_no_reasoning_override_at_all(self):
+        # "auto" means "the model's own default", and the way to ask codex for
+        # that is to send nothing. An empty `-c model_reasoning_effort=` would
+        # be a value, and a different one.
+        for value in ("auto", ""):
+            with self.subTest(value=value):
+                self.assertIsNone(
+                    self._effort(self.a.build_argv(PERSONA,
+                                                   reasoning_effort=value)))
+
+    def test_the_default_is_the_adapters_constant_and_is_auto(self):
+        # Read late from `config`, never bound as a signature or class-attribute
+        # default — the guard contract. A test that moves the constant must see
+        # the next call follow it.
+        self.assertEqual(config.CODEX_ASK_REASONING_EFFORT, "auto")
+        self.assertIsNone(self._effort(self.a.build_argv(PERSONA)))
+        with _swap(config, "CODEX_ASK_REASONING_EFFORT", "xhigh"):
+            self.assertEqual(self._effort(self.a.build_argv(PERSONA)), "xhigh")
+
+    def test_the_effort_flag_comes_after_the_persona_and_before_the_images(self):
+        # `-i` is variadic: clap eats tokens until it meets a flag, so anything
+        # added to argv must stay in front of the image list.
+        argv = self.a.build_argv(PERSONA, reasoning_effort="high",
+                                 images=["/tmp/a.png"])
+        self.assertLess(argv.index("model_reasoning_effort=high"),
+                        argv.index("-i"))
+
+    def test_dispatch_never_gets_the_conversational_effort(self):
+        # A dispatched session is a coding agent with nobody waiting on the
+        # first spoken syllable. Speeding up the conversation must not quietly
+        # make the worker that writes code think less.
+        with _swap(config, "CODEX_ASK_REASONING_EFFORT", "low"):
+            argv = self.a.dispatch_argv('"$JOB"', '"$JOB/system.txt"',
+                                        binary="/fake/codex")
+        self.assertIsNone(self._effort(argv))
+        self.assertNotIn("model_reasoning_effort",
+                         " ".join(argv))
 
     def test_dispatch_argv_gives_the_job_its_directory(self):
         argv = self.a.dispatch_argv('"$JOB"', '"$JOB/system.txt"',

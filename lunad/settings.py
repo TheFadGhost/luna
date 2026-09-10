@@ -153,6 +153,24 @@ SCHEMA: tuple[Section, ...] = (
             # override for someone who wants a different one.
             Key("model", "", "str",
                 comment='"" = agent default (codex: gpt-5.6-luna)'),
+            # How hard she is asked to think, as codex's
+            # `model_reasoning_effort`. "auto" sends no override and lets the
+            # model use its own default (medium, for gpt-5.6-luna).
+            #
+            # It is a control and not a speed fix. Measured over 60 live asks
+            # on a realistic mix of her questions, `low` came out 139 ms
+            # *slower* than the default at the median — noise — because at
+            # medium she already spends no reasoning tokens on conversation.
+            # `high` costs +393 ms and roughly doubles the length of the
+            # answer, which on the voice path is the expensive half. The
+            # numbers, and the answers at each level, are in
+            # docs/_model-speed-notes.md.
+            #
+            # claude ignores it: `ClaudeAdapter.ask` takes `**_`, and this is
+            # a codex config key with no claude equivalent.
+            Key("reasoning_effort", "auto", "str",
+                choices=("auto", "low", "medium", "high", "xhigh", "max"),
+                comment="auto = model default | low..max (codex only)"),
         ),
     ),
     Section(

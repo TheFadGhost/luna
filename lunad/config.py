@@ -273,6 +273,25 @@ CODEX_DISPATCH_SANDBOX = "bypass"
 CODEX_ASK_MODEL = "gpt-5.6-luna"
 CODEX_DISPATCH_MODEL = "gpt-5.6-sol"
 
+# How hard the conversational model is asked to think, as codex's
+# `model_reasoning_effort`. This is the adapter's fallback, used when nothing
+# is passed to `ask()`; the user-facing control is `[assistant]
+# reasoning_effort`, which the server reads and forwards per ask.
+#
+# `"auto"` means send no override at all and let the model use its own
+# default, which for `gpt-5.6-luna` is `medium` (models_cache.json,
+# `default_reasoning_level`). See docs/_model-speed-notes.md for the measured
+# latency and answer quality at each level — the choice of default is made
+# there, on numbers, and not here. The short version: on 60 live asks, `low`
+# was 139 ms *slower* than the default at the median, which is noise, so the
+# default deliberately did not move.
+CODEX_ASK_REASONING_EFFORT = "auto"
+
+# The dispatch path deliberately does *not* take this. A dispatched session is
+# a coding agent doing coding-agent work with no user waiting on the first
+# spoken syllable, and `gpt-5.6-sol` already defaults to `low`. Speeding up the
+# conversation must not quietly make the worker that writes code think less.
+
 # codex's analogue of claude's --safe-mode: do not load the user's own
 # ~/.codex/config.toml or their execpolicy .rules into Luna's turns. Luna must
 # not inherit the user's Codex setup, and must not change it either.

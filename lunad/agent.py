@@ -751,6 +751,7 @@ class CodexAdapter(BaseAdapter):
         sandbox: str | None = None,
         mode: str = "ask",
         images: Sequence[str] = (),
+        reasoning_effort: str | None = None,
     ) -> list[str]:
         """The argv for one turn. The prompt is *not* here — it goes on stdin.
 
@@ -789,6 +790,26 @@ class CodexAdapter(BaseAdapter):
             argv += ["-C", str(config.AGENT_CWD)]
 
         argv += ["-c", self._instructions_override(system_prompt)]
+        # `model_reasoning_effort` is a real codex config key, verified against
+        # 0.151.0 by measuring it: the same question answered in 3.5 s at
+        # `low`, 5.7 s at `high` and 6.8 s at `max`. It is passed per
+        # invocation rather than written into the user's config.toml, because
+        # Luna must not edit a file her user and other tools also read.
+        #
+        # Only ever sent when a level is *chosen*. `"auto"` (and `""`, which
+        # is what an unset config reads as) mean "the model's own default",
+        # and the way to ask codex for that is to send no override at all —
+        # not to send an empty one, which would be a value, and a different
+        # one. Note that codex does **not** reject a level the model does not
+        # advertise: `model_reasoning_effort=ultra` against `gpt-5.6-luna`,
+        # which lists only low/medium/high/xhigh/max, ran to a clean answer.
+        # So a wrong value here fails silently rather than loudly, which is
+        # why the choices are validated by `settings.Key` before they get here.
+        effort = (reasoning_effort
+                  if reasoning_effort is not None
+                  else config.CODEX_ASK_REASONING_EFFORT)
+        if effort and effort != "auto":
+            argv += ["-c", f"model_reasoning_effort={effort}"]
         chosen_model = model or self.model
         if chosen_model:
             argv += ["-m", chosen_model]
@@ -848,6 +869,7 @@ class CodexAdapter(BaseAdapter):
         run: "AgentRun | None" = None,
         images: Sequence[str] = (),
         on_reply: "Callable[[str], None] | None" = None,
+        reasoning_effort: str | None = None,
         **_: Any,
     ) -> AgentReply:
         # `session_id` is accepted and ignored, on purpose. claude lets the
@@ -861,7 +883,8 @@ class CodexAdapter(BaseAdapter):
         os.close(fd)
         try:
             argv = self.build_argv(system_prompt, model=model, resume=resume,
-                                   output_file=out_path, images=images)
+                                   output_file=out_path, images=images,
+                                   reasoning_effort=reasoning_effort)
             stdout, stderr, rc, wall_ms = self._spawn_and_wait(
                 argv, timeout=timeout, run=run, stdin_data=prompt,
                 on_line=self._early_reply_watcher(on_reply))

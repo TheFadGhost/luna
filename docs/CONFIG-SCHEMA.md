@@ -28,6 +28,7 @@ name         = "Luna"        # display name + how she refers to herself
 specialist   = "Sol"         # the delegate persona
 agent        = "codex"       # claude | codex   (falls back to ~/.config/omarchy/defaults/agent)
 model        = ""            # "" = agent default (codex: gpt-5.6-luna)
+reasoning_effort = "auto"    # auto = model default | low..max (codex only)
 
 [voice]
 enabled      = true
@@ -162,6 +163,7 @@ restart, which is a different daemon and a different promise; they are the
 | `specialist` | `persona`, `dispatch.announce` | Live. Sol's preamble, his persona heading and the enrolment line. |
 | `agent` | `server` | Live. Swaps the adapter (`claude` ↔ `codex`). A `--agent` flag on the daemon still wins. |
 | `model` | `server` | Live, per ask. `""` means the agent's own default. |
+| `reasoning_effort` | `server`, `agent` | Live, per ask. codex's `model_reasoning_effort`, one of `auto` `low` `medium` `high` `xhigh` `max`. `auto` sends no override. **Not a speed fix** — `low` measured 139 ms *slower* than `auto` over 60 live asks, and `high` costs +393 ms and a roughly doubled answer. claude ignores it. See `docs/_model-speed-notes.md`. |
 
 ### `[voice]`
 
