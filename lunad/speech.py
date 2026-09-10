@@ -624,6 +624,51 @@ class Speech:
             "speed": _clamp_speed(cfg.get("speed", 1.0)),
         }
 
+    def prewarm(self) -> bool:
+        """Load the piper model *now*, on a thread, if piper will be speaking.
+
+        Called at the moment the agent subprocess is spawned, so the 1.47 s
+        cold model load overlaps the 2.4-3.6 s the model spends thinking
+        instead of landing on top of it. Measured cold load 1467 ms, first
+        audio frame from a warm worker 212 ms; the whole of that 1467 ms is
+        dead time the user hears as silence today.
+
+        Deliberately narrow. It only fires when piper is the *configured*
+        provider, never merely the configured fallback: the remote path falls
+        back on about one ask in forty here, and holding 331 MB of ONNX
+        resident against 8 GB of laptop for that is a worse trade than the
+        1.47 s it would occasionally save. Returns whether a load was started,
+        which is what the tests assert on.
+
+        ``_ensure_worker`` may only load from the thread ``_speak_lock``
+        serialises (see its docstring). This honours that rather than
+        working around it: it takes the same lock, and if speech already holds
+        it there is nothing to pre-warm anyway.
+        """
+        cfg = self._voice_settings()
+        if not cfg["enabled"] or cfg["provider"] != "piper":
+            return False
+        with self._lock:
+            if self._closed:
+                return False
+            if self._proc is not None and self._proc.poll() is None:
+                return False        # already warm; nothing to do
+
+        def load() -> None:
+            if not self._speak_lock.acquire(blocking=False):
+                return              # an utterance is running; it loads its own
+            try:
+                self._ensure_worker()
+            except Exception as exc:  # noqa: BLE001 - a warm-up may not raise
+                log.debug("piper pre-warm did not take",
+                          extra={"detail": f"{type(exc).__name__}: {exc}"})
+            finally:
+                self._speak_lock.release()
+
+        threading.Thread(target=load, daemon=True,
+                         name="luna-piper-prewarm").start()
+        return True
+
     def say(self, text: str, wait: bool = False,
             timeout: float = 120.0) -> dict[str, Any]:
         """Speak ``text``. Cancels anything already speaking (barge-in).

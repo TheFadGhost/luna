@@ -326,6 +326,82 @@ class FallbackCase(TempMemoryCase):
         self.assertEqual(seen[-1], "flux-donovan-en")
 
 
+class PrewarmCase(TempMemoryCase):
+    """`prewarm()` overlaps piper's cold load with the model's thinking time.
+
+    Measured on this machine: the piper worker costs 1.47-1.61 s to load and
+    212 ms to produce its first audio frame once loaded. Started when the agent
+    subprocess is spawned, the load finishes inside the 2.4-3.6 s the model
+    spends answering and the user never hears it.
+
+    What matters as much as the saving is the narrowness — the remote provider
+    falls back to piper on roughly one ask in forty here, and pre-loading
+    331 MB of ONNX for that would be a worse trade than the wait. So these
+    mostly assert that it stays out of the way.
+    """
+
+    def obj(self) -> speech.Speech:
+        s = speech.Speech(settings=self.settings)
+        self.addCleanup(s.close)
+        return s
+
+    def test_the_remote_provider_does_not_pre_load_piper(self) -> None:
+        """piper is only the *fallback* here. 331 MB is too much to spend on
+        a path taken about one ask in forty."""
+        self.settings.set("voice.provider", "openrouter")
+        self.assertFalse(self.obj().prewarm())
+
+    def test_piper_as_the_provider_does_pre_load(self) -> None:
+        self.settings.set("voice.provider", "piper")
+        obj = self.obj()
+        loads: list[int] = []
+        obj._ensure_worker = lambda: (loads.append(1), (None, None))[1]  # type: ignore[assignment]
+        self.assertTrue(obj.prewarm())
+        for _ in range(200):
+            if loads:
+                break
+            time.sleep(0.01)
+        self.assertEqual(loads, [1])
+
+    def test_voice_switched_off_pre_loads_nothing(self) -> None:
+        self.settings.set("voice.provider", "piper")
+        self.settings.set("voice.enabled", False)
+        self.assertFalse(self.obj().prewarm())
+
+    def test_a_closed_speech_pre_loads_nothing(self) -> None:
+        self.settings.set("voice.provider", "piper")
+        obj = speech.Speech(settings=self.settings)
+        obj.close()
+        self.assertFalse(obj.prewarm())
+
+    def test_a_warm_worker_is_not_loaded_twice(self) -> None:
+        self.settings.set("voice.provider", "piper")
+        obj = self.obj()
+        obj._proc = _AliveProc()                       # type: ignore[assignment]
+        self.addCleanup(setattr, obj, "_proc", None)
+        self.assertFalse(obj.prewarm())
+
+    def test_a_load_that_fails_is_swallowed_not_raised(self) -> None:
+        """A warm-up is an optimisation. It may never turn into a failed ask."""
+        self.settings.set("voice.provider", "piper")
+        obj = self.obj()
+
+        def boom() -> None:
+            raise speech.SpeechUnavailable("no model on this machine")
+
+        obj._ensure_worker = boom                      # type: ignore[assignment]
+        self.assertTrue(obj.prewarm())
+        time.sleep(0.1)
+        self.assertIsNone(obj._proc)
+
+
+class _AliveProc:
+    """The shape `prewarm` checks for: a worker that is already running."""
+
+    def poll(self) -> None:
+        return None
+
+
 class VoiceSettingsCase(TempMemoryCase):
     def obj(self) -> speech.Speech:
         s = speech.Speech(settings=self.settings)
