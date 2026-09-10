@@ -8,6 +8,7 @@ XDG runtime (tmpfs, cleared on reboot, which is what we want for a socket).
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 # --- Filesystem layout ----------------------------------------------------
@@ -475,6 +476,39 @@ VCS_CHECK_WAIT_S = 900               # how long `ship` waits for CI to report
 # preference anybody has.
 VCS_TIMEOUT_S = 120.0
 VCS_CHECK_POLL_S = 20.0
+
+# --- Self-update: `luna update` -------------------------------------------
+#
+# She runs from a git checkout, so bringing herself up to date is a fetch and
+# a fast-forward — never a stash, never a reset, never a force. The rules that
+# matter are in `lunad/update.py`; these are only the names it reaches the
+# machine with, and they are read *late* in `Updater.__init__` for the same
+# reason `git` and `gh` are: a name bound as a signature default is fixed at
+# import and cannot be patched, and a test suite that reached the real
+# `systemctl` would restart the user's daemon out from under them.
+#
+# `UPDATE_PYTHON` is its own name rather than a use of `VENV_PYTHON` on
+# purpose. The suite disarms `VENV_PYTHON` to a path that does not exist, and
+# an interpreter that "falls back to `sys.executable` when the venv is
+# missing" would fall back to a *real* interpreter inside the test process and
+# run the whole suite again, recursively, from a test. There is no fallback
+# here: if the recorded interpreter does not exist, `luna update` refuses.
+
+SYSTEMCTL_BIN = "systemctl"
+LUNAD_UNIT = "lunad"                 # `systemctl --user restart lunad`
+UPDATE_REMOTE = "origin"             # only used when the branch has no upstream
+UPDATE_PYTHON = (VENV_PYTHON if VENV_PYTHON.exists()
+                 else Path(sys.executable))
+
+# One fetch is quick or it is wedged; the suite is the slow part and the only
+# one worth a generous ceiling. `UPDATE_READY_S` is how long she waits for the
+# restarted daemon to answer its socket and republish `state` before deciding
+# it did not come back.
+UPDATE_GIT_TIMEOUT_S = 120.0
+UPDATE_TEST_TIMEOUT_S = 1800.0
+UPDATE_RESTART_TIMEOUT_S = 60.0
+UPDATE_READY_S = 30.0
+UPDATE_READY_POLL_S = 0.25
 
 # --- Audit log rotation ---------------------------------------------------
 #

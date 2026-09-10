@@ -38,11 +38,14 @@ from ._support import (FORBIDDEN_AMBIENT_STATE, FORBIDDEN_APLAY,
                        FORBIDDEN_POWER_SUPPLY_DIR, FORBIDDEN_PYTHON,
                        FORBIDDEN_SKILLS_EXTRA_ROOTS,
                        FORBIDDEN_SKILLS_STORE_DIR,
-                       FORBIDDEN_STATE_FILE, FORBIDDEN_TERMINAL, FakeHyprland,
+                       FORBIDDEN_SOCKET_PATH, FORBIDDEN_STATE_FILE,
+                       FORBIDDEN_SYSTEMCTL,
+                       FORBIDDEN_TERMINAL, FORBIDDEN_UNIT,
+                       FORBIDDEN_UPDATE_PYTHON, FakeHyprland,
                        TempMemoryCase)
 
 from lunad import (agent, ambient, config, confirm, context, dispatch, hud,
-                   presence, skills, speech, vcs)
+                   presence, skills, speech, update, vcs)
 
 #: Every ``config`` name that reaches the outside world, and what it would do
 #: to the machine running the suite if it were the real thing.
@@ -60,6 +63,10 @@ DISARMED = {
     "CODEX_BIN_NAME": (FORBIDDEN_CODEX_BIN,
                        "spawns a real codex CLI turn on the user's own "
                        "ChatGPT session"),
+    "SYSTEMCTL_BIN": (FORBIDDEN_SYSTEMCTL,
+                      "restarts the daemon the user is talking to"),
+    "UPDATE_PYTHON": (FORBIDDEN_UPDATE_PYTHON,
+                      "runs the whole suite again from inside a test"),
 }
 
 
@@ -100,6 +107,9 @@ class LateReadCase(unittest.TestCase):
         (vcs.Repo.__init__, ("git_bin", "gh_bin", "notify_bin")),
         (skills.SkillFarm.__init__,
          ("root", "store", "git_bin", "extra_roots")),
+        (update.Updater.__init__,
+         ("systemctl_bin", "unit", "python_bin", "socket_path", "state_file",
+          "skills_dir", "store_dir")),
     )
 
     def test_outward_parameters_default_to_none(self) -> None:
@@ -131,6 +141,30 @@ class ConstructionCase(TempMemoryCase):
 
     def test_the_compositor_handle_takes_the_hyprctl_sentinel(self) -> None:
         self.assertEqual(dispatch.Hyprland().hyprctl, FORBIDDEN_HYPRCTL)
+
+    def test_the_live_daemon_s_socket_is_not_where_the_suite_looks(self) -> None:
+        """The listener the user is actually talking to. A case that connected
+        to it could ask the running daemon to do anything at all, and a case
+        that merely asked whether it exists would answer differently depending
+        on whether lunad happened to be up."""
+        self.assertEqual(config.SOCKET_PATH, FORBIDDEN_SOCKET_PATH)
+        self.assertFalse(config.SOCKET_PATH.exists())
+        self.assertFalse(str(config.SOCKET_PATH).startswith(
+            str(Path(os.environ.get("XDG_RUNTIME_DIR",
+                                    f"/run/user/{os.getuid()}")))))
+
+    def test_the_updater_takes_the_systemctl_and_interpreter_sentinels(self) -> None:
+        """The self-update path is the one that restarts her. Built with
+        nothing specified it must hold names that cannot restart anything and
+        cannot fork a second copy of this suite."""
+        up = update.Updater(self.root, audit=self.audit,
+                            settings=self.settings)
+        self.assertEqual(up.systemctl_bin, FORBIDDEN_SYSTEMCTL)
+        self.assertEqual(up.unit, FORBIDDEN_UNIT)
+        self.assertEqual(up.python_bin, FORBIDDEN_UPDATE_PYTHON)
+        self.assertFalse(up.python_bin.exists())
+        self.assertEqual(up.repo.git_bin, FORBIDDEN_GIT)
+        self.assertFalse(str(up.state_file).startswith(str(Path.home())))
 
     def test_speech_takes_the_aplay_and_python_sentinels(self) -> None:
         s = speech.Speech(settings=self.settings)

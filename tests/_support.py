@@ -115,6 +115,18 @@ FORBIDDEN_GIT = "luna-tests-must-pass-git_bin=fake-runner"
 FORBIDDEN_GH = "luna-tests-must-pass-gh_bin=fake-runner"
 FORBIDDEN_CODEX_BIN = "luna-tests-must-pass-codex_bin=fake-runner"
 
+#: `luna update` reaches the machine twice, and both are worse than they look.
+#: ``SYSTEMCTL_BIN`` would restart the daemon the user is *talking to* out from
+#: under them, mid-sentence, with no window on screen to say why. And
+#: ``UPDATE_PYTHON`` is not a use of ``VENV_PYTHON``, on purpose: a test that
+#: reached a real interpreter here would run the entire suite again from
+#: inside a test, recursively, for as long as the machine held out. It has no
+#: fallback in `lunad/config.py` for exactly that reason, so a sentinel that
+#: does not exist makes `Updater.test_target` refuse rather than recurse.
+FORBIDDEN_SYSTEMCTL = "luna-tests-must-pass-systemctl=fake-runner"
+FORBIDDEN_UPDATE_PYTHON = Path("/nonexistent/luna-tests-must-pass-update-python")
+FORBIDDEN_UNIT = "luna-tests-must-pass-unit.service"
+
 config.GRIM_BIN = FORBIDDEN_GRIM
 config.NOTIFY_BIN = FORBIDDEN_NOTIFIER
 config.APLAY_BIN = FORBIDDEN_APLAY
@@ -127,6 +139,9 @@ config.GH_BIN = FORBIDDEN_GH
 #: a name handed to `shutil.which`. `CODEX_BIN_NAME` is that name.
 config.CODEX_BIN_CANDIDATES = ()
 config.CODEX_BIN_NAME = FORBIDDEN_CODEX_BIN
+config.SYSTEMCTL_BIN = FORBIDDEN_SYSTEMCTL
+config.UPDATE_PYTHON = FORBIDDEN_UPDATE_PYTHON
+config.LUNAD_UNIT = FORBIDDEN_UNIT
 
 #: The same class of bug, one step further out: not a binary but a *file the
 #: desktop is reading*. ``config.STATE_FILE`` is what the Luna bar widget
@@ -140,6 +155,18 @@ atexit.register(shutil.rmtree, _STATE_DIR, True)
 FORBIDDEN_STATE_FILE = _STATE_DIR / "state"
 
 config.STATE_FILE = FORBIDDEN_STATE_FILE
+
+#: And the socket beside it, which was missed for the same length of time and
+#: is the more dangerous of the two: ``config.SOCKET_PATH`` is the *live
+#: daemon's* listener. Nothing was stopping a case that reached for it from
+#: connecting to the daemon the user is talking to and asking it to do
+#: something -- and, more quietly, a case that only asked ``SOCKET_PATH
+#: .exists()`` got a different answer depending on whether lunad happened to
+#: be running on the machine, which is a test that passes at a desk and fails
+#: in CI. Redirected into the same temporary directory, where nothing listens.
+FORBIDDEN_SOCKET_PATH = _STATE_DIR / "luna.sock"
+
+config.SOCKET_PATH = FORBIDDEN_SOCKET_PATH
 
 #: The same idea for the jobs tree, with the one difference that matters: this
 #: sentinel has to *work*.

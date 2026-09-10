@@ -1540,6 +1540,151 @@ def _skills_text(found: list, notes: list[str], farm: object,
                                     + ", all of them readable and described"))
     return "\n".join(out)
 
+def _daemon_confirm(timeout: float):
+    """The *daemon's* confirmation broker, reached over the socket.
+
+    `luna update` does the git work in this process, but the question has to
+    be asked by the daemon: that is where the pending queue lives, and a toast
+    answered with `luna confirm yes` talks to the daemon rather than to
+    whichever terminal happened to start the update. A broker built here would
+    put up a question nobody could answer, and would time out into a "no" that
+    looked like a policy decision.
+    """
+    from lunad import confirm as confirm_mod  # noqa: PLC0415
+
+    fields = set(confirm_mod.Decision.__dataclass_fields__)
+
+    class DaemonConfirm:
+        def check(self, action: str, detail: str = "", *, why: str = "",
+                  actor: str = "user") -> "confirm_mod.Decision":
+            with Client(timeout=timeout) as client:
+                resp = client.call("confirm", action="ask",
+                                   **{"class": action}, detail=detail,
+                                   why=why, actor=actor)
+            if not resp.get("ok"):
+                # A gate that cannot be reached is a gate that says no.
+                return confirm_mod.Decision(
+                    action, confirm_mod.ASK, False, "denied", detail=detail,
+                    why=resp.get("message", "the daemon refused the question"))
+            return confirm_mod.Decision(
+                **{k: v for k, v in resp.items() if k in fields})
+
+    return DaemonConfirm()
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    """Bring the checkout up to date, or say what is in the way.
+
+    Exit codes carry the verdict the way `vcs` does: 0 for done or already up
+    to date, 3 for "refused" — a dirty tree, a diverged branch, a red suite, a
+    declined confirmation. A refusal is a decision, not a crash, and must not
+    exit 1 next to the ones that are.
+
+    `--check` is the whole read-only half: it fetches, reports, and stops. It
+    is also the only half that runs without the daemon, because the gate the
+    other half has to pass through lives in the daemon and there is
+    deliberately no way around it.
+    """
+    from lunad import update as update_mod  # noqa: PLC0415
+    from lunad import vcs as vcs_mod        # noqa: PLC0415
+
+    if args.check:
+        try:
+            survey = update_mod.Updater().survey()
+        except vcs_mod.VcsError as exc:
+            sys.stderr.write(f"luna: {S.alert('no checkout')}: {exc}\n")
+            return 1
+        if args.json:
+            print(json.dumps(survey.to_dict(), indent=2))
+            return 3 if survey.blocked else 0
+        print(_update_survey_text(survey, S))
+        return 3 if survey.blocked else 0
+
+    if not config.SOCKET_PATH.exists():
+        sys.stderr.write(
+            "luna: she is not running, and the confirmation gate an update "
+            "has to pass through lives in the daemon.\n"
+            "  start it     : systemctl --user start lunad\n"
+            "  look anyway  : luna update --check\n")
+        return 69
+
+    try:
+        updater = update_mod.Updater(
+            confirm=_daemon_confirm(float(args.timeout)))
+        outcome = updater.update(
+            why=args.why or "the user asked for an update",
+            actor="user", run_tests=not args.no_tests,
+            restart=not args.no_restart)
+    except vcs_mod.VcsError as exc:
+        sys.stderr.write(f"luna: {S.alert('no checkout')}: {exc}\n")
+        return 1
+
+    if args.json:
+        print(json.dumps(outcome.to_dict(), indent=2))
+        return 0 if outcome.ok else 3
+    for line in outcome.refusals:
+        sys.stderr.write(f"  {S.dim('·')} {line}\n")
+    print(_update_outcome_text(outcome, S))
+    return 0 if outcome.ok else 3
+
+
+def _update_survey_text(survey, style: render.Style) -> str:
+    rows = [["branch", style.bold(survey.branch or "(detached)")],
+            ["tracking", survey.upstream or style.dim("nothing")],
+            ["head", style.dim(survey.head or "?")]]
+    if survey.behind:
+        rows.append(["behind", f"{survey.behind} → {style.bold(survey.target)}"])
+    if survey.ahead:
+        rows.append(["ahead", f"{survey.ahead} unpushed"])
+    out = [style.bold(survey.root or "no checkout")]
+    out.extend("  " + line for line in render.columns(rows, style))
+    if survey.refusals:
+        out.append("")
+        for line in survey.refusals:
+            out.append("  " + style.alert("blocked"))
+            out.extend(render.wrapped(line, style, 4, first="    "))
+        return "\n".join(out)
+    if not survey.behind:
+        out.append("  " + style.dim("already up to date"))
+        return "\n".join(out)
+    out.append("")
+    out.append("  " + style.bold(f"{survey.behind} commit(s) waiting"))
+    for change in survey.changes[:20]:
+        out.append(f"    {style.dim(change.sha)}  "
+                   + render.fit(change.subject, 68, style))
+    if len(survey.changes) > 20:
+        out.append("    " + style.dim(f"... and {len(survey.changes) - 20} more"))
+    out.append("  " + style.dim("apply it with `luna update`"))
+    return "\n".join(out)
+
+
+def _update_outcome_text(outcome, style: render.Style) -> str:
+    survey = outcome.survey
+    if not outcome.updated:
+        if outcome.ok:
+            return style.dim("already up to date")
+        return style.alert("refused")
+    head = (f"updated {style.dim(outcome.from_sha)} → "
+            f"{style.bold(outcome.to_sha)}  "
+            + style.dim(f"{len(outcome.changes)} commit(s)"))
+    out = [head]
+    for change in outcome.changes[:20]:
+        out.append(f"  {style.dim(change.sha)}  "
+                   + render.fit(change.subject, 68, style))
+    if len(outcome.changes) > 20:
+        out.append("  " + style.dim(f"... and {len(outcome.changes) - 20} more"))
+    if outcome.tested:
+        out.append("  " + style.dim("suite green on the new commit"))
+    if outcome.restarted:
+        out.append("  " + (style.dim("restarted, and she answered")
+                           if outcome.ready
+                           else style.alert("restarted, but she did not come "
+                                            "back")))
+    for note in outcome.notes:
+        out.extend(render.wrapped(note, style, 2, first="  "))
+    return "\n".join(out)
+
+
 def cmd_cancel(args: argparse.Namespace) -> int:
     with Client(timeout=15) as client:
         resp = client.call("cancel", target=args.target, all=args.all)
@@ -2098,6 +2243,27 @@ def build_parser() -> argparse.ArgumentParser:
     skadd("doctor", help="validate every installed skill; exit 3 if any is "
                          "broken")
     sk.set_defaults(func=cmd_skills, skills_cmd="list", source=None, name=None)
+
+    up = add(
+        "update", help="bring her own checkout up to date",
+        description="Fetch and fast-forward this checkout, run the suite "
+                    "against the new commit before accepting it, then "
+                    "restart her and check she came back. Refuses on a dirty "
+                    "tree, a diverged branch or a red suite, and never "
+                    "stashes, resets or discards anything.")
+    up.add_argument("--check", action="store_true",
+                    help="say whether an update is available and stop")
+    up.add_argument("--why", default="",
+                    help="the reason, for the confirmation and the audit log")
+    up.add_argument("--no-tests", action="store_true",
+                    help="skip the suite. The one flag that makes this "
+                         "dangerous; it does not skip the confirmation.")
+    up.add_argument("--no-restart", action="store_true",
+                    help="update the files but leave the running daemon alone")
+    up.add_argument("--timeout", type=float, default=300.0,
+                    help="how long to hold the socket open while the "
+                         "confirmation is on screen")
+    up.set_defaults(func=cmd_update)
 
     cn = add("cancel", help="cancel an in-flight request")
     cn.add_argument("target", nargs="?", default=None)
