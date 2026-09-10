@@ -316,6 +316,62 @@ CODEX_BIN_CANDIDATES = (
 )
 CODEX_BIN_NAME = "codex"
 
+# --- Skills (codex's own progressive disclosure, not ours) ----------------
+#
+# codex 0.151.0 ships `skill_search` as a stable feature and discovers skills
+# on the host by itself: it reads every `SKILL.md` under `~/.codex/skills/`,
+# keeps only the YAML frontmatter in the prompt, and pulls the body in when a
+# skill is actually invoked. lunad therefore has no loader, no router and no
+# prompt injection for skills, and must not grow one — the whole of Luna's
+# side of this is deciding *which directories are in that farm*, which is a
+# question about symlinks.
+#
+# `SKILLS_DIR` is the repo's own skills, the ones this project ships and
+# version-controls. `CODEX_SKILLS_DIR` is the farm codex actually reads, and
+# nothing in it is copied: every entry is a symlink back to a directory that
+# is owned by somebody — this repo, the Omarchy package, or a clone under
+# `SKILLS_STORE_DIR`. That is deliberate. A copy goes stale silently; a
+# symlink either resolves or breaks loudly, and a broken one is a skill Luna
+# cannot use and will not be told about, which is why `luna skills doctor`
+# exists.
+#
+# `SKILLS_STORE_DIR` is where a `luna skills add <git-url>` clone lands. It is
+# under the user's own state directory rather than in the farm because a
+# clone is a *working tree* — it has a `.git`, it can be pulled, and it can
+# hold more than one skill. `~/.codex/skills/` holds nothing but links.
+#
+# `CODEX_SKILLS_DIR` is disarmed by `tests/_support.py` for the same reason
+# `JOBS_DIR` is: the farm is a directory this code creates links in and
+# removes links from, and a test that forgot to redirect it would edit the
+# live set of skills Luna reasons with.
+SKILLS_DIR = PROJECT_DIR / "skills"                # shipped, version-controlled
+CODEX_SKILLS_DIR = CODEX_HOME / "skills"           # the farm codex reads
+SKILLS_STORE_DIR = STATE_DIR / "skills"            # clones, user-owned
+
+#: The other root, found the hard way. codex 0.151.0 also advertises
+#: `~/.agents/skills/` — the cross-agent convention, shared with the Omarchy
+#: skills and whatever else on this machine writes there — and a live turn
+#: was seen reaching for it *first*. Nothing here installs into it or removes
+#: from it; that tree is not Luna's. But a dangling link in it is the same
+#: invisible failure as a dangling link in the farm proper, so `doctor` walks
+#: it and says so. Reporting a root you do not manage is better than a doctor
+#: that passes while an agent silently cannot read half its skills.
+SKILLS_EXTRA_ROOTS = (HOME / ".agents" / "skills",)
+
+#: codex's own skills live here and are not ours to manage.
+SKILLS_SYSTEM_DIR = ".system"
+
+#: Shorter than this and the description cannot carry a trigger word, let
+#: alone several. The description is the *entire* retrieval surface — the body
+#: is not in the prompt until the skill fires — so a one-line summary is not a
+#: stylistic problem, it is a skill that never gets chosen.
+SKILL_MIN_DESCRIPTION = 60
+
+#: Past roughly this many skills, retrieval accuracy falls off well before
+#: token cost does: the descriptions start competing with each other. A farm
+#: over the line is a `doctor` warning, not an error.
+SKILL_FARM_SOFT_LIMIT = 60
+
 # --- Dispatch (ARCHITECTURE.md section 6) ---------------------------------
 #
 # Luna's own special workspace. `scratchpad` is already bound to SUPER+S and

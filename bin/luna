@@ -1399,6 +1399,147 @@ def cmd_log(args: argparse.Namespace) -> int:
     return 0
 
 
+
+# =========================================================================
+# skills — the one subcommand that does not talk to the daemon
+# =========================================================================
+
+
+def cmd_skills(args: argparse.Namespace) -> int:
+    """`luna skills` — what codex can see, and how it got there.
+
+    Every other subcommand in this file is a socket call, because every other
+    subcommand needs something only the daemon has: memory, a session, the
+    confirmation broker, a spawn ledger. This one needs none of it. A skill is
+    a directory with a `SKILL.md` in it and a symlink under `~/.codex/skills/`;
+    codex reads that farm itself, at the start of every turn it runs, and lunad
+    is not in the path at all. Routing this through the socket would mean the
+    farm could only be repaired while the daemon was healthy — which is
+    precisely when it is least likely to be.
+
+    So the work happens here, in `lunad.skills`, in this process. The rule it
+    breaks ("everything happens in the daemon") is about *state*, and the farm
+    is not the daemon's state: it is codex's input.
+
+    Exit codes carry the verdict the way `luna vcs` does: 0 for fine, 3 for
+    "there is something wrong with the farm" — a dangling link, a description
+    too short to be found. 3 rather than 1 because a broken skill is a finding
+    to act on, not a program that failed.
+    """
+    from lunad import skills as skills_mod
+
+    farm = skills_mod.SkillFarm()
+    action = args.skills_cmd
+
+    try:
+        if action == "add":
+            skill = farm.add(args.source, name=args.name)
+            if args.json:
+                print(json.dumps(_skill_json(skill), indent=2))
+                return 0
+            print(f"installed {S.bold(skill.name)}")
+            print(f"  {S.dim(str(skill.link) + '  →  ' + str(skill.target))}")
+            print(f"  {render.fit(skill.summary, max(S.width - 2, 40), S)}")
+            return 0
+
+        if action == "remove":
+            skill = farm.remove(args.name)
+            if args.json:
+                print(json.dumps(_skill_json(skill), indent=2))
+                return 0
+            print(f"unlinked {S.bold(skill.name)}")
+            print(f"  {S.dim('the directory it pointed at is untouched: ' + str(skill.target))}")
+            return 0
+
+        if action == "doctor":
+            found, notes = farm.doctor()
+        else:
+            found, notes = farm.list(), []
+    except skills_mod.SkillError as exc:
+        sys.stderr.write(f"luna: {S.alert('refused')}: {exc}\n")
+        return 3
+
+    if args.json:
+        print(json.dumps({"root": str(farm.root),
+                          "skills": [_skill_json(s) for s in found],
+                          "notes": notes}, indent=2))
+        return 0 if all(s.ok for s in found) and not notes else 3
+
+    print(_skills_text(found, notes, farm, doctor=(action == "doctor"), style=S))
+    broken = [s for s in found if s.problems]
+    if action == "doctor":
+        return 3 if (broken or notes) else 0
+    # `list` is not a verdict, but a link that does not resolve is not a row
+    # to skim past either: codex says nothing at all about a skill it could
+    # not read, so this is the only place the loss is visible.
+    if any(not s.resolves for s in found):
+        sys.stdout.flush()          # or the warning overtakes the table
+        sys.stderr.write(
+            f"luna: {S.alert('some skills do not resolve')} — she cannot use "
+            f"them and codex will not say so. `luna skills doctor`\n")
+        return 3
+    return 0
+
+
+def _skill_json(skill: object) -> dict:
+    s = skill  # a lunad.skills.Skill; kept loose so this file imports nothing
+    return {"name": s.name, "source": s.source, "link": str(s.link),
+            "target": str(s.target), "symlink": s.is_link,
+            "resolves": s.resolves, "declared_name": s.declared_name,
+            "description": s.description, "problems": list(s.problems),
+            "removable": s.removable}
+
+
+def _skills_text(found: list, notes: list[str], farm: object,
+                 doctor: bool, style: render.Style) -> str:
+    """The farm as one aligned table, description last because it is longest.
+
+    The description column is the whole reason to look at this list: it is
+    what codex matches against, so seeing it truncated at the terminal's width
+    is seeing roughly what the model had to go on.
+    """
+    if not found:
+        return (style.alert("no skills installed") + "\n"
+                + style.dim(f"  the farm is {farm.root}; "
+                            f"`luna skills add <path>` puts one in it"))
+
+    rows = []
+    for s in found:
+        if not s.resolves:
+            mark = style.alert("broken")
+        elif s.problems:
+            mark = style.alert("check")
+        else:
+            mark = style.dim("ok")
+        rows.append([style.bold(s.name), style.dim(s.source), mark,
+                     s.summary or style.alert("(no description)")])
+    # Give the description whatever the other three columns leave.
+    fixed = max(len(s.name) for s in found) + max(
+        len(s.source) for s in found) + 12
+    width = max(style.width - fixed - 2, 24)
+    for row, s in zip(rows, found):
+        row[3] = render.fit(row[3], width, style)
+
+    out = [style.bold(str(farm.root))]
+    out.extend("  " + line for line in render.columns(rows, style, gap=2,
+                                                      align="llll"))
+
+    problems = [s for s in found if s.problems]
+    if problems:
+        out.append("")
+        for s in problems:
+            out.append(f"  {style.alert('·')} {style.bold(s.name)}")
+            for line in s.problems:
+                out.extend(render.wrapped(line, style, indent=6))
+    for note in notes:
+        out.append("")
+        out.extend(render.wrapped(note, style, indent=2, first="  ! "))
+    if doctor and not problems and not notes:
+        out.append("")
+        out.append("  " + style.dim(render.count(len(found), "skill", "skills")
+                                    + ", all of them readable and described"))
+    return "\n".join(out)
+
 def cmd_cancel(args: argparse.Namespace) -> int:
     with Client(timeout=15) as client:
         resp = client.call("cancel", target=args.target, all=args.all)
@@ -1924,6 +2065,39 @@ def build_parser() -> argparse.ArgumentParser:
     vsh.add_argument("--no-merge", action="store_true",
                      help="open the pull request and stop")
     vc.set_defaults(func=cmd_vcs, vcs_cmd="status")
+
+    sk = add(
+        "skills", help="the skills codex can see: list, add, remove, doctor",
+        description="A skill is a directory with a SKILL.md in it, linked "
+                    "into ~/.codex/skills/. codex discovers them itself and "
+                    "loads the body only when one fires, so the description "
+                    "line is the whole of what gets a skill chosen.")
+    sksub = sk.add_subparsers(dest="skills_cmd", required=False)
+
+    def skadd(name: str, **kw: object) -> argparse.ArgumentParser:
+        return sksub.add_parser(name, parents=[common], **kw)  # type: ignore[arg-type]
+
+    skadd("list", help="every skill, its source, and whether it resolves")
+    ska = skadd(
+        "add", help="install a skill by linking it into the farm",
+        description="Validated before anything is linked: SKILL.md present, "
+                    "frontmatter parses, name and description non-empty, no "
+                    "collision. A git URL is cloned into "
+                    "~/.local/share/luna/skills first and linked from there; "
+                    "nothing is ever cloned into the farm itself.")
+    ska.add_argument("source", help="a directory, or a git URL")
+    ska.add_argument("--name", default=None,
+                     help="install under this name instead of the "
+                          "frontmatter's")
+    skr = skadd(
+        "remove", help="unlink a skill (never deletes a directory)",
+        description="Only ever removes a symlink. A real directory, "
+                    "codex's own .system/, and anything under /usr/share are "
+                    "all refused.")
+    skr.add_argument("name")
+    skadd("doctor", help="validate every installed skill; exit 3 if any is "
+                         "broken")
+    sk.set_defaults(func=cmd_skills, skills_cmd="list", source=None, name=None)
 
     cn = add("cancel", help="cancel an in-flight request")
     cn.add_argument("target", nargs="?", default=None)
