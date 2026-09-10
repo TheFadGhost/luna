@@ -51,6 +51,27 @@ class Real(Field):
 
 
 @dataclass(frozen=True)
+class Slider(Real):
+    """A Real whose whole range is worth seeing at once.
+
+    A multiplier is the textbook case. "Speed 1.00" in a spin button tells
+    you the number and nothing else: not that 1.0 is the middle of anything,
+    not how far it can go, not that it is a multiplier at all — the `unit`
+    was declared on these fields and then silently dropped, because
+    `Binder.bound_row` never rendered a unit for a `Real`. A track shows the
+    range, a tick shows the default, and the read-back carries the unit, so
+    the row says ×2.00 of a possible ×0.50–×3.00 instead of "2.00".
+
+    It is a separate kind rather than a heuristic on `Real` because "is this
+    range worth drawing" is a judgement about the setting, and a judgement
+    belongs next to the setting rather than in a rule that infers it. The two
+    that qualify are the two multipliers. `[confirm] spend_threshold` does
+    not: its range is 0–100 dollars and its default is 0.25, so a track would
+    put every value anyone actually wants inside the first pixel.
+    """
+
+
+@dataclass(frozen=True)
 class Choice(Field):
     default: str = ""
     options: tuple[str, ...] = ()
@@ -143,8 +164,15 @@ SPEC: tuple[Section, ...] = (
             VoicePick("voice", "Primary voice",
                       "The default voice (flux-alexis-en, female).",
                       default="flux-alexis-en"),
+            # Nothing reads this. `speech._voice_settings` builds its config
+            # from `voice`, never from here, and no code copies one into the
+            # other — `docs/CONFIG-SCHEMA.md` used to claim it did. So the doc
+            # says what it is: a remembered second choice with a preview
+            # button, which changes nothing until it is copied across by hand.
             VoicePick("voice_male", "Alternate voice",
-                      "The selectable alternate (flux-donovan-en, male).",
+                      "A remembered second choice (flux-donovan-en, male). "
+                      "Nothing reads it — she speaks with the primary voice "
+                      "above until you set this one as the primary.",
                       default="flux-donovan-en"),
             Choice("fallback", "On provider failure",
                    "Used when the network or the provider fails.",
@@ -152,12 +180,16 @@ SPEC: tuple[Section, ...] = (
             Text("piper_voice", "Piper voice",
                  "Local ONNX voice used by the piper fallback.",
                  default="en_GB-jenny_dioco-medium", allow_empty=False),
-            Real("speed", "Speed", default=1.0, min=0.5, max=2.0, step=0.05,
-                 digits=2, unit="x"),
+            Slider("speed", "Speed",
+                   "A multiplier on how fast she talks. piper is given "
+                   "1/speed as its length scale; OpenRouter is sent the "
+                   "number, but only when it is not 1.0.",
+                   default=1.0, min=0.25, max=4.0, step=0.05, digits=2,
+                   unit="x"),
             Number("max_spoken_chars", "Max spoken characters",
                    "Longer replies are summarised for speech; the full text "
                    "still goes to screen.",
-                   default=400, min=40, max=4000, step=20, unit="chars"),
+                   default=400, min=40, max=20000, step=20, unit="chars"),
         ),
     ),
     Section(
@@ -217,11 +249,17 @@ SPEC: tuple[Section, ...] = (
             Tri("long_job", "Long-running jobs",
                 "Anything estimated over the threshold below."),
             Number("long_job_seconds", "Long job threshold",
-                   default=300, min=10, max=7200, step=10, unit="s"),
+                   default=300, min=1, max=86400, step=10, unit="s"),
             Tri("spend", "Metered spend",
                 "Anything with a metered cost over the threshold below."),
-            Real("spend_threshold", "Spend threshold", default=0.25, min=0.0,
-                 max=100.0, step=0.05, digits=2, unit="$"),
+            # Not a Slider: the range is 0-100 and the default is 0.25, so a
+            # track would put every value anyone wants inside the first pixel.
+            # The unit is spelled rather than "$", because it is rendered
+            # after the number and "0.25 $" is not how anyone writes money.
+            Real("spend_threshold", "Spend threshold",
+                 "Above this, a metered cost is confirmed first.",
+                 default=0.25, min=0.0, max=10000.0, step=0.05, digits=2,
+                 unit="USD"),
         ),
     ),
     Section(
@@ -229,7 +267,7 @@ SPEC: tuple[Section, ...] = (
         fields=(
             Number("timeout_seconds", "Answer timeout",
                    "No answer within this is treated as the default below.",
-                   default=60, min=5, max=600, step=5, unit="s"),
+                   default=60, min=1, max=3600, step=5, unit="s"),
             Choice("default_on_timeout", "On timeout, assume",
                    default="no", options=("no", "yes")),
             Choice("channel", "Ask via", default="notification",
@@ -242,18 +280,19 @@ SPEC: tuple[Section, ...] = (
             Number("luna_cap_chars", "Assistant memory cap",
                    "LUNA.md. A write past the cap is rejected, not truncated "
                    "— overflow forces consolidation.",
-                   default=3000, min=500, max=20000, step=100, unit="chars"),
+                   default=3000, min=200, max=100000, step=100, unit="chars"),
             Number("user_cap_chars", "User memory cap",
                    "USER.md, the user model.",
-                   default=2000, min=500, max=20000, step=100, unit="chars"),
+                   default=2000, min=200, max=100000, step=100, unit="chars"),
             Number("consolidate_every_turns", "Consolidate every",
-                   "Turns between background consolidation passes. Each one "
-                   "is a model call on your account — set it to 0 to turn "
-                   "them off entirely.",
-                   default=12, min=0, max=200, step=1, unit="turns"),
+                   "Turns between background consolidation passes, with a "
+                   "floor of five minutes between them whatever this number "
+                   "is. Each pass is a model call on your account — set it "
+                   "to 0 to turn them off entirely.",
+                   default=12, min=0, max=1000, step=1, unit="turns"),
             Number("decay_half_life_days", "Salience half-life",
                    "Trivia ages out on its own. Corrections never decay.",
-                   default=30, min=1, max=365, step=1, unit="days"),
+                   default=30, min=1, max=3650, step=1, unit="days"),
             Toggle("semantic_recall", "Match meaning, not just words",
                    "Off, recall is keyword-only, so \u201chow much charge is "
                    "left\u201d finds nothing about the battery. On, it also "
@@ -276,11 +315,11 @@ SPEC: tuple[Section, ...] = (
                    "Anything over the limit waits in the queue with a job id "
                    "of its own. Lowering this never stops a job already "
                    "running.",
-                   default=1, min=1, max=8, step=1),
+                   default=1, min=1, max=16, step=1),
             Number("job_retention_days", "Keep job directories for",
                    "0 keeps them forever. Running and queued jobs are never "
                    "collected, whatever their age.",
-                   default=14, min=0, max=365, step=1, unit="days"),
+                   default=14, min=0, max=3650, step=1, unit="days"),
             Toggle("requeue_on_start", "Resume queued jobs after a restart",
                    "On, a job still waiting in the queue when lunad stops "
                    "is put back in the same place when it starts again, "
@@ -345,7 +384,7 @@ SPEC: tuple[Section, ...] = (
                    "refused, not ignored. An unattended merge that gave up "
                    "waiting and went ahead anyway is exactly what this "
                    "exists to prevent.",
-                   default=900, min=0, max=7200, step=30, unit="s"),
+                   default=900, min=0, max=21600, step=30, unit="s"),
         ),
     ),
     Section(
@@ -357,11 +396,12 @@ SPEC: tuple[Section, ...] = (
                    "Off, the thread still ticks and every hook is skipped, so "
                    "switching it back on needs no restart.",
                    default=True),
-            # The daemon clamps this to a 5 s floor; the schema states the same
-            # floor so the GUI refuses out of range rather than writing a value
-            # that would be silently raised. There is no ceiling in the daemon
-            # — an hour is this app's, and it is a very long time between
-            # three stat()s.
+            # Both bounds are the daemon's, checked by
+            # `tests/test_daemon_contract.py`. The comment that used to sit
+            # here said "there is no ceiling in the daemon — an hour is this
+            # app's"; there is one, and it is the same hour. The numbers
+            # happened to agree and the stated reason did not, which is the
+            # more dangerous of the two states to leave a comment in.
             Number("poll_seconds", "Tick every",
                    "One tick is three stat()s and a 12-byte read. A floor, "
                    "not an override: raising it slows every hook, lowering it "
@@ -380,14 +420,17 @@ SPEC: tuple[Section, ...] = (
                    "Off by default — Omarchy already warns at 10%. Turn it on "
                    "for a warning earlier than the desktop's.",
                    default=False),
-            # 0 would mean never and 100 would mean always, so neither is a
-            # threshold; the range is the open interval between them.
-            Number("battery_low_pct", "Warn at", default=20, min=1, max=99,
+            # 1-100, because that is what the daemon accepts. It used to be
+            # 1-99 on the argument that "100 would mean always, so it is not a
+            # threshold" — which is a reasonable opinion and was not the
+            # daemon's, so a config file saying 100 was legal, worked, and was
+            # rewritten to 20 the next time this app saved.
+            Number("battery_low_pct", "Warn at", default=20, min=1, max=100,
                    step=1, unit="%"),
             Number("battery_critical_pct", "Warn again at",
                    "Clamped to the warning above if you set it higher — a "
                    "critical above the low would make the low unreachable.",
-                   default=5, min=1, max=99, step=1, unit="%"),
+                   default=5, min=1, max=100, step=1, unit="%"),
             Toggle("update", "An Omarchy update landed",
                    "The version file's contents and its mtime, plus "
                    "/tmp/omarchy-update.log. Not whether one is available.",
@@ -410,15 +453,18 @@ SPEC: tuple[Section, ...] = (
                    default="bottom-right",
                    options=("top-left", "top-right", "bottom-left",
                             "bottom-right")),
-            # A Real, and a spin button, exactly like [voice] speed — the
-            # other multiplier in this app. There is no slider widget in
-            # jarvis/widgets.py and inventing one for a single row would be a
-            # second control kind to keep themed for no gain.
+            # A Slider, like [voice] speed — the other multiplier in this
+            # app, and the reason the kind exists rather than a one-off. The
+            # note that used to sit here said a slider was "a second control
+            # kind to keep themed for no gain"; the gain is that the unit
+            # these two fields declare is now actually drawn. It was being
+            # dropped, so `Size 1.00` never said ×.
             #
             # 0.5–3.0 matches the daemon's clamp, so the GUI refuses out of
             # range rather than writing a value that is silently pulled back.
-            Real("scale", "Size", "A multiplier on the sprite's base size.",
-                 default=1.0, min=0.5, max=3.0, step=0.1, digits=2, unit="x"),
+            Slider("scale", "Size", "A multiplier on the sprite's base size.",
+                   default=1.0, min=0.5, max=3.0, step=0.1, digits=2,
+                   unit="x"),
             Toggle("idle_visible", "Keep it on screen while she is idle",
                    "Off, it appears when she starts listening, thinking or "
                    "speaking, and fades out after. The bar icon is the "
@@ -436,9 +482,18 @@ SPEC: tuple[Section, ...] = (
     Section(
         key="ui", title="Interface", pane="about",
         fields=(
+            # One group, two different processes, and nothing on screen said
+            # so: the first is this window's own palette and the second is a
+            # desktop toast the daemon sends. Both now say whose they are.
             Toggle("theme_follows_omarchy", "Follow the Omarchy theme",
+                   "This window's own colours. On, they are re-read from the "
+                   "current theme and follow `omarchy theme set`; off, the "
+                   "built-in monochrome palette is pinned. The spacing and "
+                   "rounding never change — they mirror Hyprland's.",
                    default=True),
             Toggle("notify_on_finish", "Notify when a job finishes",
+                   "A desktop notification from lunad, not from this window, "
+                   "when a dispatched job ends.",
                    default=True),
         ),
     ),

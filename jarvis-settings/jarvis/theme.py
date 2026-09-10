@@ -67,6 +67,7 @@ COLUMN = {
     "value": 33,        # chars — a read-back value inside the control column
     "face": 28,         # chars — a dropdown's closed face, before the arrow
     "state": 16,        # chars — the trailing note, at caption size
+    "readback": 6,      # chars — a slider's number and its unit, right-aligned
     "lede": 72,         # chars — pane description measure (prose, 65–75ch)
     "note": 74,         # chars — full-width explanatory paragraphs
 }
@@ -349,11 +350,30 @@ def css_for(c: dict) -> str:
                        min-width: 16px; min-height: 16px; }}
     switch:disabled > slider {{ background: alpha({fg}, {d['faint']}); }}
 
+    /* The track was styled here before there was anything to style: the
+       rules predate `schema.Slider` by some months. What is new is the mark
+       and the disabled state -- a tick at the default value, and a track
+       that reads as inert rather than merely paler when its section is off.
+       `marks indicator` is qualified the way the levelbar rules are, so the
+       stock theme's own mark colour does not win on specificity. */
     scale trough {{ background: alpha({fg}, 0.12);
                     border-radius: {RADIUS}px; min-height: 4px; }}
     scale highlight {{ background: {accent}; border-radius: {RADIUS}px; }}
+    /* `margin: 0` is load-bearing, and was the bug this rule shipped with
+       for months while nothing used it. The stock theme gives the handle a
+       negative margin so it can overhang a taller trough; against a
+       `min-width` of 12 that computes to -4, and GTK spends the run warning
+       "sizes must be >= 0" on every allocation. Overriding the size without
+       overriding the margin is what makes it negative. */
     scale slider {{ background: {fg}; border-radius: {RADIUS}px;
-                    min-width: 12px; min-height: 12px; }}
+                    min-width: 12px; min-height: 12px; margin: 0; }}
+    scale marks {{ color: transparent; }}
+    scale marks indicator {{ background: alpha({fg}, {d['faint']});
+                             min-width: 1px; min-height: 3px; }}
+    scale:disabled trough {{ background: alpha({fg}, {d['hairline']}); }}
+    scale:disabled highlight {{ background: alpha({fg}, {d['faint']}); }}
+    scale:disabled slider {{ background: alpha({fg}, {d['faint']}); }}
+    scale:disabled marks indicator {{ background: alpha({fg}, {d['wash']}); }}
 
     /* ---- Ui/Button analogue ---- */
     .act {{

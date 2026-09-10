@@ -54,3 +54,26 @@ voxtype.CONFIG_PATH = FORBIDDEN_CONFIG
 voxtype.RESTART_COMMAND = FORBIDDEN_RESTART
 voxtype.STATE_PATH = FORBIDDEN_STATE
 voxtype.PID_PATH = FORBIDDEN_PID
+
+
+# --------------------------------------------------------------------------
+# And the app's *own* config file, which was never guarded at all.
+#
+# The reasoning above — "Jarvis had nothing to reach with; it read the user's
+# files and wrote its own" — quietly assumed no test would ever build an
+# `Editor`. Nothing did, because nothing built a pane. A pane test does: an
+# `Editor` reads `jarvis.config.CONFIG_PATH` on construction and `Editor.set`
+# writes it back through a GLib timeout, so a case that flips a switch to
+# check that the row below it dims would rewrite `~/.config/jarvis/config.toml`
+# — the user's live settings, read by the running daemon within two seconds.
+#
+# This one has to *work* rather than merely fail, since the app creates and
+# rewrites it, so it is a real file in a throwaway tree, seeded with the
+# defaults. `tests/test_panes.py::GuardTest` asserts it is never the real one.
+from jarvis import config as _config  # noqa: E402
+
+FORBIDDEN_JARVIS_CONFIG = _DIR / "config" / "config.toml"
+
+_config.CONFIG_DIR = FORBIDDEN_JARVIS_CONFIG.parent
+_config.CONFIG_PATH = FORBIDDEN_JARVIS_CONFIG
+_config.write_default(FORBIDDEN_JARVIS_CONFIG)

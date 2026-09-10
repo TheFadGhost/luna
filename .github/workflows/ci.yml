@@ -83,9 +83,16 @@ jobs:
 # headers or abandoning the version matrix and using the runner's system
 # python. Both are slow and both break whenever the runner image moves.
 #
-# The suite itself is fine: it runs fully headless, with no display, no D-Bus
-# and no session, and passes locally in well under a second. The obstacle is
-# purely getting `gi` importable reliably on a runner.
+# The suite itself still runs with no display, no D-Bus and no session, and
+# passes locally in well under a second. What it does not do any more is
+# *cover* everything without one: the pane-construction cases in
+# `tests/test_panes.py` build real GTK widgets, and GTK4 segfaults on the
+# first widget when there is no display attached — `Gtk.init_check()` returns
+# True anyway, so the check that looks like a guard is not one. Those cases
+# skip when `Gdk.Display.get_default()` is None, so a headless run is green
+# with roughly thirty skips rather than red. The obstacle to running any of
+# this here is still, separately, getting `gi` importable reliably on a
+# runner.
 #
 # A red or flaky badge on a public repository is worse than an honest gap, so
 # for now the jarvis-settings suite is a local requirement instead: see

@@ -63,9 +63,17 @@ cd jarvis-settings && python3 -m unittest discover -s tests -t .
 ```
 
 Both must be green before a PR is merged. The `jarvis-settings` suite runs
-fully headless — it needs no display, no D-Bus and no session — but it does
-need `gi` importable, so run it with the interpreter that can see your system
-GTK packages.
+with no D-Bus and no session, and needs `gi` importable, so run it with the
+interpreter that can see your system GTK packages.
+
+It also wants a **display**, and says so rather than pretending otherwise.
+The pane-construction cases in `tests/test_panes.py` build real GTK widgets,
+and GTK4 segfaults on the first widget constructed when nothing is attached —
+`Gtk.init_check()` returns `True` regardless, so the call that looks like the
+guard is not one. Those cases skip when `Gdk.Display.get_default()` is `None`,
+so a headless run is green with about thirty skips. **Run it from a desktop
+session**, or the panes are not being tested at all — report the skip count
+alongside the total if there was one.
 
 ## The outward-binary guard — do not weaken it
 

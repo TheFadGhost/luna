@@ -64,6 +64,16 @@ class Binder:
             return label(f"unknown setting {dotted}", css=("rowdoc",))
         _sec, fld = found
         value = self.editor.get(dotted)
+        # Tagged the way `app.py` tags a sidebar row and `widgets.row` tags
+        # its trailing column: a plain Python attribute on the widget. It
+        # costs nothing at runtime and it is the difference between a test
+        # that can say "turning `voice.enabled` off dims `voice.provider`"
+        # and one that can only say "the pane was built".
+        ctl = self._control_for(dotted, fld, value, width)
+        ctl.jarvis_key = dotted
+        return ctl
+
+    def _control_for(self, dotted, fld, value, width):
         if isinstance(fld, schema.Toggle):
             return self._switch(dotted, value)
         if isinstance(fld, schema.Tri):
@@ -79,6 +89,10 @@ class Binder:
         if isinstance(fld, schema.Number):
             return self._spin(dotted, fld.min, fld.max, fld.step, 0, value,
                               width)
+        if isinstance(fld, schema.Slider):
+            # Before Real: a Slider *is* a Real, so the narrower kind has to
+            # be asked about first or it never gets a chance to answer.
+            return self._slider(dotted, fld, value, width)
         if isinstance(fld, schema.Real):
             return self._spin(dotted, fld.min, fld.max, fld.step, fld.digits,
                               value, width)
@@ -105,14 +119,20 @@ class Binder:
             ctl = self.control_for(dotted, width)
         unit = getattr(fld, "unit", "")
         parts = [ctl]
-        if unit and not isinstance(fld, schema.Real):
+        # A Slider draws its own unit inside the read-back, so a second copy
+        # beside the track would be saying it twice. Every other kind gets
+        # the unit here -- including a plain Real, which used to be excluded
+        # and so declared a unit that was never drawn anywhere at all.
+        if unit and not isinstance(fld, schema.Slider):
             parts.append(label(unit, css=("rowdoc",)))
         if trail is None and extra:
             trail = extra[0] if len(extra) == 1 else rowbox(SPACE["md"])
             if len(extra) > 1:
                 for e in extra:
                     trail.append(e)
-        return row(fld.label, fld.doc, *parts, trail=trail)
+        box = row(fld.label, fld.doc, *parts, trail=trail)
+        box.jarvis_key = dotted
+        return box
 
     def refresh(self, keys=None):
         for dotted, fn in self._refresh.items():
@@ -203,6 +223,76 @@ class Binder:
 
         self._refresh[dotted] = put
         return sb
+
+    def _slider(self, dotted, fld, value, width):
+        """A track, a tick at the default, and the number with its unit.
+
+        The track is the point: a multiplier's range is part of its meaning,
+        and a spin button shows one number with no sense of where it sits.
+        The tick marks the default, so "back to normal" is a place on the
+        track rather than a number to remember.
+
+        `Gtk.Scale` is continuous, so the value is snapped to the field's own
+        step before it is written -- otherwise dragging writes 1.0500000002
+        into a TOML file a person has to read.
+
+        No closure here captures the control it is attached to: the handler
+        takes the widget from the signal, exactly as `_spin` does. The
+        read-back label is a *sibling*, and is captured on purpose.
+        """
+        lo, hi, step, digits = (float(fld.min), float(fld.max),
+                                float(fld.step), fld.digits)
+        scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, lo, hi,
+                                         step)
+        scale.set_draw_value(False)          # drawn as real type, beside it
+        scale.set_round_digits(digits)
+        # The *box* owns the column width; the track takes whatever is left
+        # once the read-back has its measure. Sizing the track directly meant
+        # a row asking for the narrow column got a 68px track, which is a
+        # decoration rather than a control.
+        scale.set_hexpand(True)
+        scale.set_value(float(value if value is not None else fld.default))
+        scale.add_mark(float(fld.default), Gtk.PositionType.BOTTOM, None)
+
+        read = label("", css=("value",))
+        read.set_width_chars(COLUMN["readback"])
+        read.set_xalign(1.0)
+
+        def shown(v):
+            return f"{v:.{digits}f}{fld.unit}"
+
+        read.set_text(shown(scale.get_value()))
+
+        box = rowbox(SPACE["lg"])
+        box.append(scale)
+        box.append(read)
+        box.add_css_class("slider")
+        box.set_size_request(max(width, COLUMN["control"]), -1)
+        box.set_hexpand(False)
+        box.set_halign(Gtk.Align.START)
+
+        guard = {"muted": False}
+
+        def snap(v):
+            return round(round(v / step) * step, digits)
+
+        def changed(w):
+            v = snap(w.get_value())
+            read.set_text(shown(v))
+            if not guard["muted"]:
+                self.editor.set(dotted, v)
+
+        scale.connect("value-changed", changed)
+
+        def put(v):
+            guard["muted"] = True
+            fresh = snap(float(v if v is not None else fld.default))
+            scale.set_value(fresh)
+            read.set_text(shown(fresh))
+            guard["muted"] = False
+
+        self._refresh[dotted] = put
+        return box
 
     def _entry(self, dotted, fld, value, width):
         e = Gtk.Entry()
@@ -489,7 +579,7 @@ def voice_pane(b, player, on_status):
                      "Speaks one sentence through lunad's say op.", live)]
     deliver_rows = [b.bound_row("voice.fallback"),
                     b.bound_row("voice.piper_voice"),
-                    b.bound_row("voice.speed", width=COLUMN["narrow"]),
+                    b.bound_row("voice.speed"),
                     b.bound_row("voice.max_spoken_chars",
                                 width=COLUMN["narrow"])]
     # The rows go inert, not the groups: a dimmed section heading would say
@@ -1004,7 +1094,9 @@ def hud_pane(b):
 
     r_enabled = b.bound_row("hud.enabled", ctl=enabled_ctl, trail=n_enabled)
     r_corner = b.bound_row("hud.corner")
-    r_scale = b.bound_row("hud.scale", width=COLUMN["narrow"])
+    # Not COLUMN["narrow"] any more: that was sized for the spin button this
+    # row used to be. A track needs its length -- the length *is* the range.
+    r_scale = b.bound_row("hud.scale")
     r_idle = b.bound_row("hud.idle_visible", ctl=idle_ctl, trail=n_idle)
     r_caption = b.bound_row("hud.caption", ctl=caption_ctl, trail=n_caption)
     r_sprite = b.bound_row("hud.sprite")

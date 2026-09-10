@@ -171,7 +171,7 @@ restart, which is a different daemon and a different promise; they are the
 | `provider` | `speech` | Live, per utterance. |
 | `model` | `speech` (OpenRouter) | Live, per sentence request. |
 | `voice` | `speech` (OpenRouter) | Live, per sentence request. |
-| `voice_male` | **the GUI only** | The alternate offered in the Voice pane, with its own preview button. It is a stored *choice*, not a second live voice: picking it copies it into `voice`, which is what the daemon reads. Nothing is broken here — but do not expect changing `voice_male` alone to change how she sounds. |
+| `voice_male` | **nobody** | The alternate offered in the Voice pane, with its own preview button. `speech._voice_settings` builds its configuration from `voice` and never looks here, and — contrary to what this row used to say — **nothing copies this key into `voice`**. It is a remembered second choice and a sample you can play; making her use it means setting it as `voice`. |
 | `fallback` | `speech._play` | Live. `piper` finishes an utterance the provider dropped, mid-sentence-run; `none` raises instead. |
 | `piper_voice` | `speech` | Live. Names the ONNX under `~/.local/share/luna/voices/`. A worker already holding a different model is **unloaded and reloaded** — one worker is one model and cannot be re-pointed. |
 | `speed` | `speech`, `piper_worker` | Live. piper gets `length_scale = 1/speed` on the synthesis request; OpenRouter gets `speed` in the request body, but **only when it is not 1.0** — not every model behind OpenRouter implements the field, and a 400 on it for the default value would break speech for people who never touched the setting. Off the default, a rejection falls back to piper, which honours the speed anyway. |
