@@ -26,7 +26,8 @@ import unittest
 from pathlib import Path
 
 from ._support import (FORBIDDEN_AMBIENT_STATE, FORBIDDEN_APLAY,
-                       FORBIDDEN_CODEX_BIN, FORBIDDEN_COREDUMP_DIR,
+                       FORBIDDEN_CODEX_BIN, FORBIDDEN_CODEX_SKILLS_DIR,
+                       FORBIDDEN_COREDUMP_DIR,
                        FORBIDDEN_CRASH_TOGGLE_OFF,
                        FORBIDDEN_CRASH_WATCH_UNIT, FORBIDDEN_GH,
                        FORBIDDEN_GIT, FORBIDDEN_GRIM,
@@ -35,11 +36,13 @@ from ._support import (FORBIDDEN_AMBIENT_STATE, FORBIDDEN_APLAY,
                        FORBIDDEN_NOTIFIER,
                        FORBIDDEN_OMARCHY_UPDATE_LOG, FORBIDDEN_OMARCHY_VERSION,
                        FORBIDDEN_POWER_SUPPLY_DIR, FORBIDDEN_PYTHON,
+                       FORBIDDEN_SKILLS_EXTRA_ROOTS,
+                       FORBIDDEN_SKILLS_STORE_DIR,
                        FORBIDDEN_STATE_FILE, FORBIDDEN_TERMINAL, FakeHyprland,
                        TempMemoryCase)
 
 from lunad import (agent, ambient, config, confirm, context, dispatch, hud,
-                   presence, speech, vcs)
+                   presence, skills, speech, vcs)
 
 #: Every ``config`` name that reaches the outside world, and what it would do
 #: to the machine running the suite if it were the real thing.
@@ -95,6 +98,8 @@ class LateReadCase(unittest.TestCase):
         (confirm.ConfirmBroker.__init__, ("notify_bin",)),
         (speech.Speech.__init__, ("aplay", "python", "caption")),
         (vcs.Repo.__init__, ("git_bin", "gh_bin", "notify_bin")),
+        (skills.SkillFarm.__init__,
+         ("root", "store", "git_bin", "extra_roots")),
     )
 
     def test_outward_parameters_default_to_none(self) -> None:
@@ -146,6 +151,25 @@ class ConstructionCase(TempMemoryCase):
         self.assertNotEqual(d.jobs_dir, config.STATE_DIR / "jobs")
         self.assertFalse(str(d.jobs_dir).startswith(str(Path.home())),
                          "a stray Dispatcher is collecting inside $HOME")
+
+    def test_a_skill_farm_built_with_nothing_is_nowhere_near_the_real_one(self) -> None:
+        """`remove` unlinks. It must never be pointed at the user's own farm.
+
+        The same shape as the jobs directory, and with the same reason to be
+        checked rather than assumed: a `SkillFarm()` with no arguments is what
+        `bin/luna` builds, so if the redirect did not reach it a case that
+        exercised `add`/`remove` would edit the live set of skills codex reads
+        — and a skill quietly missing has no symptom at all.
+        """
+        farm = skills.SkillFarm()
+        self.assertEqual(farm.root, FORBIDDEN_CODEX_SKILLS_DIR)
+        self.assertEqual(farm.store, FORBIDDEN_SKILLS_STORE_DIR)
+        self.assertEqual(farm.git_bin, FORBIDDEN_GIT)
+        self.assertEqual(farm.extra_roots, FORBIDDEN_SKILLS_EXTRA_ROOTS)
+        for path in (farm.root, farm.store, *farm.extra_roots):
+            self.assertFalse(str(path).startswith(str(Path.home())),
+                             f"a stray SkillFarm is linking inside $HOME: "
+                             f"{path}")
 
     def test_a_repo_built_with_nothing_holds_both_vcs_sentinels(self) -> None:
         repo = vcs.Repo(self.root)

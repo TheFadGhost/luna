@@ -159,6 +159,94 @@ class SentenceSplitTests(unittest.TestCase):
         self.assertTrue(all(u.strip() for u in units), units)
 
 
+class LeadSplitTests(unittest.TestCase):
+    """`split_lead_sentence`: the cut that starts the audio a clause early.
+
+    The rule is measured, not aesthetic — docs/_latency-notes.md §4 — so these
+    assert the arithmetic that decides it as well as where the knife lands.
+    """
+
+    def test_a_short_opening_sentence_is_left_whole(self) -> None:
+        """Already near the ~1 s floor: a seam here would buy nothing."""
+        self.assertIsNone(speech.split_lead_sentence("Right, it is running."))
+
+    def test_a_long_sentence_is_cut_at_the_first_usable_comma(self) -> None:
+        pair = speech.split_lead_sentence(
+            "I checked the logs, and the service came back up ten minutes ago.")
+        assert pair is not None
+        head, tail = pair
+        self.assertEqual(head, "I checked the logs,")
+        self.assertEqual(tail, "and the service came back up ten minutes ago.")
+
+    def test_a_sentence_with_no_clause_boundary_is_left_whole(self) -> None:
+        """No good seam exists, so none is invented. 1.7 s is the price."""
+        self.assertIsNone(speech.split_lead_sentence(
+            "That is a well known problem with no easy answer in this code."))
+
+    def test_a_boundary_too_early_to_cover_the_tail_is_passed_over(self) -> None:
+        """A head whose audio ends before the tail arrives would leave a gap.
+
+        The first comma here is 19 characters in with 74 to follow, which the
+        head cannot cover; the second is 39 in, which it can. Passing over
+        rather than giving up is the difference between splitting this
+        sentence and not.
+        """
+        pair = speech.split_lead_sentence(
+            "The build is green, the tests all pass, and the branch is ready "
+            "to merge whenever you want it.")
+        assert pair is not None
+        self.assertEqual(pair[0], "The build is green, the tests all pass,")
+
+    def test_a_semicolon_a_colon_and_a_spaced_dash_all_count(self) -> None:
+        for text in (
+            "It finished about an hour ago; nothing has touched it since then.",
+            "Here is the shape of it: three services and one shared database.",
+            "It finished an hour ago - nothing has touched it since then, ok.",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNotNone(speech.split_lead_sentence(text))
+
+    def test_a_trailing_dash_is_dropped_but_a_comma_is_kept(self) -> None:
+        """Spoken, a trailing dash is a hesitation; a comma is a pause."""
+        pair = speech.split_lead_sentence(
+            "It finished an hour ago - nothing has touched it since then, ok.")
+        assert pair is not None
+        self.assertEqual(pair[0], "It finished an hour ago")
+        pair = speech.split_lead_sentence(
+            "I checked the logs, and the service came back up ten minutes ago.")
+        assert pair is not None
+        self.assertTrue(pair[0].endswith(","))
+
+    def test_a_number_and_a_clock_time_are_not_clause_boundaries(self) -> None:
+        """"1,234" and "3:15" have no space after the mark, so neither cuts."""
+        pair = speech.split_lead_sentence(
+            "It cost 1,234 pounds and change at 3:15 which is more than "
+            "I had expected.")
+        self.assertIsNone(pair)
+
+    def test_a_hyphenated_word_is_not_a_clause_boundary(self) -> None:
+        self.assertIsNone(speech.split_lead_sentence(
+            "That is a well-known problem with no easy answer in this code."))
+
+    def test_a_tail_too_short_to_be_worth_a_seam_is_declined(self) -> None:
+        """Under ~24 characters the tail saves less than the seam costs."""
+        self.assertIsNone(speech.split_lead_sentence(
+            "The deployment finished about an hour ago and nothing, since."))
+
+    def test_the_two_halves_are_the_whole_sentence(self) -> None:
+        """No words may be lost at the seam — only the dash, deliberately."""
+        text = ("I checked the logs, and the service came back up about ten "
+                "minutes ago.")
+        pair = speech.split_lead_sentence(text)
+        assert pair is not None
+        self.assertEqual(f"{pair[0]} {pair[1]}", text)
+
+    def test_the_cover_rule_is_the_measured_one(self) -> None:
+        """54 ms/char of audio against 17 ms/char of synthesis, plus margin."""
+        self.assertTrue(speech._lead_split_covers("x" * 40, "y" * 40))
+        self.assertFalse(speech._lead_split_covers("x" * 10, "y" * 100))
+
+
 class SampleRateTests(unittest.TestCase):
     """The rate comes from the voice, never from a constant in the source."""
 

@@ -164,6 +164,44 @@ FORBIDDEN_JOBS_DIR = Path(_JOBS_GUARD.name) / "jobs"
 
 config.JOBS_DIR = FORBIDDEN_JOBS_DIR
 
+#: The skills farm, and the store `luna skills add <git-url>` clones into.
+#:
+#: `~/.codex/skills/` is the same shape of hazard as `JOBS_DIR`, one step
+#: further out: it is not a binary but a directory `lunad.skills.SkillFarm`
+#: *creates symlinks in and unlinks from*, and it is the input codex reads at
+#: the start of every turn Luna runs. A test that forgot to redirect it would
+#: install its fixtures into the user's live farm, or -- worse, because it has
+#: no symptom -- unlink a real skill and leave Luna quietly unable to do
+#: something she could do yesterday. codex says nothing about a skill that is
+#: not there.
+#:
+#: Both have to *resolve*, like `JOBS_DIR` and unlike the binary names: `add`
+#: creates the farm if it is missing and clones into the store, so an
+#: unresolvable sentinel would fail cases for the wrong reason. They point at
+#: a throwaway tree for the life of the test process instead.
+#:
+#: `SKILLS_STORE_DIR` is the other half. It is where a clone lands, so leaving
+#: it live would let a case that reached `_clone` write into the user's own
+#: state directory -- and `tests/test_skills.py` asserts, rather than trusts,
+#: that no test ever gets as far as the network at all.
+_SKILLS_GUARD = tempfile.TemporaryDirectory(prefix="luna-tests-skills-")
+atexit.register(_SKILLS_GUARD.cleanup)
+FORBIDDEN_CODEX_SKILLS_DIR = Path(_SKILLS_GUARD.name) / "codex-skills"
+FORBIDDEN_SKILLS_STORE_DIR = Path(_SKILLS_GUARD.name) / "store"
+
+config.CODEX_SKILLS_DIR = FORBIDDEN_CODEX_SKILLS_DIR
+config.SKILLS_STORE_DIR = FORBIDDEN_SKILLS_STORE_DIR
+
+#: The third path, pointing the other way: something Luna *reads* rather than
+#: writes. `~/.agents/skills/` is the cross-agent skills root, shared with
+#: whatever else on this machine writes there, and `doctor` walks it looking
+#: for dangling links. Left live, the suite's answer would depend on what the
+#: person running it happens to have installed — the same class of bug as the
+#: ambient watchers reading the real coredump directory, and the same fix.
+FORBIDDEN_SKILLS_EXTRA_ROOTS = (Path(_SKILLS_GUARD.name) / "agents-skills",)
+
+config.SKILLS_EXTRA_ROOTS = FORBIDDEN_SKILLS_EXTRA_ROOTS
+
 #: The ambient subsystem's four outward *inputs*, and its two outputs.
 #:
 #: This is the same class of bug as the notifier, pointing the other way. The
