@@ -25,10 +25,15 @@ class FakeAdapter(agent.BaseAdapter):
     name = "fake"
 
     def __init__(self, reply: str = "Fine.", raises: Exception | None = None,
-                 delay: float = 0.0) -> None:
+                 delay: float = 0.0, early: bool = False) -> None:
         self.reply = reply
         self.raises = raises
         self.delay = delay
+        #: Whether to hand the reply out at "turn.completed" the way
+        #: `CodexAdapter` does. Off by default so every existing case still
+        #: exercises the post-hoc path, which is the fallback that has to keep
+        #: working for adapters with no event stream.
+        self.early = early
         self.last_system_prompt = ""
         self.last_prompt = ""
         self.calls: list[dict[str, Any]] = []
@@ -46,6 +51,8 @@ class FakeAdapter(agent.BaseAdapter):
             time.sleep(self.delay)
         if self.raises:
             raise self.raises
+        if self.early and kw.get("on_reply") is not None:
+            kw["on_reply"](self.reply)
         return agent.AgentReply(text=self.reply, agent="fake", model="fake-1",
                                 cost_usd=0.001, wall_ms=1)
 
@@ -56,6 +63,7 @@ class MuteSpeech:
     def __init__(self) -> None:
         self.said: list[str] = []
         self.cancels = 0
+        self.prewarms = 0
 
     # Part of the real interface: `Daemon._publish_state` reads it on every
     # transition, and this double is never mid-utterance because nothing here
@@ -69,6 +77,10 @@ class MuteSpeech:
     def cancel(self) -> bool:
         self.cancels += 1
         return True
+
+    def prewarm(self) -> bool:
+        self.prewarms += 1
+        return False
 
     def status(self) -> dict[str, Any]:
         return {"loaded": False, "speaking": False, "counters": {}}
@@ -253,6 +265,64 @@ class _StuckJob:
 
     def __init__(self) -> None:
         self.done = threading.Event()
+
+
+class EarlySpeechTests(DaemonCase):
+    """She starts talking when the turn completes, not when the child exits.
+
+    `codex exec` writes its session rollout after `turn.completed` and only
+    then closes stdout — measured at 350-490 ms on this machine, on every ask.
+    The adapter hands the finished reply out during that window, so the
+    ordering asserted here is the whole point: spoken first, everything else
+    after.
+    """
+
+    def daemon(self, adapter: agent.BaseAdapter) -> Daemon:
+        d = self.build_daemon()
+        d.adapter = adapter
+        d.speech = MuteSpeech()                        # type: ignore[assignment]
+        return d
+
+    def test_an_early_reply_is_spoken_exactly_once(self):
+        d = self.daemon(FakeAdapter("Your call.", early=True))
+        reply = d.op_ask({"prompt": "hi", "surface": "voice"})
+        self.assertEqual(d.speech.said, ["Your call."])
+        self.assertEqual(reply["spoken"], "Your call.")
+
+    def test_an_adapter_with_no_event_stream_is_still_spoken(self):
+        """claude has no turn.completed to fire on. She must not go silent."""
+        d = self.daemon(FakeAdapter("Your call.", early=False))
+        reply = d.op_ask({"prompt": "hi", "surface": "voice"})
+        self.assertEqual(d.speech.said, ["Your call."])
+        self.assertEqual(reply["spoken"], "Your call.")
+
+    def test_a_silent_surface_speaks_nothing_and_pre_warms_nothing(self):
+        d = self.daemon(FakeAdapter("Your call.", early=True))
+        d.op_ask({"prompt": "hi", "surface": "cli"})
+        self.assertEqual(d.speech.said, [])
+        self.assertEqual(d.speech.prewarms, 0)
+
+    def test_speaking_pre_warms_the_speech_path_before_the_agent_runs(self):
+        d = self.daemon(FakeAdapter("Your call.", early=True))
+        d.op_ask({"prompt": "hi", "surface": "voice"})
+        self.assertEqual(d.speech.prewarms, 1)
+
+    def test_the_episode_is_still_recorded_when_speech_ran_first(self):
+        """Speaking early must not cost the memory write that follows it."""
+        d = self.daemon(FakeAdapter("Your call.", early=True))
+        reply = d.op_ask({"prompt": "remember this", "surface": "voice"})
+        self.assertIn("episode", reply)
+        self.assertTrue(d.memory.episodes.search("remember this"))
+
+    def test_a_mute_speaker_does_not_break_an_early_ask(self):
+        class Deaf(MuteSpeech):
+            def say(self, text, wait=False, timeout=0.0):
+                raise RuntimeError("no audio device")
+
+        d = self.daemon(FakeAdapter("Your call.", early=True))
+        d.speech = Deaf()                              # type: ignore[assignment]
+        reply = d.op_ask({"prompt": "hi", "surface": "voice"})
+        self.assertEqual(reply["reply"], "Your call.")
 
 
 class DispatchTests(DaemonCase):

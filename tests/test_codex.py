@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import tomllib
 import unittest
 from pathlib import Path
@@ -414,6 +415,125 @@ class FakeCodexTests(TempMemoryCase):
         with self.assertRaises(agent.AgentMalformedOutput):
             a.ask("hi", PERSONA, timeout=30)
         self.assertEqual(list(self.cwd.glob("codex-last-*")), [])
+
+
+class EarlyReplyTests(unittest.TestCase):
+    """`on_reply` fires at turn.completed, once, and only for a good turn.
+
+    The point of the callback is that speech starts while codex is still
+    shutting down — measured at 350-490 ms of dead time per ask. That is only
+    worth having if it can never speak something the turn went on to retract,
+    so most of what is asserted here is when it must stay *silent*.
+    """
+
+    def fired(self, stream: str) -> list[str]:
+        seen: list[str] = []
+        watch = agent.CodexAdapter._early_reply_watcher(seen.append)
+        assert watch is not None
+        for line in stream.splitlines(keepends=True):
+            watch(line)
+        return seen
+
+    def test_no_callback_means_no_watcher_at_all(self):
+        self.assertIsNone(agent.CodexAdapter._early_reply_watcher(None))
+
+    def test_it_fires_once_with_the_agent_message(self):
+        self.assertEqual(self.fired(events("Fine.")), ["Fine."])
+
+    def test_it_does_not_fire_before_the_turn_completes(self):
+        partial = events("Fine.").splitlines(keepends=True)[:-1]
+        self.assertEqual(self.fired("".join(partial)), [])
+
+    def test_a_failed_turn_is_never_spoken(self):
+        stream = (json.dumps({"type": "item.completed",
+                              "item": {"type": "agent_message",
+                                       "text": "half an answer"}}) + "\n"
+                  + json.dumps({"type": "turn.failed",
+                                "error": {"message": "usage limit"}}) + "\n"
+                  + json.dumps({"type": "turn.completed", "usage": {}}) + "\n")
+        self.assertEqual(self.fired(stream), [])
+
+    def test_an_error_event_is_never_spoken(self):
+        stream = (json.dumps({"type": "error", "message": "boom"}) + "\n"
+                  + json.dumps({"type": "item.completed",
+                                "item": {"type": "agent_message",
+                                         "text": "hi"}}) + "\n"
+                  + json.dumps({"type": "turn.completed", "usage": {}}) + "\n")
+        self.assertEqual(self.fired(stream), [])
+
+    def test_a_turn_with_no_message_is_never_spoken(self):
+        stream = (json.dumps({"type": "turn.started"}) + "\n"
+                  + json.dumps({"type": "turn.completed", "usage": {}}) + "\n")
+        self.assertEqual(self.fired(stream), [])
+
+    def test_the_last_message_wins_and_it_still_fires_only_once(self):
+        stream = (json.dumps({"type": "item.completed",
+                              "item": {"type": "agent_message",
+                                       "text": "first"}}) + "\n"
+                  + json.dumps({"type": "item.completed",
+                                "item": {"type": "agent_message",
+                                         "text": "second"}}) + "\n"
+                  + json.dumps({"type": "turn.completed", "usage": {}}) + "\n"
+                  + json.dumps({"type": "turn.completed", "usage": {}}) + "\n")
+        self.assertEqual(self.fired(stream), ["second"])
+
+    def test_junk_lines_do_not_upset_it(self):
+        self.assertEqual(self.fired("not json\n\n[1,2]\n" + events("Ok.")),
+                         ["Ok."])
+
+
+class EarlyReplyEndToEndTests(FakeCodexTests):
+    """The saving, through a real subprocess: spoken before the child exits."""
+
+    def test_the_reply_arrives_before_the_process_does(self):
+        stream_file = self.root / "stream.jsonl"
+        stream_file.write_text(events("Fine."), encoding="utf-8")
+        # The sleep stands in for the 359-687 ms codex spends writing its
+        # session rollout after turn.completed. The callback must land during
+        # it, not after it.
+        a = self.write_fake(
+            "cat > /dev/null\n"
+            "while [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\n"
+            f"cat {stream_file}\n"
+            "printf 'Fine.' > \"$out\"\n"
+            "sleep 1\n")
+        marks: list[float] = []
+        start = time.monotonic()
+        reply = a.ask("hello", PERSONA, timeout=30,
+                      on_reply=lambda _t: marks.append(time.monotonic() - start))
+        returned = time.monotonic() - start
+        self.assertEqual(reply.text, "Fine.")
+        self.assertEqual(len(marks), 1)
+        self.assertLess(marks[0], returned - 0.5,
+                        "on_reply should fire a whole sleep before ask() returns")
+
+    def test_streaming_still_returns_the_complete_stdout(self):
+        """The callback may not cost us any output: same reply either way."""
+        stream_file = self.root / "stream.jsonl"
+        stream_file.write_text(events("Fine.", usage={"input_tokens": 7}),
+                               encoding="utf-8")
+        body = ("cat > /dev/null\n"
+                "while [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\n"
+                f"cat {stream_file}\n"
+                "echo 'progress chatter' >&2\n"
+                "printf 'Fine.' > \"$out\"\n")
+        plain = self.write_fake(body).ask("hi", PERSONA, timeout=30)
+        streamed = self.write_fake(body).ask("hi", PERSONA, timeout=30,
+                                             on_reply=lambda _t: None)
+        self.assertEqual(plain.text, streamed.text)
+        self.assertEqual(plain.usage, streamed.usage)
+        self.assertEqual(plain.session_id, streamed.session_id)
+
+    def test_a_failing_turn_speaks_nothing_and_still_raises(self):
+        a = self.write_fake(
+            "cat > /dev/null\n"
+            "printf '{\"type\":\"turn.failed\",\"error\":"
+            "{\"message\":\"usage limit\"}}\\n'\n"
+            "exit 1\n")
+        spoke: list[str] = []
+        with self.assertRaises(agent.AgentFailed):
+            a.ask("hi", PERSONA, timeout=30, on_reply=spoke.append)
+        self.assertEqual(spoke, [])
 
 
 class CodexDispatchTests(TempMemoryCase):

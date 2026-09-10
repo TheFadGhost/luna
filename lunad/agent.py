@@ -39,7 +39,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from . import config, safety
 
@@ -208,6 +208,7 @@ class BaseAdapter:
         run: "AgentRun | None" = None,
         stdin_data: str | None = None,
         note: str = "",
+        on_line: "Callable[[str], None] | None" = None,
     ) -> tuple[str, str, int, int]:
         """Run an agent CLI to completion. Returns (stdout, stderr, rc, wall_ms).
 
@@ -215,6 +216,17 @@ class BaseAdapter:
         timeout path and one place where the pid enters and leaves the signal
         ledger. Interpreting the output is the adapter's business; owning the
         process is not.
+
+        ``on_line`` opts into reading stdout **as it arrives** rather than in
+        one lump at exit, and is handed each line the moment it lands. It
+        changes nothing about what this method returns or raises: the full
+        stdout, stderr, return code and timeout behaviour are identical either
+        way. It exists because of a measurement — ``codex exec`` emits
+        ``turn.completed`` and then spends a further 359-687 ms (median ~470)
+        writing its session rollout before it closes stdout and exits. Waiting
+        for the exit costs that half second on *every* ask, and it buys
+        nothing: the answer is already on the wire. See
+        ``docs/_latency-notes.md``.
         """
         started = time.monotonic()
 
@@ -251,7 +263,12 @@ class BaseAdapter:
             run.attach(proc)
 
         try:
-            stdout, stderr = proc.communicate(input=stdin_data, timeout=timeout)
+            if on_line is None:
+                stdout, stderr = proc.communicate(input=stdin_data,
+                                                  timeout=timeout)
+            else:
+                stdout, stderr = self._stream(proc, stdin_data, timeout,
+                                              on_line)
         except subprocess.TimeoutExpired:
             self._terminate(proc)
             stdout, stderr = proc.communicate()
@@ -268,6 +285,69 @@ class BaseAdapter:
             raise AgentCancelled(f"request {run.request_id} was cancelled")
 
         return stdout or "", stderr or "", proc.returncode, wall_ms
+
+    @staticmethod
+    def _stream(proc: subprocess.Popen, stdin_data: str | None,
+                timeout: float,
+                on_line: "Callable[[str], None]") -> tuple[str, str]:
+        """``communicate()``, but stdout is handed out line by line as it lands.
+
+        Same contract as ``communicate``: returns the *complete* stdout and
+        stderr, and raises :class:`subprocess.TimeoutExpired` on the same
+        deadline, so the caller's error handling does not have to know which
+        path it took. stdin and stderr get a thread each for the same reason
+        ``communicate`` uses threads — a child that fills a pipe nobody is
+        draining deadlocks, and codex writes progress text to stderr.
+
+        ``on_line`` is called on this thread and is not allowed to be slow;
+        anything it starts must be started, not waited for. An exception out
+        of it is logged and swallowed: an early-dispatch optimisation must
+        never be able to lose a reply that the agent successfully produced.
+        """
+        out_chunks: list[str] = []
+        err_chunks: list[str] = []
+
+        def pump_stderr() -> None:
+            try:
+                if proc.stderr is not None:
+                    err_chunks.append(proc.stderr.read() or "")
+            except Exception:  # noqa: BLE001 - stderr is diagnostic, not the reply
+                pass
+
+        def push_stdin() -> None:
+            try:
+                if proc.stdin is not None:
+                    if stdin_data is not None:
+                        proc.stdin.write(stdin_data)
+                    proc.stdin.close()
+            except Exception:  # noqa: BLE001 - a closed pipe shows up as rc anyway
+                pass
+
+        threads = [threading.Thread(target=push_stdin, daemon=True,
+                                    name="agent-stdin"),
+                   threading.Thread(target=pump_stderr, daemon=True,
+                                    name="agent-stderr")]
+        for thread in threads:
+            thread.start()
+
+        deadline = time.monotonic() + timeout
+        try:
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    out_chunks.append(line)
+                    if time.monotonic() > deadline:
+                        raise subprocess.TimeoutExpired(proc.args, timeout)
+                    try:
+                        on_line(line)
+                    except Exception:  # noqa: BLE001
+                        log.exception("agent stream callback failed")
+        finally:
+            remaining = max(0.0, deadline - time.monotonic())
+            for thread in threads:
+                thread.join(remaining)
+
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        return "".join(out_chunks), "".join(err_chunks)
 
     @staticmethod
     def _terminate(proc: subprocess.Popen, reason: str = "agent run ended") -> bool:
@@ -767,6 +847,7 @@ class CodexAdapter(BaseAdapter):
         timeout: float = config.AGENT_TIMEOUT_S,
         run: "AgentRun | None" = None,
         images: Sequence[str] = (),
+        on_reply: "Callable[[str], None] | None" = None,
         **_: Any,
     ) -> AgentReply:
         # `session_id` is accepted and ignored, on purpose. claude lets the
@@ -782,7 +863,8 @@ class CodexAdapter(BaseAdapter):
             argv = self.build_argv(system_prompt, model=model, resume=resume,
                                    output_file=out_path, images=images)
             stdout, stderr, rc, wall_ms = self._spawn_and_wait(
-                argv, timeout=timeout, run=run, stdin_data=prompt)
+                argv, timeout=timeout, run=run, stdin_data=prompt,
+                on_line=self._early_reply_watcher(on_reply))
             try:
                 last_message = Path(out_path).read_text(encoding="utf-8")
             except OSError:
@@ -795,6 +877,59 @@ class CodexAdapter(BaseAdapter):
                 os.unlink(out_path)
             except OSError:
                 pass
+
+    @staticmethod
+    def _early_reply_watcher(
+        on_reply: "Callable[[str], None] | None",
+    ) -> "Callable[[str], None] | None":
+        """Hand the finished reply out at ``turn.completed``, not at exit.
+
+        ``turn.completed`` is the earliest point that is safe to act on, and
+        deliberately not ``item.completed``/``agent_message``, which arrives
+        21-37 ms sooner. A turn may complete more than one message (see
+        :meth:`parse_output`, "last one wins") and may still fail after one,
+        so a message is a candidate and only the completed turn makes it the
+        answer. Those 30 ms are not worth speaking something the model went on
+        to retract; the ~470 ms of codex shutdown that follow are.
+
+        The callback fires at most once, never for a turn that reported an
+        error, and never for an empty message. Everything after this — the
+        full parse, the return code check, the ``-o`` fallback, every
+        exception :meth:`parse_output` can raise — is unchanged and still
+        happens. This only moves *when* the caller is told, not whether.
+        """
+        if on_reply is None:
+            return None
+        state = {"text": "", "failed": False, "fired": False}
+
+        def watch(line: str) -> None:
+            if state["fired"]:
+                return
+            line = line.strip()
+            if not line:
+                return
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                return
+            if not isinstance(event, dict):
+                return
+            kind = event.get("type")
+            if kind in ("turn.failed", "error", "thread.failed"):
+                state["failed"] = True
+            elif kind == "item.completed":
+                item = event.get("item")
+                if isinstance(item, dict) and item.get("type") == "agent_message":
+                    candidate = item.get("text")
+                    if isinstance(candidate, str) and candidate.strip():
+                        state["text"] = candidate
+            elif kind == "turn.completed":
+                if state["failed"] or not state["text"].strip():
+                    return
+                state["fired"] = True
+                on_reply(state["text"].strip())
+
+        return watch
 
     def parse_output(self, stdout: str, stderr: str, rc: int, wall_ms: int,
                      last_message: str = "",

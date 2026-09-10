@@ -38,6 +38,7 @@ says rather than on the next restart.
 
 from __future__ import annotations
 
+import array
 import json
 import logging
 import os
@@ -245,6 +246,99 @@ def _cap_length(unit: str, limit: int) -> list[str]:
     return out or [unit[:limit]]
 
 
+# -------------------------------------------------------------------------
+# The opening split
+# -------------------------------------------------------------------------
+#
+# Remote synthesis costs a fixed ~1,090 ms plus ~17 ms per character
+# (docs/_latency-notes.md §4). Only the *first* sentence's length is audible
+# as silence: everything after it is synthesised while she is already talking.
+# So the opening sentence is cut in two at a clause boundary and both halves
+# are requested at once — see `Speech._play_remote` — which starts the audio at
+# the head's cost instead of the whole sentence's.
+#
+# All three numbers below come off that measured line, and all three are there
+# to stop the split happening when it would not pay for the prosody seam it
+# costs. Declining is the safe answer.
+
+#: Under this, the sentence already synthesises near the ~1,090 ms floor and
+#: the most any split could save is ~0.5 s. 50 characters is where the saving
+#: from a well-placed cut first clears half a second (17 ms x a 30-char tail).
+LEAD_SPLIT_MIN_CHARS = 50
+
+#: A tail shorter than this saves under ~0.4 s, which is
+#: `LEAD_SPLIT_MIN_CHARS` seen from the other end.
+LEAD_SPLIT_TAIL_MIN_CHARS = 24
+
+#: Remote synthesis: ~17 ms per character above a fixed floor. The floor is the
+#: same for both halves and cancels out of the comparison below, so it is not a
+#: constant here — which is the point, because the floor is the noisiest of the
+#: three measurements.
+_SYNTH_MS_PER_CHAR = 17.0
+
+#: Speech itself: ~54 ms per character, steady across all five rows of §4
+#: (53–55 ms/char from 21 to 274 characters).
+_AUDIO_MS_PER_CHAR = 54.0
+
+#: How much slower than the model says the tail's request may come back before
+#: the seam opens into an audible gap. The provider's spread against its own
+#: line is a few hundred ms, so a quarter of a second of slack is bought and
+#: the boundary that cannot afford it is passed over.
+LEAD_SPLIT_MARGIN_MS = 250.0
+
+#: A clause boundary: a comma, semicolon or colon, or a dash used as one.
+#: The lookahead for whitespace is what keeps "1,234" and "3:15" out of it —
+#: `strip_for_speech` collapses long digit runs but a short one still gets
+#: through. A hyphen only counts when it is spaced, so "well-known" is safe.
+_LEAD_BOUNDARY_RE = re.compile(r"[,;:](?=\s)|(?<=\s)[-–—](?=\s)|—(?=\s)")
+
+
+def _lead_split_covers(head: str, tail: str) -> bool:
+    """Will the head still be playing when the tail's audio arrives?
+
+    Both halves are requested at the same instant, so the head is heard from
+    ``floor + 17*len(head)`` and lasts ``54*len(head)``, while the tail lands at
+    ``floor + 17*len(tail)``. The floor cancels, leaving the whole no-gap
+    condition as ``(54 + 17)*head >= 17*tail`` — a head covers a tail about 4.2
+    times its length — plus the margin.
+    """
+    return ((_AUDIO_MS_PER_CHAR + _SYNTH_MS_PER_CHAR) * len(head)
+            - _SYNTH_MS_PER_CHAR * len(tail)) >= LEAD_SPLIT_MARGIN_MS
+
+
+def split_lead_sentence(sentence: str) -> tuple[str, str] | None:
+    """Cut an opening sentence at a clause boundary, or decline.
+
+    Returns ``(head, tail)``, or ``None`` when no boundary is worth using.
+    Declining is the common case and the safe one: a seam in the wrong place,
+    or a gap in the middle of a sentence, is worse than the 1.7 s it saves.
+
+    The *earliest* boundary that `_lead_split_covers` wins, because time to
+    first audio is what this whole exercise is buying and a shorter head buys
+    more of it. A boundary too early to cover the tail is passed over rather
+    than ending the search — the next one along may well do.
+
+    Pure text, no I/O, no settings — it runs *after* `strip_for_speech`, so a
+    placeholder is already one short phrase and cannot be cut in half here.
+    """
+    text = sentence.strip()
+    if len(text) < LEAD_SPLIT_MIN_CHARS:
+        return None
+    for match in _LEAD_BOUNDARY_RE.finditer(text):
+        cut = match.end()
+        # A comma, semicolon or colon stays on the head: it is what stops the
+        # provider reading the fragment with a flat terminal fall. A dash is
+        # dropped — spoken, a trailing dash is a hesitation, not a pause.
+        head = text[:cut].rstrip().rstrip("-–—").rstrip()
+        tail = text[cut:].strip()
+        if not head or len(tail) < LEAD_SPLIT_TAIL_MIN_CHARS:
+            # Past here every later boundary leaves an even shorter tail.
+            break
+        if _lead_split_covers(head, tail):
+            return head, tail
+    return None
+
+
 def _hard_wrap(text: str, limit: int) -> list[str]:
     out, buf = [], ""
     for word in text.split():
@@ -375,6 +469,59 @@ def parse_wav(data: bytes) -> Wav:
     return Wav(pcm, rate, channels, bits or 16)
 
 
+#: The seam between the opening sentence's two halves, in milliseconds of
+#: silence to leave on each side of it. The provider pads every request with
+#: 200–400 ms of near-silence at the start and lets the end decay, which in
+#: the middle of a sentence is heard as a hole. Measured across nine
+#: renderings, the untrimmed seam ran 20–620 ms (median 230) against the same
+#: voice's own longest *internal* pause of 180 ms; trimmed, 20–140 ms (median
+#: 70). Cutting each facing edge back to a comma's worth is what keeps the
+#: split from sounding like a full stop. A whole number of `_SEAM_FRAME_MS`
+#: frames, which is the resolution the scan below works at.
+SEAM_KEEP_MS = 80
+
+_SEAM_FRAME_MS = 10          # the resolution the edges are trimmed at
+_SEAM_MAX_TRIM_MS = 400      # never cut more than this, whatever the scan says
+_SEAM_FLOOR = 0.03           # "silent" is under 3% of the chunk's own peak
+
+
+def trim_seam(wav: Wav, *, trailing: bool) -> bytes:
+    """Cut the padding off one edge of a chunk, leaving `SEAM_KEEP_MS`.
+
+    ``trailing`` picks the edge: the head of the pair is trimmed at its end,
+    the tail at its start, so only the two edges that face each other across
+    the seam are touched. Everything else about the audio is untouched, and a
+    chunk that is not 16-bit, or has no silence to spare, comes back exactly
+    as it went in.
+
+    The floor is relative to the chunk's own peak rather than absolute, so a
+    quiet utterance is not mistaken for a silent one, and the trim is capped
+    so that a scan that goes wrong cannot swallow a word.
+    """
+    if wav.bits != 16 or not wav.pcm:
+        return wav.pcm
+    step = (wav.rate * wav.channels * _SEAM_FRAME_MS) // 1000
+    if step <= 0:
+        return wav.pcm
+    samples = array.array("h")
+    samples.frombytes(wav.pcm[:len(wav.pcm) // 2 * 2])
+    if len(samples) < step * 2:
+        return wav.pcm
+    floor = max(max(samples), -min(samples), 1) * _SEAM_FLOOR
+    quiet = 0
+    for i in range(len(samples) // step):
+        end = len(samples) - i * step if trailing else (i + 1) * step
+        block = samples[end - step:end]
+        if max(max(block), -min(block)) >= floor:
+            break
+        quiet += 1
+    cut = min(max(0, quiet - SEAM_KEEP_MS // _SEAM_FRAME_MS),
+              _SEAM_MAX_TRIM_MS // _SEAM_FRAME_MS) * step * 2
+    if cut <= 0:
+        return wav.pcm
+    return wav.pcm[:-cut] if trailing else wav.pcm[cut:]
+
+
 def synthesise(text: str, *, model: str, voice: str, api_key: str,
                speed: float = 1.0,
                url: str = config.OPENROUTER_SPEECH_URL,
@@ -433,10 +580,11 @@ class _Job:
     __slots__ = ("id", "sentences", "text", "cancelled", "done", "started",
                  "error", "played_bytes", "first_audio", "provider",
                  "fell_back", "voice", "sample_rate", "cfg", "speed",
-                 "abandon_remote")
+                 "abandon_remote", "lead_pair")
 
     def __init__(self, sentences: list[str], text: str,
-                 cfg: dict[str, Any] | None = None) -> None:
+                 cfg: dict[str, Any] | None = None,
+                 lead_pair: bool = False) -> None:
         self.cfg = cfg or {}
         self.id = uuid.uuid4().hex[:12]
         self.sentences = sentences
@@ -464,6 +612,11 @@ class _Job:
         # sentences piper is about to speak instead, so the user is not billed
         # for audio nobody will ever hear.
         self.abandon_remote = False
+        # `sentences[0]` and `sentences[1]` are the two halves of one sentence,
+        # cut by `split_lead_sentence`, and are to be requested concurrently.
+        # Defaults off, so every other caller — and the whole piper path —
+        # keeps the strict one-ahead producer it has always had.
+        self.lead_pair = lead_pair and len(sentences) > 1
 
 
 class Speech:
@@ -624,6 +777,51 @@ class Speech:
             "speed": _clamp_speed(cfg.get("speed", 1.0)),
         }
 
+    def prewarm(self) -> bool:
+        """Load the piper model *now*, on a thread, if piper will be speaking.
+
+        Called at the moment the agent subprocess is spawned, so the 1.47 s
+        cold model load overlaps the 2.4-3.6 s the model spends thinking
+        instead of landing on top of it. Measured cold load 1467 ms, first
+        audio frame from a warm worker 212 ms; the whole of that 1467 ms is
+        dead time the user hears as silence today.
+
+        Deliberately narrow. It only fires when piper is the *configured*
+        provider, never merely the configured fallback: the remote path falls
+        back on about one ask in forty here, and holding 331 MB of ONNX
+        resident against 8 GB of laptop for that is a worse trade than the
+        1.47 s it would occasionally save. Returns whether a load was started,
+        which is what the tests assert on.
+
+        ``_ensure_worker`` may only load from the thread ``_speak_lock``
+        serialises (see its docstring). This honours that rather than
+        working around it: it takes the same lock, and if speech already holds
+        it there is nothing to pre-warm anyway.
+        """
+        cfg = self._voice_settings()
+        if not cfg["enabled"] or cfg["provider"] != "piper":
+            return False
+        with self._lock:
+            if self._closed:
+                return False
+            if self._proc is not None and self._proc.poll() is None:
+                return False        # already warm; nothing to do
+
+        def load() -> None:
+            if not self._speak_lock.acquire(blocking=False):
+                return              # an utterance is running; it loads its own
+            try:
+                self._ensure_worker()
+            except Exception as exc:  # noqa: BLE001 - a warm-up may not raise
+                log.debug("piper pre-warm did not take",
+                          extra={"detail": f"{type(exc).__name__}: {exc}"})
+            finally:
+                self._speak_lock.release()
+
+        threading.Thread(target=load, daemon=True,
+                         name="luna-piper-prewarm").start()
+        return True
+
     def say(self, text: str, wait: bool = False,
             timeout: float = 120.0) -> dict[str, Any]:
         """Speak ``text``. Cancels anything already speaking (barge-in).
@@ -643,10 +841,24 @@ class Speech:
             return {"spoken": "", "sentences": 0, "id": None,
                     "note": "nothing speakable in that text"}
 
+        # Cut the opening sentence in two so speech can start on the first
+        # clause. Remote only, and deliberately not inside `split_sentences`:
+        # piper synthesises a whole sentence in ~212 ms pre-warmed, so there a
+        # split is a prosody seam bought for nothing. If the remote path later
+        # falls back to piper mid-utterance it simply speaks the two halves as
+        # two units into the same `aplay`, which is what it already does for
+        # every other sentence boundary. See `split_lead_sentence`.
+        lead_pair = False
+        if voice_cfg["provider"] == "openrouter":
+            pair = split_lead_sentence(sentences[0])
+            if pair is not None:
+                sentences = [pair[0], pair[1], *sentences[1:]]
+                lead_pair = True
+
         # barge-in: the previous utterance stops. The caption stays -- the one
         # written below replaces it in a single `os.replace`.
         self.cancel(retract=False)
-        job = _Job(sentences, spoken, cfg=voice_cfg)
+        job = _Job(sentences, spoken, cfg=voice_cfg, lead_pair=lead_pair)
         with self._lock:
             if self._closed:
                 raise SpeechUnavailable("speech worker is shut down")
@@ -674,6 +886,8 @@ class Speech:
             "waited": wait, "cancelled": job.cancelled,
             "provider": job.provider, "voice": job.voice or self.piper_voice(),
         }
+        if job.lead_pair:
+            payload["lead_split"] = True
         if job.fell_back:
             payload["fell_back_to"] = "piper"
             payload["fallback_reason"] = job.fell_back[:300]
@@ -853,6 +1067,21 @@ class Speech:
         two is already in flight while sentence one is playing. One ahead and
         not all of them: a barge-in two words in should not have paid for the
         whole reply.
+
+        The one exception is the opening sentence when `split_lead_sentence`
+        has cut it in two (``job.lead_pair``). Both halves are requested at
+        once, because one-ahead would only start the tail *after* the head came
+        back, which lands it about a second after the head has finished
+        playing — a gap in the middle of a sentence, which is worse than the
+        silence the split removed. Two threads, so exactly two requests are
+        ever in flight, and the second one carries on from sentence two under
+        the ordinary one-ahead rule: the concurrency does not outlive the
+        opening sentence.
+
+        It does not make a barge-in more expensive, either. Before, an
+        interruption during sentence one had already paid for sentence *two*;
+        now it has paid for the other half of sentence one, and sentence two is
+        not requested until the head is playing. Same text, fewer characters.
         """
         cfg = job.cfg
         key = settings_mod.api_key()
@@ -861,8 +1090,26 @@ class Speech:
         playing = [0]                     # the index the consumer is on
         ready = threading.Condition()
 
-        def produce() -> None:
-            for index, sentence in enumerate(job.sentences):
+        def request(index: int) -> bool:
+            """One sentence, one request. False means stop producing."""
+            if job.cancelled or job.abandon_remote:
+                return False
+            try:
+                outcome: Any = self.synth(
+                    job.sentences[index], model=model, voice=voice,
+                    api_key=key, speed=job.speed,
+                    timeout=config.OPENROUTER_TIMEOUT_S)
+            except RemoteSpeechFailed as exc:
+                outcome = exc
+            except Exception as exc:  # noqa: BLE001 - any fault is a fallback
+                outcome = RemoteSpeechFailed(f"{type(exc).__name__}: {exc}")
+            with ready:
+                results[index] = outcome
+                ready.notify_all()
+            return not isinstance(outcome, RemoteSpeechFailed)
+
+        def produce(start: int) -> None:
+            for index in range(start, len(job.sentences)):
                 with ready:
                     # Stay at most one sentence ahead of playback.
                     while (not job.cancelled and not job.abandon_remote
@@ -870,24 +1117,31 @@ class Speech:
                         ready.wait(0.05)
                 if job.cancelled or job.abandon_remote:
                     break
-                try:
-                    outcome: Any = self.synth(
-                        sentence, model=model, voice=voice, api_key=key,
-                        speed=job.speed,
-                        timeout=config.OPENROUTER_TIMEOUT_S)
-                except RemoteSpeechFailed as exc:
-                    outcome = exc
-                except Exception as exc:  # noqa: BLE001 - any fault is a fallback
-                    outcome = RemoteSpeechFailed(f"{type(exc).__name__}: {exc}")
-                with ready:
-                    results[index] = outcome
-                    ready.notify_all()
-                if isinstance(outcome, RemoteSpeechFailed):
+                if not request(index):
                     break
 
-        worker = threading.Thread(target=produce, daemon=True,
-                                  name=f"luna-tts-{job.id}")
-        worker.start()
+        def produce_lead_tail() -> None:
+            """The second half of the opening sentence, then the rest.
+
+            Continuing from index 2 in *this* thread rather than a third is
+            what puts the one-ahead rule back: sentence two cannot be
+            requested until the tail has come back and the head is playing.
+            """
+            if request(1):
+                produce(2)
+
+        if job.lead_pair:
+            workers = [
+                threading.Thread(target=request, args=(0,), daemon=True,
+                                 name=f"luna-tts-{job.id}-head"),
+                threading.Thread(target=produce_lead_tail, daemon=True,
+                                 name=f"luna-tts-{job.id}-tail"),
+            ]
+        else:
+            workers = [threading.Thread(target=produce, args=(0,), daemon=True,
+                                        name=f"luna-tts-{job.id}")]
+        for worker in workers:
+            worker.start()
 
         player: subprocess.Popen | None = None
         current: Wav | None = None
@@ -911,10 +1165,11 @@ class Speech:
                     # piper is about to speak `remaining` instead. Without
                     # this, `produce()` keeps requesting — and OpenRouter TTS
                     # is the one service in this project that costs money —
-                    # audio for sentences nobody will ever hear. The one
-                    # request already in flight, if any, cannot be
-                    # interrupted mid-call; everything after it now will
-                    # never be requested at all.
+                    # audio for sentences nobody will ever hear. Whatever is
+                    # already in flight (one request, or two while the opening
+                    # sentence's halves are out) cannot be interrupted
+                    # mid-call; everything after it now will never be
+                    # requested at all.
                     if not job.abandon_remote:
                         job.abandon_remote = True
                         log.warning(
@@ -935,10 +1190,15 @@ class Speech:
                     current = wav
                     job.first_audio = job.first_audio or time.monotonic()
                     job.sample_rate = wav.rate
-                if not _feed(player, wav.pcm):
+                pcm = wav.pcm
+                if job.lead_pair and index <= 1:
+                    # The two halves of one sentence, so the pause between
+                    # them has to be a comma's and not an utterance boundary's.
+                    pcm = trim_seam(wav, trailing=index == 0)
+                if not _feed(player, pcm):
                     job.cancelled = True
                     return []
-                job.played_bytes += len(wav.pcm)
+                job.played_bytes += len(pcm)
                 index += 1
                 with ready:
                     playing[0] = index

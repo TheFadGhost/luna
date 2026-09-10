@@ -35,6 +35,37 @@ from .memory import (Memory, MemoryCapExceeded, MemoryError as LunaMemoryError,
 log = logging.getLogger("lunad.server")
 
 
+class _EarlySpeaker:
+    """Speaks a reply the moment the agent's turn completes, once.
+
+    A callable rather than a bare lambda because the ask path needs two things
+    back from it afterwards: whether it fired at all (if not, the reply has to
+    be spoken the old way) and what it said (which goes in the response payload
+    as ``spoken``). Callable from the adapter's stdout-reader thread, so it
+    does the least it can — ``Speech.say`` returns as soon as the utterance is
+    handed to its own thread, and nothing here waits for audio.
+
+    Never raises into the reader thread: ``_speak_safely`` already swallows a
+    mute speaker, and this adds the same protection to the bookkeeping around
+    it. A reply that could not be spoken is still a reply.
+    """
+
+    __slots__ = ("_say", "spoken", "fired")
+
+    def __init__(self, say: Callable[[str], str | None]) -> None:
+        self._say = say
+        self.spoken: str | None = None
+        self.fired = False
+
+    def __call__(self, text: str) -> None:
+        try:
+            self.spoken = self._say(text)
+        except Exception:  # noqa: BLE001 - never break the reply for the audio
+            log.exception("early speech dispatch failed")
+            self.spoken = None
+        self.fired = True
+
+
 # =========================================================================
 # Daemon state
 # =========================================================================
@@ -449,6 +480,22 @@ class Daemon:
                                "recalled": bool(recall),
                                "conversation": conversation,
                                "resuming": bool(args.get("resume"))})
+        # Speech is dispatched from inside the agent call, the moment the
+        # turn completes, rather than here after the child process has
+        # finished shutting down. Measured: ~470 ms earlier, every ask. The
+        # adapter fires it at most once and only for a turn that succeeded;
+        # if it never fires (claude, a stream with no events, voice off) the
+        # post-hoc call below still speaks, exactly as before.
+        speaker = _EarlySpeaker(self._speak_safely) if speak else None
+        if speak:
+            # Overlap piper's 1.47 s cold model load with the model's own
+            # thinking time instead of paying them one after the other. A
+            # no-op unless piper is the configured provider; see
+            # `Speech.prewarm`.
+            try:
+                self.speech.prewarm()
+            except Exception:  # noqa: BLE001 - a warm-up may never break an ask
+                log.exception("speech pre-warm failed")
         scope = req.get("look")
         try:
             if scope:
@@ -458,10 +505,12 @@ class Daemon:
                 with context_mod.look(str(scope)) as shot:
                     reply = self._ask_agent(req, message, system_prompt, args,
                                             run, sess, conversation, prefix,
-                                            request_id, images=(str(shot),))
+                                            request_id, images=(str(shot),),
+                                            on_reply=speaker)
             else:
                 reply = self._ask_agent(req, message, system_prompt, args, run,
-                                        sess, conversation, prefix, request_id)
+                                        sess, conversation, prefix, request_id,
+                                        on_reply=speaker)
         finally:
             self.runs.done(run)
             self._publish_state()
@@ -485,7 +534,13 @@ class Daemon:
 
         spoken = None
         if speak:
-            spoken = self._speak_safely(reply.text)
+            # Already said, in almost every case, by the callback above. This
+            # is the fallback for the paths that cannot fire it — an adapter
+            # with no event stream, or a reply recovered from `-o` after the
+            # stream lost it — and it must stay, because "she answered but
+            # said nothing" is the worst failure this path has.
+            spoken = (speaker.spoken if speaker is not None and speaker.fired
+                      else self._speak_safely(reply.text))
 
         log.info("reply", extra={"req_id": request_id, "wall_ms": reply.wall_ms,
                                  "cost_usd": reply.cost_usd,
@@ -555,7 +610,9 @@ class Daemon:
                    args: dict[str, Any], run: agent.AgentRun,
                    sess: sessions.Session | None, conversation: str,
                    prefix: str, request_id: str,
-                   images: tuple[str, ...] = ()) -> agent.AgentReply:
+                   images: tuple[str, ...] = (),
+                   on_reply: "_EarlySpeaker | None" = None,
+                   ) -> agent.AgentReply:
         """One agent call, with a single retry if a resume is refused.
 
         A resumable session id can go stale under the daemon — the agent's own
@@ -574,7 +631,8 @@ class Daemon:
                                     model=model,
                                     session_id=args.get("session_id"),
                                     resume=args.get("resume"),
-                                    timeout=timeout, run=run, images=images)
+                                    timeout=timeout, run=run, images=images,
+                                    on_reply=on_reply)
         except agent.AgentFailed as exc:
             if not args.get("resume") or sess is None:
                 raise
@@ -587,7 +645,8 @@ class Daemon:
             return self.adapter.ask(message, system_prompt,
                                     model=model,
                                     session_id=fresh.session_id, resume=None,
-                                    timeout=timeout, run=run, images=images)
+                                    timeout=timeout, run=run, images=images,
+                                    on_reply=on_reply)
 
     def _speak_safely(self, text: str) -> str | None:
         """Speak, but never let a mute speaker turn into a failed ask."""
