@@ -1630,8 +1630,11 @@ def cmd_update(args: argparse.Namespace) -> int:
 
 def _update_survey_text(survey, style: render.Style) -> str:
     rows = [["branch", style.bold(survey.branch or "(detached)")],
-            ["tracking", survey.upstream or style.dim("nothing")],
-            ["head", style.dim(survey.head or "?")]]
+            ["tracking", survey.upstream or style.dim("nothing")]]
+    # No head when the survey stopped before reading one: a row saying "?" is
+    # noise next to a refusal that already says what happened.
+    if survey.head:
+        rows.append(["head", style.dim(survey.head)])
     if survey.behind:
         rows.append(["behind", f"{survey.behind} → {style.bold(survey.target)}"])
     if survey.ahead:
