@@ -80,6 +80,43 @@ HUD_MESSAGE_FILE = RUNTIME_DIR / "message"
 # the overlay never learns that a config file exists.
 HUD_SETTINGS_FILE = RUNTIME_DIR / "hud.json"
 
+# The fourth file: "this dictation is Luna's, not plain F9 dictation".
+#
+# voxtype 0.7.5 owns the microphone and publishes `recording` to its own state
+# file, but it does not expose the active PROFILE anywhere -- `voxtype status
+# --format json --extended` returns text/alt/class/tooltip/model/device/backend
+# and no profile at all. So a desktop widget reading only voxtype's file cannot
+# tell F9 (plain dictation, types what you say) from F10 (`--profile luna`),
+# and every dictation lit the orb up as though Luna were listening.
+#
+# `bin/luna-voice-turn` -- the wrapper the F10 bind and the bar icon now go
+# through -- stamps this file with `date +%s%3N` and *then* execs voxtype, so
+# the marker is on disk before voxtype's daemon can publish `recording`. The
+# widget latches "this recording is Luna's" from it at the moment voxtype
+# leaves idle.
+#
+# Content: epoch milliseconds as ASCII digits, no trailing newline, matching
+# `state`'s one-bare-token shape. Absent means "no Luna turn in flight".
+#
+# Two independent things stop it being stranded, because a marker that stayed
+# set would mean F9 *never* stops lighting her up -- a worse bug than the one
+# it fixes:
+#
+#   1. `bin/luna-voice-router` removes it first thing, on every transcript the
+#      luna profile produces. That is the only hook voxtype runs for this
+#      profile and it runs whatever the transcript was -- empty, over-long, or
+#      refused by `[listen] enabled` -- so the ordinary path always clears.
+#   2. The timestamp is the backstop for the paths that never reach the hook
+#      at all (voxtype killed mid-record, a cancelled recording, the wrapper
+#      running when the voxtype daemon is down). The reader only trusts a
+#      marker younger than a few seconds, so the worst a crashed turn can do
+#      is confuse one dictation started immediately after it.
+#
+# Nothing in the daemon reads this. It is written by a shell wrapper, removed
+# by the router, and read by QML; lunad only names the path so that the router
+# and the tests agree on it.
+VOICE_TURN_FILE = RUNTIME_DIR / "voice-turn"
+
 OMARCHY_DEFAULT_AGENT = HOME / ".config" / "omarchy" / "defaults" / "agent"
 
 # --- Jarvis: the app's own configuration home ------------------------------

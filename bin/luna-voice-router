@@ -37,6 +37,13 @@ clipboard, which is the same containment the rest of this file relies on.
 Unlike the other three `[listen]` keys it needs no voxtype restart, because
 nothing on voxtype's side of the boundary has changed.
 
+It also takes down the "a Luna voice turn is in flight" marker that
+``bin/luna-voice-turn`` put up when the recording started. That is not a
+detour: this hook is the only thing voxtype runs for the luna profile, so it
+is the one place that sees *every* end of a turn — including the empty
+transcripts and the ones ``[listen] enabled`` refuses, which the daemon never
+hears about at all. See :func:`clear_turn_marker`.
+
 Diagnostics go to a small rotating file, never to stdout and never to stderr —
 voxtype logs our stderr, and a chatty hook makes its logs useless.
 """
@@ -64,6 +71,48 @@ def _log(message: str) -> None:
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
         with path.open("a", encoding="utf-8") as fh:
             fh.write(f"{stamp} {message}\n")
+    except Exception:  # noqa: BLE001 - deliberately total
+        pass
+
+
+def clear_turn_marker() -> None:
+    """Take down "a Luna voice turn is in flight", because it has just ended.
+
+    ``bin/luna-voice-turn`` stamps ``$XDG_RUNTIME_DIR/luna/voice-turn`` before
+    it starts recording, so that the bar widget and the orb can tell an F10
+    turn from plain F9 dictation — voxtype 0.7.5 publishes `recording` but not
+    the profile that is recording, so without the marker every dictation lit
+    Luna up.
+
+    This is the right place to clear it, and it is not a close call. The
+    daemon is the other candidate and it is strictly worse: it never hears
+    about a turn that produced an empty transcript, or one refused by
+    ``[listen] enabled``, or one whose socket connect failed — and each of
+    those would leave the marker set, which means F9 goes on lighting her up
+    until something else happens to clear it. This hook is the only thing
+    voxtype runs for the luna profile, and it runs for *every* transcript the
+    profile produces, including all three of those. So the clear happens on
+    the paths where the dispatch does not.
+
+    It runs before the dispatch rather than after it for the same reason: what
+    is being published is "the microphone is no longer hers", which became
+    true when the recording stopped, not when the daemon accepted the text.
+
+    Total, like everything else here. A marker that could not be removed is a
+    cosmetic fault with a timestamp behind it — the reader distrusts a stale
+    one within seconds — and it may not become a non-zero exit, which is what
+    would put the user's speech in whatever window has focus.
+    """
+    try:
+        import sys as _sys
+        from pathlib import Path
+
+        _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from lunad import config  # noqa: PLC0415
+
+        config.VOICE_TURN_FILE.unlink()
+    except FileNotFoundError:
+        pass                      # nothing in flight, or already cleared
     except Exception:  # noqa: BLE001 - deliberately total
         pass
 
@@ -164,6 +213,10 @@ def dispatch(transcript: str) -> str:
 def main() -> int:
     transcript = ""
     try:
+        # First, before anything that could fail or block: the recording is
+        # over, so the "Luna is listening" marker must come down whatever else
+        # this invocation goes on to do with the transcript.
+        clear_turn_marker()
         transcript = read_transcript()
         outcome = dispatch(transcript)
         _log(outcome)

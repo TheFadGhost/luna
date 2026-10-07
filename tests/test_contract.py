@@ -722,6 +722,27 @@ class HudCaptionCase(TempMemoryCase):
     def message(self) -> dict:
         return json.loads((self.root / "message").read_text(encoding="utf-8"))
 
+    def settle(self, s, timeout: float = 10.0) -> None:
+        """Wait for the utterance to be over before reading the pane.
+
+        The caption is no longer written on the way *into* `say()`. It goes up
+        at the instant the first audio frame reaches `aplay`, because the two
+        used to be 966-4,479 ms apart on the remote provider and the user saw
+        her subtitles running ahead of her voice.
+
+        Nothing in this suite can reach a TTS engine -- `tests/_support.py`
+        points `VENV_PYTHON` at a sentinel -- so here there is never a first
+        frame, and the caption lands on `_run_job`'s backstop instead: the
+        moment the attempt gives up. That is the same guarantee from the
+        user's side (the words appear even when the voice does not) and it is
+        asynchronous either way, so these cases wait for the job exactly as
+        the user waits for the answer.
+        """
+        deadline = time.monotonic() + timeout
+        while s.speaking and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertFalse(s.speaking, "the utterance never finished")
+
     def test_an_ordinary_spoken_reply_reaches_the_pane(self) -> None:
         _writer, cap = self.parts()
         self.assertTrue(cap.said("The build finished."))
@@ -783,11 +804,13 @@ class HudCaptionCase(TempMemoryCase):
         self.assertFalse(cap.clear())
 
     def test_speech_captions_what_it_actually_says(self) -> None:
-        """The wiring, not the helper: `Speech.say` has to call it.
+        """The wiring, not the helper: speaking has to caption.
 
         Driven through the real `say()` with the piper worker unreachable --
         `tests/_support.py` sees to that -- because what is being asserted is
-        that the caption is written on the way in, not that speech succeeded.
+        that the utterance captions itself at all, not that speech succeeded.
+        `tests/test_tts.py` is where the *timing* is pinned down, against a
+        synth that can be held open.
         """
         writer, cap = self.parts()
         s = speech.Speech(settings=self.settings, caption=cap)
@@ -798,6 +821,7 @@ class HudCaptionCase(TempMemoryCase):
         # caption of a sentence she did not say is a caption that disagrees
         # with the voice the user is listening to.
         s.say("The build **finished**.")
+        self.settle(s)
         self.assertEqual(self.message()["text"], "The build finished.")
 
         # And `luna hush` -- which is `speak.cancel`, which is this -- takes it
@@ -816,8 +840,10 @@ class HudCaptionCase(TempMemoryCase):
         s = speech.Speech(settings=self.settings, caption=cap)
         self.addCleanup(s.close)
         s.say("The first thing.")
+        self.settle(s)
         first = self.message()
         s.say("The second thing.")
+        self.settle(s)
         second = self.message()
         self.assertEqual(second["text"], "The second thing.")
         # The id is what makes a message new to the pane, so it has to move.
@@ -830,14 +856,40 @@ class HudCaptionCase(TempMemoryCase):
         s.say("   ")
         self.assertFalse((self.root / "message").exists())
 
-    def test_speech_switched_off_captions_nothing_either(self) -> None:
-        # `[voice] enabled = false` returns before anything is spoken, and a
-        # caption of something she did not say would be a lie on screen.
+    def test_speech_switched_off_still_puts_the_words_on_screen(self) -> None:
+        """The reverse of what this case used to assert, and deliberately.
+
+        It used to require that `[voice] enabled = false` captioned nothing,
+        on the reasoning that a caption of something she did not say is a lie
+        on screen. That reasoning does not survive contact with the surface it
+        is about: a voice turn arrives by F10 and leaves by the orb, so with
+        the voice off and the caption suppressed the turn produced *nothing*
+        at all -- no sound, no words, no evidence she had answered.
+
+        The caption does not claim to be audio. It claims to be what she
+        replied, and she did reply. So it goes up immediately here rather than
+        waiting for a first frame that is never coming; `[hud] caption` is
+        still what decides whether it is drawn, and the two cases above prove
+        that switch is honoured on this path too.
+        """
         _writer, cap = self.parts()
         self.settings.set("voice.enabled", False)
         s = speech.Speech(settings=self.settings, caption=cap)
         self.addCleanup(s.close)
-        s.say("she is muted")
+        result = s.say("she is **muted**")
+        # Nothing was spoken, and the return value still says so.
+        self.assertEqual(result["spoken"], "")
+        self.assertIn("switched off", result["note"])
+        # Synchronous: there is no job and nothing to wait for.
+        self.assertEqual(self.message()["text"], "she is muted")
+
+    def test_the_caption_switch_still_wins_with_the_voice_off(self) -> None:
+        _writer, cap = self.parts()
+        self.settings.set("voice.enabled", False)
+        self.settings.set("hud.caption", False)
+        s = speech.Speech(settings=self.settings, caption=cap)
+        self.addCleanup(s.close)
+        s.say("she is muted and unwritten")
         self.assertFalse((self.root / "message").exists())
 
 

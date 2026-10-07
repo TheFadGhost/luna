@@ -123,6 +123,15 @@ microphone — voxtype does, and the daemon does not hear about a voice turn
 until the transcript arrives, which is after the listening is over. The widget
 reads voxtype's `$XDG_RUNTIME_DIR/voxtype/state` for that and composes the two.
 
+That composition needed a fourth file, because voxtype's `state` says only
+that *somebody* is recording, never which profile:
+`$XDG_RUNTIME_DIR/luna/voice-turn` — epoch milliseconds, stamped by
+`bin/luna-voice-turn` before it execs voxtype and cleared by
+`bin/luna-voice-router` on every transcript the luna profile produces — is
+what lets the widget show `listening` for F10 and not for plain F9 dictation.
+Neither script is `lunad`; the daemon only names the path
+(`config.VOICE_TURN_FILE`) so the two agree on it. §5 has the wrapper.
+
 `lunad/presence.py` holds the writer and the contract. It cannot raise: it is
 called from the middle of answering a question, and a full disk is not a
 reason to fail an answer that was otherwise fine.
@@ -492,9 +501,14 @@ post_process_timeout_ms = 2000
 output_mode = "clipboard"
 ```
 
-Keybind: **F10** runs `voxtype record toggle --profile luna`,
-verified free against `hyprctl binds` and added to the user-owned
-`~/.config/hypr/bindings.lua` so it survives `omarchy update`.
+Keybind: **F10** runs `bin/luna-voice-turn`, verified free against
+`hyprctl binds` and added to the user-owned `~/.config/hypr/bindings.lua` so
+it survives `omarchy update`. The wrapper stamps
+`$XDG_RUNTIME_DIR/luna/voice-turn` with the current time and then `exec`s
+`voxtype record toggle --profile luna` — marker on disk before voxtype's
+daemon can publish `recording`, so the bar widget can tell this turn is
+Luna's and not F9's. See §3's presence section for why that marker exists at
+all: voxtype 0.7.5 never says which profile is recording.
 **F9 and SUPER+CTRL+X keep working exactly as today** - no shared mode flag, no
 race, no fork of voxtype. This is the requirement that plain dictation must not
 regress, and profiles satisfy it cleanly.

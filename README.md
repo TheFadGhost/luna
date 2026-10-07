@@ -117,9 +117,12 @@ starts on the first one (measured: first audio at 45 ms) while the rest is still
 being synthesised. Code, paths, URLs and long numbers are never read aloud; they
 become "it's on screen".
 
-**In** — `F10` runs `voxtype record toggle --profile luna`. The profile's
-`post_process_command` is `bin/luna-voice-router`, which forwards the transcript
-to the daemon and prints nothing.
+**In** — `F10` runs `bin/luna-voice-turn`, which stamps
+`$XDG_RUNTIME_DIR/luna/voice-turn` (so the desktop can tell an F10 turn from
+plain F9 dictation — voxtype never says which profile is recording) and then
+execs `voxtype record toggle --profile luna`. The profile's
+`post_process_command` is `bin/luna-voice-router`, which clears that marker
+and forwards the transcript to the daemon, printing nothing.
 
 Plain dictation (F9, SUPER+CTRL+X) is untouched and stays untouched: it names no
 profile, so it takes none of this path.

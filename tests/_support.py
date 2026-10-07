@@ -242,6 +242,20 @@ FORBIDDEN_HUD_MESSAGE = _STATE_DIR / "message"
 #: and it would stay that way until the next real settings change.
 FORBIDDEN_HUD_SETTINGS = _STATE_DIR / "hud.json"
 
+#: The fourth, and the only one in that directory the daemon never writes:
+#: `$XDG_RUNTIME_DIR/luna/voice-turn`, stamped by `bin/luna-voice-turn` when a
+#: Luna voice turn starts and *removed by `bin/luna-voice-router`* when the
+#: transcript arrives. Only the router touches it from Python, and the router
+#: runs as a subprocess in `tests/test_router.py` -- but that subprocess
+#: imports `lunad.config`, and unlike the rest of this file a redirect here
+#: does not reach it, because it is a different interpreter. So the router
+#: cases pass `XDG_RUNTIME_DIR` in the child's environment, which is what
+#: `config.RUNTIME_DIR` is derived from, and this line covers the in-process
+#: readers instead: anything that comes to name the path later must not be
+#: able to delete the running desktop's marker mid-dictation, which would drop
+#: the orb out of `listening` in the middle of a real sentence.
+FORBIDDEN_VOICE_TURN_FILE = _STATE_DIR / "voice-turn"
+
 FORBIDDEN_COREDUMP_DIR.mkdir(parents=True, exist_ok=True)
 FORBIDDEN_POWER_SUPPLY_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -263,6 +277,7 @@ config.OMARCHY_UPDATE_LOG = FORBIDDEN_OMARCHY_UPDATE_LOG
 config.AMBIENT_STATE_PATH = FORBIDDEN_AMBIENT_STATE
 config.HUD_MESSAGE_FILE = FORBIDDEN_HUD_MESSAGE
 config.HUD_SETTINGS_FILE = FORBIDDEN_HUD_SETTINGS
+config.VOICE_TURN_FILE = FORBIDDEN_VOICE_TURN_FILE
 
 
 class FakeHyprland:

@@ -14,7 +14,7 @@
 > |---|---|
 > | writing the message file | `lunad/ambient.py::HudWriter`, the one writer and the one `id` sequence |
 > | an ambient event's caption | `lunad/ambient.py::Notifier.pane` |
-> | an ordinary spoken reply's caption | `lunad/hud.py::Caption`, called from `lunad/speech.py::Speech.say` |
+> | an ordinary spoken reply's caption | `lunad/hud.py::Caption`, called from `Speech._caption_now` at first audio (or from `Speech.say` itself when `[voice] enabled = false`, since then there is no first audio to wait for) |
 > | retracting a caption on `luna hush` | `lunad/speech.py::Speech.cancel` |
 > | removing the file on shutdown | `lunad/server.py::Daemon.close`, plus the `ExecStopPost` named below |
 > | the overlay's own settings | a separate file and a separate contract — `[hud]` in `docs/CONFIG-SCHEMA.md`, published by `lunad/hud.py` |
@@ -28,7 +28,10 @@
 > it into `docs/` would have broken three references to save a filename.
 >
 > One thing below has been overtaken and is marked where it appears: the
-> `ExecStopPost` line now removes three files, not two.
+> `ExecStopPost` line now removes four files, not two. It also names
+> `%t/luna/voice-turn` — the marker `bin/luna-voice-turn` stamps before a Luna
+> voice turn and `bin/luna-voice-router` clears after one; see
+> `docs/CONFIG-SCHEMA.md` for that file's contract, it is not this one's.
 
 ## What already exists
 
@@ -80,18 +83,22 @@ example). It also means the file must be removed on shutdown — add it to the
 same `ExecStopPost` line `20-presence.conf` already uses for `state`:
 
 ```ini
-ExecStopPost=-/usr/bin/rm -f %t/luna/state %t/luna/message %t/luna/hud.json
+ExecStopPost=-/usr/bin/rm -f %t/luna/state %t/luna/message %t/luna/hud.json %t/luna/voice-turn
 ```
 
 Without that, a SIGKILLed daemon leaves its last sentence on disk, and the
 `ts` staleness rule is then the only thing standing between the user and a
 ghost message at next login.
 
-**Updated:** three files, not the two this line originally named. `hud.json`
+**Updated:** four files, not the two this line originally named. `hud.json`
 is the overlay's settings, published by `lunad/hud.py` and specified as `[hud]`
 in `docs/CONFIG-SCHEMA.md`; it joined this line when that landed, and it has
 no `ts` of its own, so `ExecStopPost` is the *only* thing that removes it
-after a crash. The drop-in lives at
+after a crash. `voice-turn` joined it after that — it is a different pane's
+file, `bin/luna-voice-turn`'s marker for "this recording is Luna's", covered
+in `docs/CONFIG-SCHEMA.md`, not this file's own contract — and it does carry
+a timestamp, so a stale one is also caught by the reader's own 15 s rule; this
+line is only the crash backstop. The drop-in lives at
 `~/.config/systemd/user/lunad.service.d/20-presence.conf`, outside this
 repository, so a change to it needs `systemctl --user daemon-reload`.
 

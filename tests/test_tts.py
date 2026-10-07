@@ -53,11 +53,36 @@ class _Player:
         return 0
 
 
+class _Captions:
+    """A `hud.Caption` that records instead of writing.
+
+    Injected everywhere in this file so that the timing of the caption can be
+    asserted without a message file, and so that nothing here can reach the
+    real one -- `config.HUD_MESSAGE_FILE` is redirected by `tests/_support.py`,
+    but a test that asserts *when* something was written is much clearer
+    against a list than against a stat().
+    """
+
+    def __init__(self) -> None:
+        self.said_texts: list[str] = []
+        self.clears = 0
+
+    def said(self, text: str) -> bool:
+        self.said_texts.append(text)
+        return True
+
+    def clear(self) -> bool:
+        self.clears += 1
+        return True
+
+
 class _Speech(speech.Speech):
     """The real class with only the two things that touch the system replaced."""
 
-    def __init__(self, synth, settings) -> None:  # noqa: ANN001
-        super().__init__(synth=synth, settings=settings)
+    def __init__(self, synth, settings, caption=None) -> None:  # noqa: ANN001
+        self.captions = caption if caption is not None else _Captions()
+        super().__init__(synth=synth, settings=settings,
+                         caption=self.captions)
         self.players: list[_Player] = []
         self.piper_calls: list[list[str]] = []
 
@@ -733,6 +758,114 @@ class VoiceSettingsCase(TempMemoryCase):
     def test_status_reports_piper_voice_when_piper_is_the_provider(self) -> None:
         self.settings.set("voice.provider", "piper")
         self.assertEqual(self.obj().status()["voice"], config.VOICE_NAME)
+
+
+class CaptionTimingCase(TempMemoryCase):
+    """The caption goes up with the sound, not with the text.
+
+    The bug the user reported: "the tts takes a while to trigger after i see
+    the text". Her words were published the instant the reply had been parsed
+    and the audio arrived whenever synthesis finished -- measured at
+    966-4,479 ms later against the real remote provider over five real asks,
+    the worst of them a four-sentence answer. The subtitles ran ahead of the
+    voice by a visible second to four and a half.
+
+    These cases pin the fix where it can be asserted deterministically: a
+    synth that can be held open, so that "after the reply text exists but
+    before any audio" is an interval a test can stand in rather than a race it
+    has to hope for.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.calls: list[str] = []
+
+    def held_speech(self, gate: threading.Event) -> _Speech:
+        """A `_Speech` whose first sentence will not synthesise until told."""
+        first = [True]
+
+        def synth(text, *, model, voice, api_key, speed=1.0,  # noqa: ANN001
+                  timeout=None):
+            self.calls.append(text)
+            if first[0]:
+                first[0] = False
+                # This is the gap the user was seeing: the reply text exists,
+                # the provider has not answered yet, and nothing has been
+                # played. Held open rather than merely slow, so the assertion
+                # below is about ordering and not about a sleep being long
+                # enough.
+                gate.wait(10.0)
+            return speech.parse_wav(make_wav())
+
+        obj = _Speech(synth=synth, settings=self.settings)
+        self.addCleanup(obj.close)
+        return obj
+
+    def test_no_caption_is_published_while_synthesis_is_still_running(self) -> None:
+        gate = threading.Event()
+        obj = self.held_speech(gate)
+        job = speech._Job(["One.", "Two."], "One. Two.",
+                          cfg=dict(self.settings.section("voice")))
+        worker = threading.Thread(target=obj._play, args=(job,), daemon=True)
+        worker.start()
+        self.addCleanup(gate.set)
+        self.addCleanup(worker.join, 10.0)
+
+        # Wait until the provider has actually been asked, so that "nothing
+        # captioned yet" means "held mid-synthesis" and not "not started".
+        deadline = time.monotonic() + 10.0
+        while not self.calls and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertEqual(self.calls[:1], ["One."])
+        self.assertIsNone(job.first_audio)
+        self.assertEqual(obj.captions.said_texts, [],
+                         "the words went up before there was any sound")
+
+        gate.set()
+        worker.join(10.0)
+        self.assertFalse(worker.is_alive())
+        self.assertIsNotNone(job.first_audio)
+        self.assertEqual(obj.captions.said_texts, ["One. Two."])
+
+    def test_one_caption_per_utterance_however_many_players(self) -> None:
+        """A format change restarts `aplay`; it does not restart the caption.
+
+        This is why `_caption_now` is called from the two `_start_player`
+        sites and not from inside `_start_player`: a sentence at a different
+        sample rate cannot be spliced into a running player, so an utterance
+        can legitimately open two of them, and the pane must not be handed the
+        same sentence twice under two ids.
+        """
+        queue = [make_wav(rate=24_000), make_wav(rate=22_050)]
+
+        def synth(text, *, model, voice, api_key, speed=1.0,  # noqa: ANN001
+                  timeout=None):
+            return speech.parse_wav(queue.pop(0))
+
+        obj = _Speech(synth=synth, settings=self.settings)
+        self.addCleanup(obj.close)
+        job = speech._Job(["One.", "Two."], "One. Two.",
+                          cfg=dict(self.settings.section("voice")))
+        obj._play(job)
+        self.assertEqual(len(obj.players), 2, "the rate change needs a new aplay")
+        self.assertEqual(obj.captions.said_texts, ["One. Two."])
+
+    def test_an_utterance_barged_in_on_before_a_sound_captions_nothing(self) -> None:
+        """Words that were never said must not appear as though they were.
+
+        `say()` opens with a barge-in cancel, so a reply that is superseded
+        during synthesis is marked cancelled while it still has no audio. Its
+        caption must not arrive late and assert something the room never
+        heard.
+        """
+        obj = _Speech(synth=lambda *a, **k: None, settings=self.settings)
+        self.addCleanup(obj.close)
+        job = speech._Job(["Never mind."], "Never mind.",
+                          cfg=dict(self.settings.section("voice")))
+        job.cancelled = True
+        obj._caption_now(job)
+        self.assertEqual(obj.captions.said_texts, [])
+        self.assertFalse(job.captioned)
 
 
 if __name__ == "__main__":

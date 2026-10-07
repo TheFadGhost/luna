@@ -1,0 +1,63 @@
+#!/bin/sh
+# luna-voice-turn — start a Luna voice turn, and say so before it starts.
+#
+# The whole file exists to answer one question the desktop could not otherwise
+# ask: *whose* dictation is this?
+#
+# voxtype owns the microphone and publishes `recording` to
+# $XDG_RUNTIME_DIR/voxtype/state on every transition, which is what the bar
+# widget and the orb read to show "listening". But voxtype 0.7.5 does not put
+# the active PROFILE anywhere readable — `voxtype status --format json
+# --extended` reports text, alt, class, tooltip, model, device and backend, and
+# no profile — so that file says "somebody is recording" and never "it is
+# Luna". F9 is plain dictation and F10 is Luna, and the widget lit up for both.
+#
+# So the profile is published here instead, by the only process that knows it:
+# the one the keybind runs. A marker is stamped with the current time and then
+# this script *execs* voxtype, in that order and never the other way round.
+# The ordering is the point. voxtype's `record` is a client; the daemon behind
+# it is what writes `recording`, and it cannot do so until this exec has
+# happened — so by the time the widget sees `recording` the marker is already
+# on disk, and there is no window in which a Luna turn looks like an F9 one.
+#
+# Why a wrapper is affordable here, when an earlier note said it was not: F10
+# is `voxtype record toggle`, one press per state change. It is F9 that is
+# push-to-talk (`record start` on press, `record stop --release` on release),
+# and that is the key where a process spawn in front of the microphone would
+# have been unacceptable. Nothing latency-sensitive runs through this file.
+#
+# Failure is deliberately one-directional. If the marker cannot be written the
+# recording still happens and the orb simply does not light up; if it could
+# fail the other way — recording refused because a cosmetic file could not be
+# stamped — a broken tmpfs would take the microphone with it.
+#
+# Clearing is not done here, because this process is gone long before the turn
+# is: `bin/luna-voice-router` removes the marker on every transcript the luna
+# profile produces, and the timestamp is the backstop for the turns that never
+# reach it. See `VOICE_TURN_FILE` in lunad/config.py for that pair.
+
+set -u
+
+dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/luna"
+marker="$dir/voice-turn"
+tmp="$marker.$$"
+
+# `|| :` throughout: see above. Nothing in this block may stop the exec.
+if mkdir -p "$dir" 2>/dev/null; then
+    # Milliseconds since the epoch, no trailing newline — the same
+    # one-bare-token shape as the `state` file next to it, so a reader that
+    # compares the whole body does not have to strip anything.
+    if printf '%s' "$(date +%s%3N)" > "$tmp" 2>/dev/null; then
+        # Atomic, for the same reason lunad's own writes are: the reader is an
+        # inotify watch, and a reader that can see a half-written file will
+        # eventually read one.
+        mv -f "$tmp" "$marker" 2>/dev/null || rm -f "$tmp" 2>/dev/null || :
+    else
+        rm -f "$tmp" 2>/dev/null || :
+    fi
+fi
+
+# exec, not a call: this shell has nothing left to do, and leaving it in the
+# process table between the keypress and the transcript would put a second
+# parent between Hyprland and voxtype for no reason.
+exec voxtype record toggle --profile luna

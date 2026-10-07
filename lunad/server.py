@@ -1426,6 +1426,13 @@ class Daemon:
         # and both have to exist -- systemd cannot clean up after a daemon
         # that is still running, and a daemon that was SIGKILLed cannot clean
         # up after itself.
+        #
+        # A fourth file lives in that directory -- `voice-turn`, "this
+        # dictation is Luna's" -- and is deliberately NOT cleared here. It is
+        # not the daemon's: `bin/luna-voice-turn` writes it, the voice router
+        # removes it, and its own timestamp expires it. A shutdown mid-turn
+        # has no business deciding whose the microphone was. The `ExecStopPost`
+        # names it only so a restart does not leave a dead one in tmpfs.
         self.hud.clear()
         self.ambient.close()
         self.settings.stop_watching()

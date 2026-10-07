@@ -50,6 +50,9 @@ provider     = "openrouter"  # openrouter | local  ->  voxtype [whisper] mode
 model        = "fish-audio/transcribe-1"   # ->  voxtype [whisper] model
 language     = "en"          # ->  voxtype [whisper] language
 keybind      = "F10"         # Hyprland's, in ~/.config/hypr/bindings.lua
+                              # runs bin/luna-voice-turn, which stamps
+                              # $XDG_RUNTIME_DIR/luna/voice-turn and execs
+                              # voxtype -- see [listen] "keybind" below
 
 [confirm]
 # The safety model. NOT hard blocks — Jarvis asks first, then proceeds.
@@ -195,7 +198,7 @@ than a fake writable one.
 | `provider` | **voxtype**, as `[whisper] mode` | Written through, then `systemctl --user restart voxtype`. `openrouter` becomes `remote`, `local` becomes `local`. |
 | `model` | **voxtype**, as `[whisper] model` | Written through with the same restart, and it writes `remote_model` too when the provider is `openrouter` — **the gotcha that costs the time**: in `mode = "remote"` voxtype sends `model` to the endpoint, *not* `remote_model`, despite `remote_model` being a real field in its config struct. The symptom of getting it wrong is a journal line reading `model=base.en` and an HTML error page back from OpenRouter, which has no model of that name. Jarvis keeps the two in step so the file has one answer rather than two, and the wrong one does not look authoritative because of its name. Going the other way, `provider = local` with a model that is neither a whisper model name nor an absolute path to a `.bin` is **refused with the list of names**, because voxtype would treat an OpenRouter id as a path, fail to load it, and stop transcribing with the reason only in the journal. |
 | `language` | **voxtype**, as `[whisper] language` | Written through, same restart. |
-| `keybind` | **the GUI only** | Displayed, never written. The binding lives in `~/.config/hypr/bindings.lua`; writing it here would put Jarvis and Hyprland out of step, and Hyprland is the one holding the key. |
+| `keybind` | **the GUI only** | Displayed, never written. The binding lives in `~/.config/hypr/bindings.lua`; writing it here would put Jarvis and Hyprland out of step, and Hyprland is the one holding the key. It no longer runs `voxtype record toggle --profile luna` directly — it runs `bin/luna-voice-turn`, which stamps `$XDG_RUNTIME_DIR/luna/voice-turn` and then `exec`s that same voxtype command, so the widget can tell an F10 (Luna) turn from plain F9 dictation, which voxtype's own state file does not say. |
 
 **The restart is the point.** voxtype reads its config once, at start-up. A
 write-through that skipped the restart would leave the file correct, the GUI
@@ -352,7 +355,7 @@ applies. There is no error card, no placeholder, and no "waiting for Luna".
 | `corner` | the orb overlay, via `hud.json` | Live, next reload. One of `top-left`, `top-right`, `bottom-left`, `bottom-right`. Anything else is the default, silently — the overlay has nowhere to report a bad value to. |
 | `scale` | the orb overlay, via `hud.json` | Live, next reload. A multiplier on the sprite's base size, **clamped** to 0.5–3.0 rather than refused. The schema minimum and maximum are the same two numbers, so the GUI reports out of range before it is ever written; the clamp in `hud.payload` is the second line, for a hand-edited file. |
 | `idle_visible` | the orb overlay, via `hud.json` | Live, next reload. `false` — the default — hides the overlay entirely while the composed phase is `idle` or `down`; it appears when she starts listening, thinking or speaking and fades out after. `true` keeps it on screen always. Off by default because the bar icon is already the always-on surface and a second permanent one is clutter until somebody asks for it. |
-| `caption` | the orb overlay, via `hud.json`; **`lunad/hud.py::Caption`** | Live. The one key here with a reader on *both* sides of the boundary: the overlay decides whether to draw the caption, and the daemon decides whether to write one. `true` and an ordinary spoken reply publishes its spoken form to `$XDG_RUNTIME_DIR/luna/message` — the *spoken* form, already capped by `[voice] max_spoken_chars` and cut at a sentence boundary, one message per utterance and never one per sentence. A `luna hush` removes it, which is what dismisses it on screen. Writing it can never fail a reply: every failure is swallowed and logged once per process, not once per sentence. |
+| `caption` | the orb overlay, via `hud.json`; **`lunad/hud.py::Caption`** | Live. The one key here with a reader on *both* sides of the boundary: the overlay decides whether to draw the caption, and the daemon decides whether to write one. `true` and an ordinary spoken reply publishes its spoken form to `$XDG_RUNTIME_DIR/luna/message` at the instant the first audio frame reaches `aplay`, not when the reply text is parsed — those two moments measured 966-4,479 ms apart on the remote provider, which is the words appearing well before the voice. The *spoken* form, already capped by `[voice] max_spoken_chars` and cut at a sentence boundary, one message per utterance and never one per sentence. With `[voice] enabled = false` there is no first audio to wait for, so the caption publishes immediately instead — a voice turn with the voice off still has to show *something*, or it looks like she never answered. A `luna hush` removes it, which is what dismisses it on screen. Writing it can never fail a reply: every failure is swallowed and logged once per process, not once per sentence. |
 | `sprite` | the orb overlay, via `hud.json` | Live, next reload. Reserved for a second sprite; only `"orb"` exists and anything unrecognised falls back to it. The key is here so a future sprite needs no schema change to be selectable. |
 
 **There is no `ttl` key, on purpose.** How long a caption stays up is the
@@ -363,11 +366,15 @@ and would not mean that. The daemon uses `config.SPEECH_HUD_TTL_S` for the
 reading time after she stops talking, and `config.AMBIENT_HUD_TTL_S` for an
 ambient event, and neither is offered as a setting.
 
-**The three files, and who removes them.** `state`, `message` and `hud.json`
-all live in `$XDG_RUNTIME_DIR/luna`. `lunad` removes all three on a clean
-shutdown, and `~/.config/systemd/user/lunad.service.d/20-presence.conf` names
-all three in its `ExecStopPost` so a `SIGKILL`ed daemon does not leave the
-desktop reading settings and a sentence belonging to a process that is gone.
+**The four files, and who removes them.** `state`, `message`, `hud.json` and
+`voice-turn` all live in `$XDG_RUNTIME_DIR/luna`. `lunad` removes the first
+three on a clean shutdown, and `~/.config/systemd/user/lunad.service.d/
+20-presence.conf` names all four in its `ExecStopPost` so a `SIGKILL`ed daemon
+does not leave the desktop reading settings and a sentence belonging to a
+process that is gone. `voice-turn` is the odd one out: `lunad` never writes
+it, only names it (`config.VOICE_TURN_FILE`), because it belongs to
+`bin/luna-voice-turn` and `bin/luna-voice-router` instead — see `[listen]`
+below and `HANDOFF-hud.md`.
 
 ### `[ui]`
 

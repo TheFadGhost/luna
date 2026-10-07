@@ -290,7 +290,9 @@ What is genuinely still unbuilt, as of Phase 4:
   voxtype's file, so the key already on this machine keeps working and nothing
   had to be copied out of another program's directory.
 - `luna` and `jarvis` are both on PATH (`~/.local/bin`, symlinks to
-  `bin/luna`); `bin/jarvis` is a symlink in the repo.
+  `bin/luna`); `bin/jarvis` is a symlink in the repo. `~/.local/bin/luna-voice-turn`
+  joined them the same way, for the F10 bind and the bar icon to run rather
+  than calling voxtype directly — see `docs/ARCHITECTURE.md` §5.
 - 447 tests pass, up from 325.
 
 ### Phase 2c — making the config contract true (2026-08-27)
@@ -1280,8 +1282,11 @@ file's mtime and force a QML re-parse for nothing.
 - **Spoken replies now reach the HUD.** `ambient.HudWriter` had only ever been
   called by the crash/battery/update hooks, so the one surface built to show
   Luna's words showed everything except them. `hud.py::Caption` is the speech
-  path's user of that same writer, hooked into `Speech.say`, carrying the
-  spoken (already-capped) text, one message per utterance. `Speech.cancel`
+  path's user of that same writer, called from `Speech._caption_now` at the
+  instant the first audio frame reaches `aplay` — not from `Speech.say` at
+  parse time, which is where it first landed and which a later fix moved off
+  of, because that gap was measured at 966-4,479 ms on the remote provider —
+  carrying the spoken (already-capped) text, one message per utterance. `Speech.cancel`
   retracts it — `luna hush` now clears the screen as well as the air — except
   the barge-in cancel that opens every `say()`, which passes `retract=False`:
   a real retract there would unlink the file microseconds before the rewrite,
@@ -1300,13 +1305,14 @@ file's mtime and force a QML re-parse for nothing.
   from the existing `Binder.control_for`; `scale` is a spin button, the same
   choice already made for `[voice] speed`, rather than inventing a slider
   widget for one row.
-- **`hud.json` has no staleness rule, on purpose and unlike the other two
+- **`hud.json` has no staleness rule, on purpose and unlike the other
   runtime files** — it is settings, not an event, and the overlay is meant to
   keep using it while `lunad` isn't running. That makes a `SIGKILL` between a
   settings change and the next start a real failure mode (the overlay pins to
   the stale corner/size forever), so it now joins `hud.service.d/
-  20-presence.conf`'s `ExecStopPost`, which removes three files instead of
-  two. Needs `systemctl --user daemon-reload`; recorded in
+  20-presence.conf`'s `ExecStopPost`, which removes four files instead of
+  two (`voice-turn`, the Luna-vs-plain-dictation marker, joined after
+  `hud.json` did). Needs `systemctl --user daemon-reload`; recorded in
   `~/.config/omarchy/CUSTOMISATIONS.md` §8a.14.
 - **`HANDOFF-hud.md` was stale** — it still described itself as an
   unimplemented spec while `lunad/ambient.py::HudWriter` had, in fact,

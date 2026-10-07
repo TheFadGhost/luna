@@ -580,7 +580,7 @@ class _Job:
     __slots__ = ("id", "sentences", "text", "cancelled", "done", "started",
                  "error", "played_bytes", "first_audio", "provider",
                  "fell_back", "voice", "sample_rate", "cfg", "speed",
-                 "abandon_remote", "lead_pair")
+                 "abandon_remote", "lead_pair", "captioned")
 
     def __init__(self, sentences: list[str], text: str,
                  cfg: dict[str, Any] | None = None,
@@ -595,6 +595,11 @@ class _Job:
         self.done = threading.Event()
         self.played_bytes = 0
         self.first_audio: float | None = None   # proves streaming, not batching
+        # Whether this utterance's words have been put on the HUD yet. One
+        # caption per job, published at the instant the first frame reaches
+        # `aplay` rather than when the reply text was parsed -- see
+        # `Speech._caption_now`.
+        self.captioned = False
         self.provider = str(self.cfg.get("provider", "piper"))
         self.voice = str(self.cfg.get("voice", ""))
         self.speed = _clamp_speed(self.cfg.get("speed", 1.0))
@@ -830,12 +835,23 @@ class Speech:
         way so a caller can show what was actually said.
         """
         voice_cfg = self._voice_settings()
-        if not voice_cfg["enabled"]:
-            return {"spoken": "", "sentences": 0, "id": None,
-                    "note": "voice is switched off in [voice] enabled"}
         # `max_spoken_chars` is the cap the schema exposes: anything past it is
         # trimmed at a sentence boundary and the full text stays on screen.
+        #
+        # Computed before the `enabled` check, and that ordering is the whole
+        # reason it moved: with the voice switched off there is no audio for a
+        # caption to wait for, and a voice turn that produced neither speech
+        # nor words on screen produced nothing at all. The stripper runs
+        # either way -- the caption carries the *spoken* form, so what is not
+        # fit to say is not fit to show.
         spoken = strip_for_speech(text, max_chars=voice_cfg["max_spoken_chars"])
+        if not voice_cfg["enabled"]:
+            # Immediately, not at first audio: there will not be a first audio.
+            # `[hud] caption` still decides whether anything is written, and
+            # `Caption.said` is total, so this cannot fail the reply.
+            self._caption.said(spoken)
+            return {"spoken": "", "sentences": 0, "id": None,
+                    "note": "voice is switched off in [voice] enabled"}
         sentences = split_sentences(spoken)
         if not sentences:
             return {"spoken": "", "sentences": 0, "id": None,
@@ -865,16 +881,19 @@ class Speech:
             self._job = job
         threading.Thread(target=self._run_job, args=(job,), daemon=True,
                          name=f"luna-speak-{job.id}").start()
-        # One caption per utterance, carrying the *spoken* form -- already
-        # capped by `[voice] max_spoken_chars` and cut at a sentence boundary.
-        # Not one per sentence: the HUD is a glance surface, and a pane that
-        # re-rendered every 260 characters would be a teleprompter.
+        # The caption is NOT written here. It used to be, and that was the
+        # bug the user reported as "the tts takes a while to trigger after i
+        # see the text": the words went up the moment the reply had been
+        # parsed, and the audio arrived whenever synthesis finished, which was
+        # measured at 966-4,479 ms later on the remote provider for real asks.
+        # She appeared to have finished a sentence she had not begun.
         #
-        # After the thread has started, so the file write is never in front of
-        # the first audio frame; before `_notify()`, so the caption and the
-        # `speaking` state the pane reads land in that order rather than the
-        # pane briefly showing her speaking with nothing to show.
-        self._caption.said(spoken)
+        # So it is published from `_caption_now`, at the instant the first
+        # frame reaches `aplay` -- see `_play_remote` and `_play_piper` -- and
+        # from `_run_job` as a backstop for an utterance that never produces a
+        # frame at all. Still one caption per utterance and not one per
+        # sentence: the HUD is a glance surface, and a pane that re-rendered
+        # every 260 characters would be a teleprompter.
         self._notify()
         if wait:
             job.done.wait(timeout)
@@ -919,6 +938,44 @@ class Speech:
             cb()
         except Exception:  # noqa: BLE001 - a watcher must not break speech
             log.exception("speech activity callback failed")
+
+    def _caption_now(self, job: _Job) -> None:
+        """Put this utterance's words on the HUD. Once, and not before time.
+
+        Called from the moment the first frame reaches ``aplay`` -- from both
+        providers, and from ``_start_player``'s two call sites rather than
+        from ``_start_player`` itself, because that is also what restarts the
+        player when a sentence changes audio format mid-utterance and a
+        caption is per utterance, not per player.
+
+        Why the first frame and not the parsed reply: those two moments are
+        966-4,479 ms apart on the remote provider, measured over real asks,
+        and the user sees that gap as Luna's subtitles running ahead of her
+        voice. They are the same event now.
+
+        Why not per sentence, in step with what is being spoken: it would keep
+        caption and audio together just as well, and it was rejected anyway.
+        The message file carries one monotonically increasing ``id`` and the
+        pane treats every new id as a new thing to show, so a four-sentence
+        answer would become four pop-ins and four ttl countdowns for one
+        thing she said -- a teleprompter on a surface built for a glance. The
+        first frame is the earliest instant at which the whole utterance is
+        certainly going to be spoken, which is exactly what the caption
+        claims.
+
+        Idempotent, and silent for an utterance that was barged in on before
+        it ever made a sound: those words were never said, and captioning them
+        after the fact would leave the pane asserting something the room did
+        not hear. ``_lock`` is held only for the flag, never across the write.
+        """
+        with self._lock:
+            if job.captioned or job.cancelled:
+                return
+            job.captioned = True
+        # Bare, with no try/except of its own: `hud.Caption` swallows
+        # everything and complains once per process, and a guard here would
+        # suggest a caption is a thing that can fail a reply.
+        self._caption.said(job.text)
 
     def cancel(self, *, retract: bool = True) -> bool:
         """Stop speaking now. Safe to call when nothing is speaking.
@@ -1027,6 +1084,23 @@ class Speech:
                     if self._job is job:
                         self._player = None
                 self._last_used = time.monotonic()
+                # A job that never produced a frame still has to show its
+                # words. TTS can fail outright (no provider, no piper voice, a
+                # worker that died), and a caption that only appeared when
+                # audio did would turn a broken voice into a Luna who answered
+                # with nothing at all -- the reply is on screen or it is
+                # nowhere. A no-op for the ordinary utterance, which captioned
+                # itself at its first frame, and for a barge-in, which
+                # `_caption_now` refuses.
+                #
+                # BEFORE `done.set()`, deliberately. That makes it a contract
+                # a caller can rely on rather than a race: when `say(wait=True)`
+                # returns, or when `speaking` goes false, the caption for that
+                # utterance is already on disk. Written the other way round it
+                # passed a suite most of the time and failed roughly one run in
+                # eight, in the window between the event being set and the file
+                # being written.
+                self._caption_now(job)
                 job.done.set()
         # Outside the playback lock and after `done` is set, so a callback that
         # reads `speaking` sees the finished state and cannot deadlock against
@@ -1190,6 +1264,12 @@ class Speech:
                     current = wav
                     job.first_audio = job.first_audio or time.monotonic()
                     job.sample_rate = wav.rate
+                    # The words, at the same instant as the sound. Before the
+                    # `_feed` below rather than after it, because `_feed`
+                    # blocks on `aplay`'s pipe for the length of the audio it
+                    # is handing over, and a caption published on the far side
+                    # of that would lag the voice instead of leading the text.
+                    self._caption_now(job)
                 pcm = wav.pcm
                 if job.lead_pair and index <= 1:
                     # The two halves of one sentence, so the pause between
@@ -1249,6 +1329,11 @@ class Speech:
                     if player is None:
                         player = self._start_player(rate)
                         job.first_audio = time.monotonic()
+                        # Same instant, same reason as the remote path. This
+                        # is also the branch a fallback lands in, so a remote
+                        # failure that piper rescues still captions when piper
+                        # starts talking and not when OpenRouter gave up.
+                        self._caption_now(job)
                     if not _feed(player, payload):
                         job.cancelled = True
                     else:
